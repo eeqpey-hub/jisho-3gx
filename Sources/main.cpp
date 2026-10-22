@@ -227,7 +227,7 @@ namespace CTRPluginFramework
 
         std::vector<std::string> names;
         for (const Category &c : g_cats)
-            names.push_back(Utils::Format("%s (ID 0x%04X〜0x%04X)", c.name, c.idMin, c.idMax));
+            names.push_back(c.name);
 
         Keyboard kc("一括変更するカテゴリを選択", names);
         int ci = kc.Open();
