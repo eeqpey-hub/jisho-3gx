@@ -15,25 +15,25 @@ jobs:
       image: pablomk7/libctrpf:0.7.4
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       
     - name: Build Plugin
       run: make
       
     - name: Upload Plugin
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: Jisho.3gx
         path: Jisho.3gx
     
     - name: Upload Plugin ELF
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: Jisho.elf
         path: Jisho.elf
 
     - name: Upload Dictionary
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: JMdict_smol.txt
         path: JMdict_smol.txt
