@@ -24,7 +24,7 @@ namespace CTRPluginFramework
     static constexpr u32 OFF_ID    = 0x00;       // u16
     static constexpr u32 OFF_COUNT = 0x04;       // u8 (要確認)
     static constexpr u32 MAX_COUNT = 99;
-    static constexpr u32 MAX_ID    = 0x05C4;
+    static constexpr u32 MAX_ID    = 0x09DF;
 
     struct Category
     {
@@ -40,11 +40,12 @@ namespace CTRPluginFramework
 
     static const Category g_cats[] =
     {
-        { "武器",       0x0001, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
+　　　　 { "アイテム", 0x05C5, 0x09DF, -1, -1, -1, -1, nullptr, nullptr },
+        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
         { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力" },
         { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr },
         { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr },
-    };
+　　};
 
     struct Field
     {
