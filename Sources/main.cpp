@@ -29,11 +29,13 @@
 extern "C"
 {
     void jp_hookA(void);
+    void jp_hookB2(void);
 
     volatile u32 g_capPtr   = 0;
     volatile u32 g_capCount = 0;
 
     void jp_captureA(u32 r3) { g_capPtr = r3 + 4; g_capCount = g_capCount + 1; }
+    void jp_captureB(u32 r4) { g_capPtr = r4 + 4; g_capCount = g_capCount + 1; }
 }
 
 asm(R"(
@@ -54,6 +56,24 @@ jp_hookA:
     pop   {r0-r6}
     add   r6, r6, #4
     mov   pc, r6
+
+    @ ---- ライフ道具用(実験): 0x2BA9AC に入れる関数の途中フック ----
+    @ 置き換えた3命令 (0x2BA9A8/AC/B0) を再現し、0x2BA9B4 に戻る。
+    @ この時点で r4 = 装備されるレコード。レジスタは全部保存する。
+    .global jp_hookB2
+    .type jp_hookB2, %function
+jp_hookB2:
+    push  {r0-r3, r12, lr}
+    ldr   r0, [sp, #24]          @ 積まれている戻り先 (X+4)
+    add   r0, r0, #4             @ X+8 に直す
+    str   r0, [sp, #24]
+    mov   r0, r4
+    bl    jp_captureB
+    pop   {r0-r3, r12, lr}
+    str   r4, [r5, r6, lsl #2]   @ 0x2BA9A8 の元命令
+    ldr   r0, [r4, #0xc]         @ 0x2BA9AC
+    orr   r0, r0, #1             @ 0x2BA9B0
+    ldr   pc, [sp], #4           @ X+8 へ戻りつつスタックを戻す
 )");
 
 namespace CTRPluginFramework
@@ -62,6 +82,7 @@ namespace CTRPluginFramework
     //  日本語版のアドレス
     // ------------------------------------------------------------
     static constexpr u32 HOOK_A = 0x002D33F8;   // 海外版 0x2E091C
+    static constexpr u32 HOOK_B2 = 0x002BA9AC;  // ライフ道具(実験) 関数の途中
 
     static constexpr u32 BAG_BASE  = 0x006DDF2C; // かばん1枠目のアイテムID
     static constexpr u32 BAG_SLOTS = 500;
@@ -288,6 +309,8 @@ namespace CTRPluginFramework
     };
 
     static Hook g_hookA;
+    static Hook g_hookB2;
+    static bool g_hookB2Installed = false;
     static bool g_hooksInstalled = false;
 
     static bool CheckWords(u32 addr, const u32 *expect, int n)
@@ -324,6 +347,31 @@ namespace CTRPluginFramework
 
         g_hooksInstalled = true;
         return true;
+    }
+
+    // ライフ道具(ハンマー等)用の実験フック。ゲーム再起動まで有効のまま
+    static bool InstallHookB2(void)
+    {
+        if (g_hookB2Installed)
+            return true;
+        static const u32 expectB2[3] = { 0xE7854106, 0xE594000C, 0xE3800001 }; // str r4,[r5,r6,lsl#2] / ldr r0,[r4,#0xc] / orr r0,r0,#1
+        if (!CheckWords(HOOK_B2 - 4, expectB2, 3))
+        {
+            PauseGuard pg;
+            MessageBox("エラー", "ライフ道具用フック位置の命令が想定と違います。")();
+            return false;
+        }
+        Process::Write32(HOOK_B2 - 4, 0xE52DF004);   // str pc,[sp,#-4]!
+        g_hookB2.Initialize(HOOK_B2, (u32)(uintptr_t)jp_hookB2);
+        g_hookB2.Enable();
+        g_hookB2Installed = true;
+        return true;
+    }
+
+    static void LifeToolHookEntry(MenuEntry *entry)
+    {
+        if (!InstallHookB2())
+            entry->Disable();
     }
 
     // 有効な間、毎フレーム呼ばれる
@@ -457,6 +505,10 @@ namespace CTRPluginFramework
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
                                    "「Yボタンで編集」と表示されたらYを押し、編集後にもう一度外して着け直すと反映されます。"));
+        menu->Append(new MenuEntry("ライフ道具(ハンマー等)も拾う【実験】", LifeToolHookEntry, nullptr,
+                                   "ハンマー・針・のこぎり・フライパン・フラスコ用の追加フックです。\n"
+                                   "「新しく装備したアイテムを編集」と一緒にONにしてください。\n"
+                                   "ONにした後、ゲームを再起動するまでフックは残ります。装備でフリーズしたら使わないでください。"));
         menu->Append(new MenuEntry("アイテムエディタ(かばんの枠指定)", nullptr, ItemEditorEntry,
                                    "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
