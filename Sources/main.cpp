@@ -121,6 +121,7 @@ namespace CTRPluginFramework
         bool hex;
         u32  maxV;
         bool isFloat;   // true: 32bit float として読み書きする
+        std::vector<std::string> choices;   // 空でなければ「選択式」(値=選択肢の番号)
 
         // C++11 でもビルドできるよう、集成体初期化ではなくコンストラクタを使う
         Field(const std::string &l, u32 o, u32 sz, bool h, u32 mx, bool fl = false)
@@ -147,7 +148,10 @@ namespace CTRPluginFramework
         if (!c)
             return v;
         if (c->offQuality >= 0)
-            v.push_back({ "クオリティ", (u32)c->offQuality, 1, false, 255 });
+        {
+            v.push_back({ "クオリティ", (u32)c->offQuality, 1, false, 4 });
+            v.back().choices = { "なし", "上", "特上", "最高", "ゴッド" };   // 値 0〜4
+        }
         if (c->offEffect >= 0)
             v.push_back({ "追加効果", (u32)c->offEffect, 2, true, 0xFFFF });
         if (c->offAtk >= 0)
@@ -198,6 +202,8 @@ namespace CTRPluginFramework
 
     static std::string FmtValue(const Field &f, u32 v)
     {
+        if (!f.choices.empty() && v < f.choices.size())
+            return f.choices[v];
         if (f.isFloat && v == 0xFFFFFFFFu)
             return "異常値";
         return f.hex ? Utils::Format("0x%04X", v) : Utils::Format("%u", v);
@@ -221,6 +227,17 @@ namespace CTRPluginFramework
         if (v > maxV)
             v = maxV;
         out = v;
+        return true;
+    }
+
+    // 選択式の入力。キャンセルなら false
+    static bool AskChoice(const std::string &msg, const std::vector<std::string> &choices, u32 &out)
+    {
+        Keyboard kb(msg, choices);
+        int sel = kb.Open();
+        if (sel < 0)
+            return false;
+        out = (u32)sel;
         return true;
     }
 
@@ -285,7 +302,10 @@ namespace CTRPluginFramework
 
                 u32 cur = 0, val = 0;
                 ReadField(base, f, cur);
-                if (AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, val))
+                const bool ok = f.choices.empty()
+                                    ? AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, val)
+                                    : AskChoice(f.label, f.choices, val);
+                if (ok)
                 {
                     if (!WriteField(base, f, val))
                         MessageBox("エラー", "書き込みに失敗しました。")();
@@ -310,7 +330,6 @@ namespace CTRPluginFramework
 
     static Hook g_hookA;
     static Hook g_hookB2;
-    static bool g_hookB2Installed = false;
     static bool g_hooksInstalled = false;
 
     static bool CheckWords(u32 addr, const u32 *expect, int n)
@@ -331,7 +350,9 @@ namespace CTRPluginFramework
 
         // 置き換える3命令が想定どおりか確認 (違うバージョンなら入れない)
         static const u32 expectA[3] = { 0xE24DD00C, 0xE1A07000, 0xE3E00000 }; // sub sp,#0xC / mov r7,r0 / mvn r0,#0
-        if (!CheckWords(HOOK_A - 4, expectA, 3))
+        // ライフ道具(ハンマー等): str r4,[r5,r6,lsl#2] / ldr r0,[r4,#0xc] / orr r0,r0,#1
+        static const u32 expectB2[3] = { 0xE7854106, 0xE594000C, 0xE3800001 };
+        if (!CheckWords(HOOK_A - 4, expectA, 3) || !CheckWords(HOOK_B2 - 4, expectB2, 3))
         {
             PauseGuard pg;
             MessageBox("エラー",
@@ -345,40 +366,29 @@ namespace CTRPluginFramework
         g_hookA.Initialize(HOOK_A, (u32)(uintptr_t)jp_hookA);
         g_hookA.Enable();
 
+        Process::Write32(HOOK_B2 - 4, 0xE52DF004);
+        g_hookB2.Initialize(HOOK_B2, (u32)(uintptr_t)jp_hookB2);
+        g_hookB2.Enable();
+
         g_hooksInstalled = true;
         return true;
     }
 
-    // ライフ道具(ハンマー等)用の実験フック。ゲーム再起動まで有効のまま
-    static bool InstallHookB2(void)
-    {
-        if (g_hookB2Installed)
-            return true;
-        static const u32 expectB2[3] = { 0xE7854106, 0xE594000C, 0xE3800001 }; // str r4,[r5,r6,lsl#2] / ldr r0,[r4,#0xc] / orr r0,r0,#1
-        if (!CheckWords(HOOK_B2 - 4, expectB2, 3))
-        {
-            PauseGuard pg;
-            MessageBox("エラー", "ライフ道具用フック位置の命令が想定と違います。")();
-            return false;
-        }
-        Process::Write32(HOOK_B2 - 4, 0xE52DF004);   // str pc,[sp,#-4]!
-        g_hookB2.Initialize(HOOK_B2, (u32)(uintptr_t)jp_hookB2);
-        g_hookB2.Enable();
-        g_hookB2Installed = true;
-        return true;
-    }
+    // 有効な間、毎フレーム呼ばれる(SynchronizeWithFrame により 約30回/秒)
+    //
+    //  ・装備を検出すると案内を出し、PENDING_FRAMES の間だけ Y で編集できる。
+    //  ・編集後に「反映のため同じ装備をつけ直す」操作は、編集の対象にしない。
+    //    (通常プレイ画面に戻った後で Y を押しても編集メニューが出ないようにする)
+    static constexpr u32 PENDING_FRAMES = 300;    // 約5秒
+    static constexpr u32 APPLIED_FRAMES = 1800;   // 約30秒
 
-    static void LifeToolHookEntry(MenuEntry *entry)
-    {
-        if (!InstallHookB2())
-            entry->Disable();
-    }
-
-    // 有効な間、毎フレーム呼ばれる
     static void EquipEditEntry(MenuEntry *entry)
     {
-        static u32 lastCount = 0;
-        static u32 pending   = 0;
+        static u32 lastCount    = 0;
+        static u32 pending      = 0;   // Yで編集できる対象
+        static u32 pendingTimer = 0;
+        static u32 appliedPtr   = 0;   // 編集済み(次の同一装備は反映用として無視)
+        static u32 appliedTimer = 0;
 
         if (!InstallHooks())
         {
@@ -386,23 +396,50 @@ namespace CTRPluginFramework
             return;
         }
 
+        if (pendingTimer && --pendingTimer == 0)
+            pending = 0;
+        if (appliedTimer && --appliedTimer == 0)
+            appliedPtr = 0;
+
         const u32 c = g_capCount;
         if (c != lastCount)
         {
             lastCount = c;
-            pending = g_capPtr;
-            // 画面上部の通知(OSD)は日本語が表示できないため、英数字のみ
-            OSD::Notify("Item captured. Press Y to edit.");
+            const u32 p = g_capPtr;
+            if (appliedPtr && p == appliedPtr)
+            {
+                // 編集後の「反映のための装備」: 案内も出さず、Yでも開かない
+                appliedPtr   = 0;
+                appliedTimer = 0;
+                pending      = 0;
+                pendingTimer = 0;
+            }
+            else
+            {
+                pending      = p;
+                pendingTimer = PENDING_FRAMES;
+                appliedPtr   = 0;
+                appliedTimer = 0;
+                // 画面上部の通知(OSD)は日本語が表示できないため、英数字のみ
+                OSD::Notify("Item captured. Press Y to edit.");
+            }
         }
 
         if (pending && Controller::IsKeyPressed(Key::Y))
         {
             const u32 target = pending;
-            pending = 0;
+            pending      = 0;
+            pendingTimer = 0;
 
-            PauseGuard pg;
-            EditAt(target, "装備アイテムの編集", false);
-            MessageBox("編集の終了", "外して装備し直すと反映されます。")();
+            {
+                PauseGuard pg;
+                EditAt(target, "装備アイテムの編集", false);
+                MessageBox("編集の終了", "外して装備し直すと反映されます。")();
+            }
+
+            // この後の同じ装備のつけ直しは「反映」として扱う
+            appliedPtr   = target;
+            appliedTimer = APPLIED_FRAMES;
         }
     }
 
@@ -458,7 +495,10 @@ namespace CTRPluginFramework
         const Field &f = fields[fi + 1];
 
         u32 val = 0;
-        if (!AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, 0, val))
+        const bool okv = f.choices.empty()
+                             ? AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, 0, val)
+                             : AskChoice(f.label, f.choices, val);
+        if (!okv)
             return;
 
         std::string msg = Utils::Format("かばん内の「%s」すべての%sを %s にします。よろしいですか?",
@@ -504,11 +544,9 @@ namespace CTRPluginFramework
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
-                                   "「Yボタンで編集」と表示されたらYを押し、編集後にもう一度外して着け直すと反映されます。"));
-        menu->Append(new MenuEntry("ライフ道具(ハンマー等)も拾う【実験】", LifeToolHookEntry, nullptr,
-                                   "ハンマー・針・のこぎり・フライパン・フラスコ用の追加フックです。\n"
-                                   "「新しく装備したアイテムを編集」と一緒にONにしてください。\n"
-                                   "ONにした後、ゲームを再起動するまでフックは残ります。装備でフリーズしたら使わないでください。"));
+                                   "「Press Y to edit」と表示されてから約5秒の間だけYで編集できます。\n"
+                                   "編集後、同じ装備をもう一度つけ直すと反映されます(そのつけ直しでは編集メニューは出ません)。\n"
+                                   "武器・防具・ライフ道具8種すべてに対応しています。"));
         menu->Append(new MenuEntry("アイテムエディタ(かばんの枠指定)", nullptr, ItemEditorEntry,
                                    "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
