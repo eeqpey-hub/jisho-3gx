@@ -99,7 +99,11 @@ namespace CTRPluginFramework
         u32  size;   // 1 / 2 / 4 (byte)
         bool hex;
         u32  maxV;
-        bool isFloat = false;   // true: 32bit float として読み書きする
+        bool isFloat;   // true: 32bit float として読み書きする
+
+        // C++11 でもビルドできるよう、集成体初期化ではなくコンストラクタを使う
+        Field(const std::string &l, u32 o, u32 sz, bool h, u32 mx, bool fl = false)
+            : label(l), off(o), size(sz), hex(h), maxV(mx), isFloat(fl) {}
     };
 
     static u32 SlotAddr(u32 slot) { return BAG_BASE + slot * SLOT_SIZE; }
