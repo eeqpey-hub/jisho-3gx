@@ -5,8 +5,10 @@
 //   2) Yボタンでエディタを開く
 //   3) 構造体を書き換え、「外して装備し直す」と反映される
 //
-// 日本語版のフック位置は、海外版コードとの命令列照合で求めたもの(静的解析のみ・実機未確認)。
+// 日本語版のフック位置は、海外版コードとの命令列照合で求めたもの。
 // 位置の命令列が違う場合は、フックを入れずに警告を出す。
+// フックは A(0x2D33F8) のみ。ライフ道具もAで同じレコードが取れる(gdb確認済み)。
+// フックB(0x2BA928)は、ライフ道具の装備でクラッシュしたため削除した。
 //
 // 構造体のオフセットは、ユーザー提供のARコード(かばん 0x6DDF2C から 0x3C 刻み)と
 // PLGのエディタが使う位置(+0x1E, +0x20 など)に一致している。
@@ -14,6 +16,7 @@
 #include <3ds.h>
 #include "csvc.h"
 #include <CTRPluginFramework.hpp>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -26,13 +29,11 @@
 extern "C"
 {
     void jp_hookA(void);
-    void jp_hookB(void);
 
     volatile u32 g_capPtr   = 0;
     volatile u32 g_capCount = 0;
 
     void jp_captureA(u32 r3) { g_capPtr = r3 + 4; g_capCount = g_capCount + 1; }
-    void jp_captureB(u32 r1) { g_capPtr = r1 + 4; g_capCount = g_capCount + 1; }
 }
 
 asm(R"(
@@ -53,20 +54,6 @@ jp_hookA:
     pop   {r0-r6}
     add   r6, r6, #4
     mov   pc, r6
-
-    .global jp_hookB
-    .type jp_hookB, %function
-jp_hookB:
-    ldr   r2, [sp], #4
-    push  {r4-r8, lr}
-    push  {r0-r4}
-    mov   r0, r1
-    bl    jp_captureB
-    pop   {r0-r4}
-    movs  r4, r1
-    mov   r5, r0
-    add   r2, r2, #4
-    mov   pc, r2
 )");
 
 namespace CTRPluginFramework
@@ -75,7 +62,6 @@ namespace CTRPluginFramework
     //  日本語版のアドレス
     // ------------------------------------------------------------
     static constexpr u32 HOOK_A = 0x002D33F8;   // 海外版 0x2E091C
-    static constexpr u32 HOOK_B = 0x002BA928;   // 海外版 0x2C846C
 
     static constexpr u32 BAG_BASE  = 0x006DDF2C; // かばん1枠目のアイテムID
     static constexpr u32 BAG_SLOTS = 500;
@@ -84,6 +70,7 @@ namespace CTRPluginFramework
     static constexpr u32 OFF_COUNT = 0x04;       // u8 (要確認)
     static constexpr u32 MAX_COUNT = 99;
     static constexpr u32 MAX_ID    = 0x05C4;
+    static constexpr u32 MAX_BONUS = 2147483647; // 追加数値の最大(海外版エディタと同じ)
 
     struct Category
     {
@@ -109,9 +96,10 @@ namespace CTRPluginFramework
     {
         std::string label;
         u32  off;
-        u32  size;   // 1 or 2 (byte)
+        u32  size;   // 1 / 2 / 4 (byte)
         bool hex;
         u32  maxV;
+        bool isFloat = false;   // true: 32bit float として読み書きする
     };
 
     static u32 SlotAddr(u32 slot) { return BAG_BASE + slot * SLOT_SIZE; }
@@ -124,11 +112,13 @@ namespace CTRPluginFramework
         return nullptr;
     }
 
-    static std::vector<Field> FieldsFor(const Category *c)
+    // withCount=false のとき「個数」を出さない (装備編集用)
+    static std::vector<Field> FieldsFor(const Category *c, bool withCount)
     {
         std::vector<Field> v;
         v.push_back({ "アイテムID", OFF_ID,    2, true,  MAX_ID });
-        v.push_back({ "個数",       OFF_COUNT, 1, false, MAX_COUNT });
+        if (withCount)
+            v.push_back({ "個数",   OFF_COUNT, 1, false, MAX_COUNT });
         if (!c)
             return v;
         if (c->offQuality >= 0)
@@ -136,14 +126,24 @@ namespace CTRPluginFramework
         if (c->offEffect >= 0)
             v.push_back({ "追加効果", (u32)c->offEffect, 2, true, 0xFFFF });
         if (c->offAtk >= 0)
-            v.push_back({ std::string("追加") + c->atkName, (u32)c->offAtk, 2, false, 65535 });
+            v.push_back({ std::string("追加") + c->atkName, (u32)c->offAtk - 2, 4, false, MAX_BONUS, true });
         if (c->offMatk >= 0)
-            v.push_back({ std::string("追加") + c->matkName, (u32)c->offMatk, 2, false, 65535 });
+            v.push_back({ std::string("追加") + c->matkName, (u32)c->offMatk - 2, 4, false, MAX_BONUS, true });
         return v;
     }
 
     static bool ReadField(u32 base, const Field &f, u32 &out)
     {
+        if (f.isFloat)
+        {
+            u32 raw = 0;
+            if (!Process::Read32(base + f.off, raw)) return false;
+            float t = 0.0f;
+            std::memcpy(&t, &raw, 4);
+            // 負数・NaN・巨大値は 0xFFFFFFFF(異常値)として扱う
+            out = (t >= 0.0f && t < 4.0e9f) ? (u32)t : 0xFFFFFFFFu;
+            return true;
+        }
         if (f.size == 1)
         {
             u8 t = 0;
@@ -159,6 +159,13 @@ namespace CTRPluginFramework
 
     static bool WriteField(u32 base, const Field &f, u32 val)
     {
+        if (f.isFloat)
+        {
+            float t = (float)val;
+            u32 raw = 0;
+            std::memcpy(&raw, &t, 4);
+            return Process::Write32(base + f.off, raw);
+        }
         if (f.size == 1)
             return Process::Write8(base + f.off, (u8)val);
         return Process::Write16(base + f.off, (u16)val);
@@ -166,6 +173,8 @@ namespace CTRPluginFramework
 
     static std::string FmtValue(const Field &f, u32 v)
     {
+        if (f.isFloat && v == 0xFFFFFFFFu)
+            return "異常値";
         return f.hex ? Utils::Format("0x%04X", v) : Utils::Format("%u", v);
     }
 
@@ -173,7 +182,14 @@ namespace CTRPluginFramework
     {
         Keyboard kb(msg);
         kb.IsHexadecimal(hex);
-        kb.SetMaxLength(hex ? 4 : 5);
+        int len = 4;
+        if (!hex)
+        {
+            len = 1;
+            for (u32 t = maxV; t >= 10; t /= 10)
+                ++len;
+        }
+        kb.SetMaxLength(len);
         u32 v = cur;
         if (kb.Open(v, cur) != 0)
             return false;
@@ -214,7 +230,7 @@ namespace CTRPluginFramework
             }
 
             const Category *cat = FindCategory(id);
-            std::vector<Field> fields = FieldsFor(cat);
+            std::vector<Field> fields = FieldsFor(cat, slotMode);   // 装備編集では個数を出さない
 
             std::vector<std::string> opts;
             for (const Field &f : fields)
@@ -268,7 +284,6 @@ namespace CTRPluginFramework
     };
 
     static Hook g_hookA;
-    static Hook g_hookB;
     static bool g_hooksInstalled = false;
 
     static bool CheckWords(u32 addr, const u32 *expect, int n)
@@ -289,8 +304,7 @@ namespace CTRPluginFramework
 
         // 置き換える3命令が想定どおりか確認 (違うバージョンなら入れない)
         static const u32 expectA[3] = { 0xE24DD00C, 0xE1A07000, 0xE3E00000 }; // sub sp,#0xC / mov r7,r0 / mvn r0,#0
-        static const u32 expectB[3] = { 0xE92D41F0, 0xE1B04001, 0xE1A05000 }; // push {r4-r8,lr} / movs r4,r1 / mov r5,r0
-        if (!CheckWords(HOOK_A - 4, expectA, 3) || !CheckWords(HOOK_B - 4, expectB, 3))
+        if (!CheckWords(HOOK_A - 4, expectA, 3))
         {
             PauseGuard pg;
             MessageBox("エラー",
@@ -300,12 +314,9 @@ namespace CTRPluginFramework
 
         // PLGと同じ手順: found-4 に str pc,[sp,#-4]! を書き、found に ldr pc 形式のフックを入れる
         Process::Write32(HOOK_A - 4, 0xE52DF004);
-        Process::Write32(HOOK_B - 4, 0xE52DF004);
 
         g_hookA.Initialize(HOOK_A, (u32)(uintptr_t)jp_hookA);
-        g_hookB.Initialize(HOOK_B, (u32)(uintptr_t)jp_hookB);
         g_hookA.Enable();
-        g_hookB.Enable();
 
         g_hooksInstalled = true;
         return true;
@@ -383,7 +394,7 @@ namespace CTRPluginFramework
             return;
         const Category &cat = g_cats[ci];
 
-        std::vector<Field> fields = FieldsFor(&cat);
+        std::vector<Field> fields = FieldsFor(&cat, true);   // [0]=ID [1]=個数 を前提
         std::vector<std::string> fn;
         for (size_t i = 1; i < fields.size(); ++i)
             fn.push_back(fields[i].label);
