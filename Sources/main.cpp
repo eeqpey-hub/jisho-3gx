@@ -247,7 +247,7 @@ namespace CTRPluginFramework
                 if (AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, val))
                 {
                     if (!WriteField(base, f, val))
-                        OSD::Notify("書き込みに失敗しました");
+                        MessageBox("エラー", "書き込みに失敗しました。")();
                 }
             }
             else if ((size_t)sel == fields.size())
@@ -260,6 +260,13 @@ namespace CTRPluginFramework
     // ------------------------------------------------------------
     //  海外版と同じ「新しく装備したアイテムを編集」
     // ------------------------------------------------------------
+    // エディタを開いている間、ゲームを止める(止めないとボタン入力がゲームにも届く)
+    struct PauseGuard
+    {
+        PauseGuard()  { Process::Pause(); }
+        ~PauseGuard() { Process::Play(); }
+    };
+
     static Hook g_hookA;
     static Hook g_hookB;
     static bool g_hooksInstalled = false;
@@ -285,6 +292,7 @@ namespace CTRPluginFramework
         static const u32 expectB[3] = { 0xE92D41F0, 0xE1B04001, 0xE1A05000 }; // push {r4-r8,lr} / movs r4,r1 / mov r5,r0
         if (!CheckWords(HOOK_A - 4, expectA, 3) || !CheckWords(HOOK_B - 4, expectB, 3))
         {
+            PauseGuard pg;
             MessageBox("エラー",
                        "フック位置の命令が想定と違います。\nゲームのバージョンが異なる可能性があるため、機能を有効にできません。")();
             return false;
@@ -320,15 +328,18 @@ namespace CTRPluginFramework
         {
             lastCount = c;
             pending = g_capPtr;
-            OSD::Notify("Yボタンで、いま装備したアイテムを編集できます");
+            // 画面上部の通知(OSD)は日本語が表示できないため、英数字のみ
+            OSD::Notify("Item captured. Press Y to edit.");
         }
 
         if (pending && Controller::IsKeyPressed(Key::Y))
         {
             const u32 target = pending;
             pending = 0;
+
+            PauseGuard pg;
             EditAt(target, "装備アイテムの編集", false);
-            OSD::Notify("外して装備し直すと反映されます");
+            MessageBox("編集の終了", "外して装備し直すと反映されます。")();
         }
     }
 
@@ -404,7 +415,7 @@ namespace CTRPluginFramework
             if (WriteField(base, f, val))
                 ++n;
         }
-        OSD::Notify(Utils::Format("%u 件を変更しました", n));
+        MessageBox("完了", Utils::Format("%u 件を変更しました。", n))();
     }
 
     // ------------------------------------------------------------
@@ -422,7 +433,7 @@ namespace CTRPluginFramework
     int main(void)
     {
         if (Process::GetTitleID() != 0x00040000000E9C00ULL)
-            OSD::Notify("警告: 想定外のタイトルです");
+            OSD::Notify("Warning: unexpected title.");
 
         PluginMenu *menu = new PluginMenu("ファンタジーライフ アイテムエディタ", 0, 2, 0,
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
