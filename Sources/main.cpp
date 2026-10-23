@@ -1,11 +1,15 @@
 // ファンタジーライフ(日本語版) アイテムエディタ  (CTRPluginFramework / .3gx)
 //
-// 構造はユーザー提供のARコードから起こしたもの:
-//   かばん 500枠 x 0x3C 、1枠目のアイテムID = 0x006DDF2C
-//   カテゴリはIDの範囲で判定し、カテゴリごとに編集できる項目とオフセットが違う
+// 海外版PLGのItemEditorと同じ仕組み:
+//   1) ゲームの装備処理2か所にフックを入れ、装備したアイテムの構造体アドレスを取得
+//   2) Yボタンでエディタを開く
+//   3) 構造体を書き換え、「外して装備し直す」と反映される
 //
-// ※ 未コンパイル・未実機テスト。個数のオフセット(+4)は「たぶん」なので　
-//    「Hexダンプを表示」で確認してから使うこと。
+// 日本語版のフック位置は、海外版コードとの命令列照合で求めたもの(静的解析のみ・実機未確認)。
+// 位置の命令列が違う場合は、フックを入れずに警告を出す。
+//
+// 構造体のオフセットは、ユーザー提供のARコード(かばん 0x6DDF2C から 0x3C 刻み)と
+// PLGのエディタが使う位置(+0x1E, +0x20 など)に一致している。
 
 #include <3ds.h>
 #include "csvc.h"
@@ -13,23 +17,78 @@
 #include <string>
 #include <vector>
 
+// ------------------------------------------------------------
+//  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
+//  呼び出し側で「found-4」に str pc,[sp,#-4]! を書いてあるので、
+//  スタックには (found+4) が積まれている。置き換えた3命令をここで再実行して、
+//  found+8 に戻る。
+// ------------------------------------------------------------
+extern "C"
+{
+    void jp_hookA(void);
+    void jp_hookB(void);
+
+    volatile u32 g_capPtr   = 0;
+    volatile u32 g_capCount = 0;
+
+    void jp_captureA(u32 r3) { g_capPtr = r3 + 4; g_capCount = g_capCount + 1; }
+    void jp_captureB(u32 r1) { g_capPtr = r1 + 4; g_capCount = g_capCount + 1; }
+}
+
+asm(R"(
+    .arm
+    .text
+    .align 2
+
+    .global jp_hookA
+    .type jp_hookA, %function
+jp_hookA:
+    ldr   r6, [sp], #4
+    sub   sp, sp, #0xC
+    mov   r7, r0
+    mvn   r0, #0
+    push  {r0-r6}
+    mov   r0, r3
+    bl    jp_captureA
+    pop   {r0-r6}
+    add   r6, r6, #4
+    mov   pc, r6
+
+    .global jp_hookB
+    .type jp_hookB, %function
+jp_hookB:
+    ldr   r2, [sp], #4
+    push  {r4-r8, lr}
+    push  {r0-r4}
+    mov   r0, r1
+    bl    jp_captureB
+    pop   {r0-r4}
+    movs  r4, r1
+    mov   r5, r0
+    add   r2, r2, #4
+    mov   pc, r2
+)");
+
 namespace CTRPluginFramework
 {
     // ------------------------------------------------------------
-    //  アドレス・構造 (日本語版)
+    //  日本語版のアドレス
     // ------------------------------------------------------------
-    static constexpr u32 BAG_BASE  = 0x006DDF2C; // 1枠目のアイテムID
+    static constexpr u32 HOOK_A = 0x002D33F8;   // 海外版 0x2E091C
+    static constexpr u32 HOOK_B = 0x002BA928;   // 海外版 0x2C846C
+
+    static constexpr u32 BAG_BASE  = 0x006DDF2C; // かばん1枠目のアイテムID
     static constexpr u32 BAG_SLOTS = 500;
     static constexpr u32 SLOT_SIZE = 0x3C;
     static constexpr u32 OFF_ID    = 0x00;       // u16
     static constexpr u32 OFF_COUNT = 0x04;       // u8 (要確認)
     static constexpr u32 MAX_COUNT = 99;
-    static constexpr u32 MAX_ID    = 0x09DF;
+    static constexpr u32 MAX_ID    = 0x05C4;
 
     struct Category
     {
         const char *name;
-        u16  idMin, idMax;   // 両端を含む
+        u16  idMin, idMax;
         int  offQuality;     // u8   / -1 = なし
         int  offEffect;      // u16
         int  offAtk;         // u16
@@ -40,12 +99,11 @@ namespace CTRPluginFramework
 
     static const Category g_cats[] =
     {
-　　　　 { "アイテム", 0x05C5, 0x09DF, -1, -1, -1, -1, nullptr, nullptr },
-        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
+        { "武器",       0x0001, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
         { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力" },
         { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr },
         { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr },
-　　};
+    };
 
     struct Field
     {
@@ -125,9 +183,8 @@ namespace CTRPluginFramework
         return true;
     }
 
-    static void ShowDump(u32 slot)
+    static void ShowDump(u32 base)
     {
-        const u32 base = SlotAddr(slot);
         std::string s;
         for (u32 i = 0; i < SLOT_SIZE; ++i)
         {
@@ -137,18 +194,18 @@ namespace CTRPluginFramework
             if (i % 12 == 11)
                 s += "\n";
         }
-        MessageBox(Utils::Format("%u枠目 (0x%08X)", slot + 1, base), s)();
+        MessageBox(Utils::Format("アドレス 0x%08X", base), s)();
     }
 
     // ------------------------------------------------------------
-    //  1枠ずつ編集
+    //  指定アドレスのアイテムを編集する共通UI
+    //  slotMode=true のときは「別の枠を選ぶ」を出す
     //  戻り値: true = 別の枠を選ぶ / false = 終了
     // ------------------------------------------------------------
-    static bool EditSlot(u32 slot)
+    static bool EditAt(u32 base, const std::string &title, bool slotMode)
     {
         for (;;)
         {
-            const u32 base = SlotAddr(slot);
             u16 id = 0;
             if (!Process::Read16(base + OFF_ID, id))
             {
@@ -167,9 +224,10 @@ namespace CTRPluginFramework
                 opts.push_back(f.label + ": " + FmtValue(f, v));
             }
             opts.push_back("Hexダンプを表示");
-            opts.push_back("別の枠を選ぶ");
+            if (slotMode)
+                opts.push_back("別の枠を選ぶ");
 
-            Keyboard kb(Utils::Format("かばん %u枠目 [%s]", slot + 1, cat ? cat->name : "空き/未対応"), opts);
+            Keyboard kb(Utils::Format("%s [%s]", title.c_str(), cat ? cat->name : "空き/未対応"), opts);
             int sel = kb.Open();
             if (sel < 0)
                 return false;
@@ -193,12 +251,90 @@ namespace CTRPluginFramework
                 }
             }
             else if ((size_t)sel == fields.size())
-                ShowDump(slot);
+                ShowDump(base);
             else
                 return true;
         }
     }
 
+    // ------------------------------------------------------------
+    //  海外版と同じ「新しく装備したアイテムを編集」
+    // ------------------------------------------------------------
+    static Hook g_hookA;
+    static Hook g_hookB;
+    static bool g_hooksInstalled = false;
+
+    static bool CheckWords(u32 addr, const u32 *expect, int n)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            u32 v = 0;
+            if (!Process::Read32(addr + 4 * i, v) || v != expect[i])
+                return false;
+        }
+        return true;
+    }
+
+    static bool InstallHooks(void)
+    {
+        if (g_hooksInstalled)
+            return true;
+
+        // 置き換える3命令が想定どおりか確認 (違うバージョンなら入れない)
+        static const u32 expectA[3] = { 0xE24DD00C, 0xE1A07000, 0xE3E00000 }; // sub sp,#0xC / mov r7,r0 / mvn r0,#0
+        static const u32 expectB[3] = { 0xE92D41F0, 0xE1B04001, 0xE1A05000 }; // push {r4-r8,lr} / movs r4,r1 / mov r5,r0
+        if (!CheckWords(HOOK_A - 4, expectA, 3) || !CheckWords(HOOK_B - 4, expectB, 3))
+        {
+            MessageBox("エラー",
+                       "フック位置の命令が想定と違います。\nゲームのバージョンが異なる可能性があるため、機能を有効にできません。")();
+            return false;
+        }
+
+        // PLGと同じ手順: found-4 に str pc,[sp,#-4]! を書き、found に ldr pc 形式のフックを入れる
+        Process::Write32(HOOK_A - 4, 0xE52DF004);
+        Process::Write32(HOOK_B - 4, 0xE52DF004);
+
+        g_hookA.Initialize(HOOK_A, (u32)(uintptr_t)jp_hookA);
+        g_hookB.Initialize(HOOK_B, (u32)(uintptr_t)jp_hookB);
+        g_hookA.Enable();
+        g_hookB.Enable();
+
+        g_hooksInstalled = true;
+        return true;
+    }
+
+    // 有効な間、毎フレーム呼ばれる
+    static void EquipEditEntry(MenuEntry *entry)
+    {
+        static u32 lastCount = 0;
+        static u32 pending   = 0;
+
+        if (!InstallHooks())
+        {
+            entry->Disable();
+            return;
+        }
+
+        const u32 c = g_capCount;
+        if (c != lastCount)
+        {
+            lastCount = c;
+            pending = g_capPtr;
+            OSD::Notify("Yボタンで、いま装備したアイテムを編集できます");
+        }
+
+        if (pending && Controller::IsKeyPressed(Key::Y))
+        {
+            const u32 target = pending;
+            pending = 0;
+            EditAt(target, "装備アイテムの編集", false);
+            OSD::Notify("外して装備し直すと反映されます");
+        }
+    }
+
+    // ------------------------------------------------------------
+    //  かばんの枠を指定して編集
+    // ------------------------------------------------------------
     static void ItemEditorEntry(MenuEntry *entry)
     {
         (void)entry;
@@ -214,7 +350,7 @@ namespace CTRPluginFramework
             if (n < 1) n = 1;
             if (n > BAG_SLOTS) n = BAG_SLOTS;
             last = n;
-            if (!EditSlot(n - 1))
+            if (!EditAt(SlotAddr(n - 1), Utils::Format("かばん %u枠目", n), true))
                 return;
         }
     }
@@ -228,7 +364,7 @@ namespace CTRPluginFramework
 
         std::vector<std::string> names;
         for (const Category &c : g_cats)
-            names.push_back(c.name);
+            names.push_back(Utils::Format("%s (ID 0x%04X〜0x%04X)", c.name, c.idMin, c.idMax));
 
         Keyboard kc("一括変更するカテゴリを選択", names);
         int ci = kc.Open();
@@ -238,7 +374,7 @@ namespace CTRPluginFramework
 
         std::vector<Field> fields = FieldsFor(&cat);
         std::vector<std::string> fn;
-        for (size_t i = 1; i < fields.size(); ++i) // IDは一括対象から除く
+        for (size_t i = 1; i < fields.size(); ++i)
             fn.push_back(fields[i].label);
 
         Keyboard kf(Utils::Format("[%s] 変更する項目", cat.name), fn);
@@ -285,15 +421,17 @@ namespace CTRPluginFramework
 
     int main(void)
     {
-        // 日本語版のベースTID (更新データ 0004000E000E9C00 から推定)
         if (Process::GetTitleID() != 0x00040000000E9C00ULL)
             OSD::Notify("警告: 想定外のタイトルです");
 
-        PluginMenu *menu = new PluginMenu("ファンタジーライフ アイテムエディタ", 0, 1, 0,
-                                          "日本語版用。かばん(500枠)のアイテムを編集します。");
+        PluginMenu *menu = new PluginMenu("ファンタジーライフ アイテムエディタ", 0, 2, 0,
+                                          "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
 
-        menu->Append(new MenuEntry("アイテムエディタ(かばん)", nullptr, ItemEditorEntry,
+        menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
+                                   "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
+                                   "「Yボタンで編集」と表示されたらYを押し、編集後にもう一度外して着け直すと反映されます。"));
+        menu->Append(new MenuEntry("アイテムエディタ(かばんの枠指定)", nullptr, ItemEditorEntry,
                                    "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の全アイテムの項目をまとめて変更します。"));
