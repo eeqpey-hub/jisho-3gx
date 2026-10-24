@@ -21,6 +21,28 @@
 #include <vector>
 
 // ------------------------------------------------------------
+//  名前の表 (ID → 表示名)。末尾は name == nullptr。
+//  ItemNames.hpp があれば、その中の g_itemNames / g_effectNames を使う。
+//  無ければ空の表になり、IDの直接入力だけになる。
+// ------------------------------------------------------------
+struct NameEntry
+{
+    u16         id;
+    const char *name;
+};
+
+#if defined(__has_include)
+#  if __has_include("ItemNames.hpp")
+#    include "ItemNames.hpp"
+#    define HAVE_NAME_TABLES 1
+#  endif
+#endif
+#ifndef HAVE_NAME_TABLES
+static const NameEntry g_itemNames[]   = { { 0xFFFF, nullptr } };
+static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
+#endif
+
+// ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
 //  呼び出し側で「found-4」に str pc,[sp,#-4]! を書いてあるので、
 //  スタックには (found+4) が積まれている。置き換えた3命令をここで再実行して、
@@ -107,11 +129,15 @@ namespace CTRPluginFramework
 
     static const Category g_cats[] =
     {
-        { "武器",       0x0001, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
+        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
         { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力" },
         { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr },
         { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr },
     };
+
+    static constexpr int K_NORMAL = 0;
+    static constexpr int K_ITEMID = 1;   // アイテムID (範囲チェック+一覧)
+    static constexpr int K_EFFECT = 2;   // 追加効果ID (一覧)
 
     struct Field
     {
@@ -121,11 +147,12 @@ namespace CTRPluginFramework
         bool hex;
         u32  maxV;
         bool isFloat;   // true: 32bit float として読み書きする
+        int  kind;      // K_NORMAL / K_ITEMID / K_EFFECT
         std::vector<std::string> choices;   // 空でなければ「選択式」(値=選択肢の番号)
 
         // C++11 でもビルドできるよう、集成体初期化ではなくコンストラクタを使う
         Field(const std::string &l, u32 o, u32 sz, bool h, u32 mx, bool fl = false)
-            : label(l), off(o), size(sz), hex(h), maxV(mx), isFloat(fl) {}
+            : label(l), off(o), size(sz), hex(h), maxV(mx), isFloat(fl), kind(K_NORMAL) {}
     };
 
     static u32 SlotAddr(u32 slot) { return BAG_BASE + slot * SLOT_SIZE; }
@@ -143,6 +170,7 @@ namespace CTRPluginFramework
     {
         std::vector<Field> v;
         v.push_back({ "アイテムID", OFF_ID,    2, true,  MAX_ID });
+        v.back().kind = K_ITEMID;
         if (withCount)
             v.push_back({ "個数",   OFF_COUNT, 1, false, MAX_COUNT });
         if (!c)
@@ -153,7 +181,10 @@ namespace CTRPluginFramework
             v.back().choices = { "なし", "上", "特上", "最高", "ゴッド" };   // 値 0〜4
         }
         if (c->offEffect >= 0)
+        {
             v.push_back({ "追加効果", (u32)c->offEffect, 2, true, 0xFFFF });
+            v.back().kind = K_EFFECT;
+        }
         if (c->offAtk >= 0)
             v.push_back({ std::string("追加") + c->atkName, (u32)c->offAtk - 2, 4, false, MAX_BONUS, true });
         if (c->offMatk >= 0)
@@ -200,12 +231,28 @@ namespace CTRPluginFramework
         return Process::Write16(base + f.off, (u16)val);
     }
 
+    static const char *LookupName(const NameEntry *table, u32 id)
+    {
+        for (const NameEntry *e = table; e->name; ++e)
+            if (e->id == id)
+                return e->name;
+        return nullptr;
+    }
+
     static std::string FmtValue(const Field &f, u32 v)
     {
         if (!f.choices.empty() && v < f.choices.size())
             return f.choices[v];
         if (f.isFloat && v == 0xFFFFFFFFu)
             return "異常値";
+        if (f.kind == K_ITEMID || f.kind == K_EFFECT)
+        {
+            std::string t = Utils::Format("0x%04X", v);
+            const char *n = LookupName(f.kind == K_ITEMID ? g_itemNames : g_effectNames, v);
+            if (n)
+                t += std::string(" ") + n;
+            return t;
+        }
         return f.hex ? Utils::Format("0x%04X", v) : Utils::Format("%u", v);
     }
 
@@ -239,6 +286,85 @@ namespace CTRPluginFramework
             return false;
         out = (u32)sel;
         return true;
+    }
+
+    // 16進のIDを入力する。restrict=true のときは lo〜hi の範囲外を弾く
+    static bool AskHexId(const std::string &title, u32 cur, bool restrict, u32 lo, u32 hi, u32 &out)
+    {
+        for (;;)
+        {
+            Keyboard kb(title);
+            kb.IsHexadecimal(true);
+            kb.SetMaxLength(4);
+            u32 v = cur;
+            if (kb.Open(v, cur) != 0)
+                return false;
+            if (restrict && (v < lo || v > hi))
+            {
+                MessageBox("範囲外のID",
+                           Utils::Format("入力できるIDは 0x%04X 〜 0x%04X です。", lo, hi))();
+                continue;
+            }
+            out = v;
+            return true;
+        }
+    }
+
+    // 「[ID入力]」+ 名前の一覧。一覧が空のときは、ID入力だけになる。
+    static bool PickFromNames(const std::string &title, const NameEntry *table,
+                              bool restrict, u32 lo, u32 hi, u32 cur, u32 &out)
+    {
+        std::vector<std::string> opts;
+        std::vector<u32> ids;
+        opts.push_back(Utils::Format("[ID入力] 現在 0x%04X", cur));
+        ids.push_back(0);
+        for (const NameEntry *e = table; e->name; ++e)
+        {
+            if (restrict && (e->id < lo || e->id > hi))
+                continue;
+            opts.push_back(Utils::Format("%04X ", (u32)e->id) + e->name);
+            ids.push_back(e->id);
+        }
+
+        const std::string hexTitle = title + " (16進)";
+        if (opts.size() == 1)
+            return AskHexId(hexTitle, cur, restrict, lo, hi, out);
+
+        for (;;)
+        {
+            Keyboard kb(title, opts);
+            int sel = kb.Open();
+            if (sel < 0)
+                return false;
+            if (sel == 0)
+            {
+                if (AskHexId(hexTitle, cur, restrict, lo, hi, out))
+                    return true;
+                continue;
+            }
+            out = ids[sel];
+            return true;
+        }
+    }
+
+    // 項目ごとの入力方法をまとめたもの (装備編集・かばん編集・一括変更で共通)
+    static bool AskFieldValue(const Field &f, const Category *cat, u32 cur, u32 &out)
+    {
+        if (!f.choices.empty())
+            return AskChoice(f.label, f.choices, out);
+
+        if (f.kind == K_ITEMID)
+        {
+            // 種類の範囲内のIDだけを許可する (範囲外は弾く)
+            if (cat)
+                return PickFromNames(Utils::Format("アイテムID [%s]", cat->name), g_itemNames,
+                                     true, cat->idMin, cat->idMax, cur, out);
+            return PickFromNames("アイテムID", g_itemNames, false, 0, MAX_ID, cur, out);
+        }
+        if (f.kind == K_EFFECT)
+            return PickFromNames(f.label, g_effectNames, false, 0, 0xFFFF, cur, out);
+
+        return AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, out);
     }
 
     static void ShowDump(u32 base)
@@ -294,18 +420,9 @@ namespace CTRPluginFramework
             {
                 const Field &f = fields[sel];
 
-                if (sel == 0
-                    && !(MessageBox("注意",
-                                    "別カテゴリのIDに変えると、他の項目が不正な値になる可能性があります。続けますか?",
-                                    DialogType::DialogYesNo))())
-                    continue;
-
                 u32 cur = 0, val = 0;
                 ReadField(base, f, cur);
-                const bool ok = f.choices.empty()
-                                    ? AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, val)
-                                    : AskChoice(f.label, f.choices, val);
-                if (ok)
+                if (AskFieldValue(f, cat, cur, val))
                 {
                     if (!WriteField(base, f, val))
                         MessageBox("エラー", "書き込みに失敗しました。")();
@@ -374,12 +491,12 @@ namespace CTRPluginFramework
         return true;
     }
 
-    // 有効な間、毎フレーム呼ばれる(SynchronizeWithFrame により 約30回/秒)
+    // 有効な間、毎フレーム呼ばれる(SynchronizeWithFrame により 約60回/秒)
     //
     //  ・装備を検出すると案内を出し、PENDING_FRAMES の間だけ Y で編集できる。
     //  ・編集後に「反映のため同じ装備をつけ直す」操作は、編集の対象にしない。
     //    (通常プレイ画面に戻った後で Y を押しても編集メニューが出ないようにする)
-    static constexpr u32 PENDING_FRAMES = 300;    // 約5秒
+    static constexpr u32 PENDING_FRAMES = 600;    // 約10秒
     static constexpr u32 APPLIED_FRAMES = 1800;   // 約30秒
 
     static void EquipEditEntry(MenuEntry *entry)
@@ -495,10 +612,7 @@ namespace CTRPluginFramework
         const Field &f = fields[fi + 1];
 
         u32 val = 0;
-        const bool okv = f.choices.empty()
-                             ? AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, 0, val)
-                             : AskChoice(f.label, f.choices, val);
-        if (!okv)
+        if (!AskFieldValue(f, &cat, 0, val))
             return;
 
         std::string msg = Utils::Format("かばん内の「%s」すべての%sを %s にします。よろしいですか?",
@@ -518,42 +632,4 @@ namespace CTRPluginFramework
             if (WriteField(base, f, val))
                 ++n;
         }
-        MessageBox("完了", Utils::Format("%u 件を変更しました。", n))();
-    }
-
-    // ------------------------------------------------------------
-    //  CTRPF 必須関数
-    // ------------------------------------------------------------
-    void PatchProcess(FwkSettings &settings)
-    {
-        (void)settings;
-    }
-
-    void OnProcessExit(void)
-    {
-    }
-
-    int main(void)
-    {
-        if (Process::GetTitleID() != 0x00040000000E9C00ULL)
-            OSD::Notify("Warning: unexpected title.");
-
-        PluginMenu *menu = new PluginMenu("ファンタジーライフ アイテムエディタ", 0, 2, 0,
-                                          "日本語版用。海外版PLGのItemEditorと同じ方式です。");
-        menu->SynchronizeWithFrame(true);
-
-        menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
-                                   "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
-                                   "「Press Y to edit」と表示されてから約5秒の間だけYで編集できます。\n"
-                                   "編集後、同じ装備をもう一度つけ直すと反映されます(そのつけ直しでは編集メニューは出ません)。\n"
-                                   "武器・防具・ライフ道具8種すべてに対応しています。"));
-        menu->Append(new MenuEntry("アイテムエディタ(かばんの枠指定)", nullptr, ItemEditorEntry,
-                                   "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
-        menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
-                                   "武器・防具・ライフ道具・家具ごとに、かばん内の全アイテムの項目をまとめて変更します。"));
-
-        menu->Run();
-        delete menu;
-        return 0;
-    }
-}
+        MessageBox("完了"
