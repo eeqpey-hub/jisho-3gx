@@ -310,6 +310,246 @@ namespace CTRPluginFramework
         }
     }
 
+    // ------------------------------------------------------------
+    //  名前で検索 (かな入力)
+    //  CTRPFのキーボードは英数字しか打てないため、「行 → 文字」の2段階で
+    //  かなを1文字ずつ選んで検索語を作る。ひらがな/カタカナ、全角/半角英数、
+    //  大文字/小文字は区別しない。名前の途中に含まれていてもヒットし、
+    //  先頭が一致するものを先に並べる。
+    // ------------------------------------------------------------
+    static void Utf8Decode(const char *s, std::vector<u32> &out)
+    {
+        while (*s)
+        {
+            const u8 c = (u8)*s;
+            u32 cp;
+            int n;
+            if (c < 0x80)                { cp = c;        n = 1; }
+            else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; n = 2; }
+            else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; n = 3; }
+            else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; n = 4; }
+            else { ++s; continue; }
+            ++s;
+            for (int i = 1; i < n && (((u8)*s) & 0xC0) == 0x80; ++i, ++s)
+                cp = (cp << 6) | (((u8)*s) & 0x3F);
+            out.push_back(cp);
+        }
+    }
+
+    static void Utf8Append(std::string &s, u32 cp)
+    {
+        if (cp < 0x80)
+            s += (char)cp;
+        else if (cp < 0x800)
+        {
+            s += (char)(0xC0 | (cp >> 6));
+            s += (char)(0x80 | (cp & 0x3F));
+        }
+        else if (cp < 0x10000)
+        {
+            s += (char)(0xE0 | (cp >> 12));
+            s += (char)(0x80 | ((cp >> 6) & 0x3F));
+            s += (char)(0x80 | (cp & 0x3F));
+        }
+        else
+        {
+            s += (char)(0xF0 | (cp >> 18));
+            s += (char)(0x80 | ((cp >> 12) & 0x3F));
+            s += (char)(0x80 | ((cp >> 6) & 0x3F));
+            s += (char)(0x80 | (cp & 0x3F));
+        }
+    }
+
+    // 検索用に文字をそろえる (カタカナ→ひらがな、全角英数→半角、大文字→小文字)
+    static u32 FoldChar(u32 c)
+    {
+        if (c >= 0x30A1 && c <= 0x30F6) return c - 0x60;
+        if (c >= 0xFF21 && c <= 0xFF3A) return c - 0xFF21 + 'a';
+        if (c >= 0xFF41 && c <= 0xFF5A) return c - 0xFF41 + 'a';
+        if (c >= 0xFF10 && c <= 0xFF19) return c - 0xFF10 + '0';
+        if (c >= 'A' && c <= 'Z')       return c - 'A' + 'a';
+        if (c == 0x3000)                return ' ';
+        return c;
+    }
+
+    struct SearchItem
+    {
+        u32               id;
+        const char       *name;
+        std::vector<u32>  key;   // 検索用に整えた名前 (先頭の ＃ や空白は除く)
+    };
+
+    static int FindSub(const std::vector<u32> &hay, const std::vector<u32> &q)
+    {
+        if (q.empty())
+            return 0;
+        if (hay.size() < q.size())
+            return -1;
+        for (size_t i = 0; i + q.size() <= hay.size(); ++i)
+        {
+            size_t j = 0;
+            while (j < q.size() && hay[i + j] == q[j])
+                ++j;
+            if (j == q.size())
+                return (int)i;
+        }
+        return -1;
+    }
+
+    // 先頭一致 → 途中一致 の順に並べる
+    static void CollectMatches(const std::vector<SearchItem> &items, const std::vector<u32> &q,
+                               std::vector<size_t> &out)
+    {
+        out.clear();
+        std::vector<size_t> rest;
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            const int p = FindSub(items[i].key, q);
+            if (p == 0)
+                out.push_back(i);
+            else if (p > 0)
+                rest.push_back(i);
+        }
+        out.insert(out.end(), rest.begin(), rest.end());
+    }
+
+    struct KanaRow
+    {
+        const char *name;    // 行の名前
+        const char *chars;   // この行で選べる文字 (ひらがな)
+    };
+
+    static const KanaRow g_kanaRows[] =
+    {
+        { "あ行", "あいうえおぁぃぅぇぉゔ" },
+        { "か行", "かきくけこがぎぐげご" },
+        { "さ行", "さしすせそざじずぜぞ" },
+        { "た行", "たちつてとだぢづでどっ" },
+        { "な行", "なにぬねの" },
+        { "は行", "はひふへほばびぶべぼぱぴぷぺぽ" },
+        { "ま行", "まみむめも" },
+        { "や行", "やゆよゃゅょ" },
+        { "ら行", "らりるれろ" },
+        { "わ行", "わをんー" },
+    };
+    static constexpr int KANA_ROWS = (int)(sizeof(g_kanaRows) / sizeof(g_kanaRows[0]));
+
+    // 行の中から1文字選んで検索語の末尾に足す
+    static bool PickKana(const KanaRow &row, std::vector<u32> &q)
+    {
+        std::vector<u32> cs;
+        Utf8Decode(row.chars, cs);
+        std::vector<std::string> opts;
+        for (u32 c : cs)
+        {
+            std::string s;
+            Utf8Append(s, c);
+            opts.push_back(s);
+        }
+        Keyboard kb(Utils::Format("%s: 文字を選んでください", row.name), opts);
+        const int sel = kb.Open();
+        if (sel < 0)
+            return false;
+        q.push_back(FoldChar(cs[sel]));
+        return true;
+    }
+
+    // 名前で検索して1つ選ぶ。キャンセルなら false
+    static bool SearchByName(const NameEntry *table, bool restrict, u32 lo, u32 hi, u32 &out)
+    {
+        std::vector<SearchItem> items;
+        for (const NameEntry *e = table; e->name; ++e)
+        {
+            if (restrict && (e->id < lo || e->id > hi))
+                continue;
+            SearchItem it;
+            it.id   = e->id;
+            it.name = e->name;
+            std::vector<u32> raw;
+            Utf8Decode(e->name, raw);
+            size_t start = 0;
+            while (start < raw.size() && (raw[start] == 0xFF03 || raw[start] == '#' ||
+                                          raw[start] == 0x3000 || raw[start] == ' '))
+                ++start;
+            for (size_t k = start; k < raw.size(); ++k)
+                it.key.push_back(FoldChar(raw[k]));
+            items.push_back(it);
+        }
+
+        std::vector<u32>    q;
+        std::vector<size_t> hit;
+        const int IDX_ASCII = KANA_ROWS + 1;
+        const int IDX_BACK  = KANA_ROWS + 2;
+        const int IDX_CLEAR = KANA_ROWS + 3;
+
+        for (;;)
+        {
+            CollectMatches(items, q, hit);
+
+            std::string qs;
+            for (u32 c : q)
+                Utf8Append(qs, c);
+
+            std::vector<std::string> opts;
+            opts.push_back(Utils::Format("▶ 候補を見る (%u件)", (u32)hit.size()));
+            for (int i = 0; i < KANA_ROWS; ++i)
+                opts.push_back(g_kanaRows[i].name);
+            opts.push_back("英数字を入力");
+            opts.push_back("1文字消す");
+            opts.push_back("全部消す");
+
+            Keyboard kb(q.empty() ? std::string("名前検索: かなを選んでください")
+                                  : Utils::Format("名前検索: 「%s」", qs.c_str()),
+                        opts);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return false;
+
+            if (sel == 0)
+            {
+                if (hit.empty())
+                {
+                    MessageBox("候補なし", "該当するものがありません。")();
+                    continue;
+                }
+                std::vector<std::string> co;
+                for (size_t i : hit)
+                    co.push_back(Utils::Format("%04X ", items[i].id) + items[i].name);
+                Keyboard kc(Utils::Format("候補 「%s」 %u件", qs.c_str(), (u32)hit.size()), co);
+                const int cs = kc.Open();
+                if (cs < 0)
+                    continue;
+                out = items[hit[cs]].id;
+                return true;
+            }
+            if (sel <= KANA_ROWS)
+            {
+                PickKana(g_kanaRows[sel - 1], q);
+            }
+            else if (sel == IDX_ASCII)
+            {
+                Keyboard ka("英数字を入力 (検索語に追加されます)");
+                std::string s;
+                if (ka.Open(s) >= 0)
+                {
+                    std::vector<u32> t;
+                    Utf8Decode(s.c_str(), t);
+                    for (u32 c : t)
+                        q.push_back(FoldChar(c));
+                }
+            }
+            else if (sel == IDX_BACK)
+            {
+                if (!q.empty())
+                    q.pop_back();
+            }
+            else if (sel == IDX_CLEAR)
+            {
+                q.clear();
+            }
+        }
+    }
+
     // 「[ID入力]」+ 名前の一覧。一覧が空のときは、ID入力だけになる。
     static bool PickFromNames(const std::string &title, const NameEntry *table,
                               bool restrict, u32 lo, u32 hi, u32 cur, u32 &out)
@@ -318,6 +558,9 @@ namespace CTRPluginFramework
         std::vector<u32> ids;
         opts.push_back(Utils::Format("[ID入力] 現在 0x%04X", cur));
         ids.push_back(0);
+        opts.push_back("[名前で検索] (かな入力)");
+        ids.push_back(0);
+        const size_t head = opts.size();
         for (const NameEntry *e = table; e->name; ++e)
         {
             if (restrict && (e->id < lo || e->id > hi))
@@ -327,7 +570,7 @@ namespace CTRPluginFramework
         }
 
         const std::string hexTitle = title + " (16進)";
-        if (opts.size() == 1)
+        if (opts.size() == head)
             return AskHexId(hexTitle, cur, restrict, lo, hi, out);
 
         for (;;)
@@ -339,6 +582,12 @@ namespace CTRPluginFramework
             if (sel == 0)
             {
                 if (AskHexId(hexTitle, cur, restrict, lo, hi, out))
+                    return true;
+                continue;
+            }
+            if (sel == 1)
+            {
+                if (SearchByName(table, restrict, lo, hi, out))
                     return true;
                 continue;
             }
@@ -491,6 +740,26 @@ namespace CTRPluginFramework
         return true;
     }
 
+    // ------------------------------------------------------------
+    //  画面上部の日本語案内
+    //  OSD::Notify は日本語を表示できないため、システムフォントで自前描画する。
+    //  ビルドが通らない場合は JP_NOTICE_SYSFONT を 0 にすると、
+    //  従来どおり英語の OSD::Notify に戻る。
+    // ------------------------------------------------------------
+#define JP_NOTICE_SYSFONT 1
+#if JP_NOTICE_SYSFONT
+    static volatile bool g_noticeOn = false;
+
+    static bool DrawNotice(const Screen &screen)
+    {
+        if (!g_noticeOn || !screen.IsTop)
+            return false;
+        screen.DrawRect(20, 8, 360, 24, Color::Black, true);
+        screen.DrawSysfont("アイテムを取得しました。Yボタンで編集できます", 28, 12, Color::White);
+        return true;
+    }
+#endif
+
     // 有効な間、毎フレーム呼ばれる(SynchronizeWithFrame により 約60回/秒)
     //
     //  ・装備を検出すると案内を出し、PENDING_FRAMES の間だけ Y で編集できる。
@@ -509,6 +778,9 @@ namespace CTRPluginFramework
 
         if (!InstallHooks())
         {
+#if JP_NOTICE_SYSFONT
+            g_noticeOn = false;
+#endif
             entry->Disable();
             return;
         }
@@ -537,16 +809,25 @@ namespace CTRPluginFramework
                 pendingTimer = PENDING_FRAMES;
                 appliedPtr   = 0;
                 appliedTimer = 0;
-                // 画面上部の通知(OSD)は日本語が表示できないため、英数字のみ
+#if !JP_NOTICE_SYSFONT
+                // 画面上部の通知(OSD::Notify)は日本語が表示できないため、英数字のみ
                 OSD::Notify("Item captured. Press Y to edit.");
+#endif
             }
         }
+
+#if JP_NOTICE_SYSFONT
+        g_noticeOn = (pending != 0);
+#endif
 
         if (pending && Controller::IsKeyPressed(Key::Y))
         {
             const u32 target = pending;
             pending      = 0;
             pendingTimer = 0;
+#if JP_NOTICE_SYSFONT
+            g_noticeOn = false;
+#endif
 
             {
                 PauseGuard pg;
@@ -658,13 +939,17 @@ namespace CTRPluginFramework
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
-                                   "「Press Y to edit」と表示されてから約10秒の間だけYで編集できます。\n"
+                                   "画面上部に案内が出てから約10秒の間だけYで編集できます。\n"
                                    "編集後、同じ装備をもう一度つけ直すと反映されます(そのつけ直しでは編集メニューは出ません)。\n"
                                    "武器・防具・ライフ道具8種すべてに対応しています。"));
         menu->Append(new MenuEntry("アイテムエディタ(かばんの枠指定)", nullptr, ItemEditorEntry,
                                    "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の全アイテムの項目をまとめて変更します。"));
+
+#if JP_NOTICE_SYSFONT
+        OSD::Run(DrawNotice);
+#endif
 
         menu->Run();
         delete menu;
