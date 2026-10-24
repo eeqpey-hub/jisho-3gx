@@ -632,4 +632,42 @@ namespace CTRPluginFramework
             if (WriteField(base, f, val))
                 ++n;
         }
-        MessageBox("完了"
+        MessageBox("完了", Utils::Format("%u 件を変更しました。", n))();
+    }
+
+    // ------------------------------------------------------------
+    //  CTRPF 必須関数
+    // ------------------------------------------------------------
+    void PatchProcess(FwkSettings &settings)
+    {
+        (void)settings;
+    }
+
+    void OnProcessExit(void)
+    {
+    }
+
+    int main(void)
+    {
+        if (Process::GetTitleID() != 0x00040000000E9C00ULL)
+            OSD::Notify("Warning: unexpected title.");
+
+        PluginMenu *menu = new PluginMenu("ファンタジーライフ アイテムエディタ", 0, 2, 0,
+                                          "日本語版用。海外版PLGのItemEditorと同じ方式です。");
+        menu->SynchronizeWithFrame(true);
+
+        menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
+                                   "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
+                                   "「Press Y to edit」と表示されてから約10秒の間だけYで編集できます。\n"
+                                   "編集後、同じ装備をもう一度つけ直すと反映されます(そのつけ直しでは編集メニューは出ません)。\n"
+                                   "武器・防具・ライフ道具8種すべてに対応しています。"));
+        menu->Append(new MenuEntry("アイテムエディタ(かばんの枠指定)", nullptr, ItemEditorEntry,
+                                   "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
+        menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
+                                   "武器・防具・ライフ道具・家具ごとに、かばん内の全アイテムの項目をまとめて変更します。"));
+
+        menu->Run();
+        delete menu;
+        return 0;
+    }
+}
