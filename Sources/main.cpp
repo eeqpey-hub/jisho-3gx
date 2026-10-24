@@ -740,26 +740,6 @@ namespace CTRPluginFramework
         return true;
     }
 
-    // ------------------------------------------------------------
-    //  画面上部の日本語案内
-    //  OSD::Notify は日本語を表示できないため、システムフォントで自前描画する。
-    //  ビルドが通らない場合は JP_NOTICE_SYSFONT を 0 にすると、
-    //  従来どおり英語の OSD::Notify に戻る。
-    // ------------------------------------------------------------
-#define JP_NOTICE_SYSFONT 1
-#if JP_NOTICE_SYSFONT
-    static volatile bool g_noticeOn = false;
-
-    static bool DrawNotice(const Screen &screen)
-    {
-        if (!g_noticeOn || !screen.IsTop)
-            return false;
-        screen.DrawRect(20, 8, 360, 24, Color::Black, true);
-        screen.DrawSysfont("アイテムを取得しました。Yボタンで編集できます", 28, 12, Color::White);
-        return true;
-    }
-#endif
-
     // 有効な間、毎フレーム呼ばれる(SynchronizeWithFrame により 約60回/秒)
     //
     //  ・装備を検出すると案内を出し、PENDING_FRAMES の間だけ Y で編集できる。
@@ -778,9 +758,6 @@ namespace CTRPluginFramework
 
         if (!InstallHooks())
         {
-#if JP_NOTICE_SYSFONT
-            g_noticeOn = false;
-#endif
             entry->Disable();
             return;
         }
@@ -809,25 +786,16 @@ namespace CTRPluginFramework
                 pendingTimer = PENDING_FRAMES;
                 appliedPtr   = 0;
                 appliedTimer = 0;
-#if !JP_NOTICE_SYSFONT
-                // 画面上部の通知(OSD::Notify)は日本語が表示できないため、英数字のみ
+                // 画面上部の通知(OSD)は日本語が表示できないため、英数字のみ
                 OSD::Notify("Item captured. Press Y to edit.");
-#endif
             }
         }
-
-#if JP_NOTICE_SYSFONT
-        g_noticeOn = (pending != 0);
-#endif
 
         if (pending && Controller::IsKeyPressed(Key::Y))
         {
             const u32 target = pending;
             pending      = 0;
             pendingTimer = 0;
-#if JP_NOTICE_SYSFONT
-            g_noticeOn = false;
-#endif
 
             {
                 PauseGuard pg;
@@ -939,17 +907,13 @@ namespace CTRPluginFramework
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
-                                   "画面上部に案内が出てから約10秒の間だけYで編集できます。\n"
+                                   "「Press Y to edit」と表示されてから約10秒の間だけYで編集できます。\n"
                                    "編集後、同じ装備をもう一度つけ直すと反映されます(そのつけ直しでは編集メニューは出ません)。\n"
                                    "武器・防具・ライフ道具8種すべてに対応しています。"));
         menu->Append(new MenuEntry("アイテムエディタ(かばんの枠指定)", nullptr, ItemEditorEntry,
                                    "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の全アイテムの項目をまとめて変更します。"));
-
-#if JP_NOTICE_SYSFONT
-        OSD::Run(DrawNotice);
-#endif
 
         menu->Run();
         delete menu;
