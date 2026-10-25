@@ -118,13 +118,16 @@ jp_hookB2:
     @ ---- エリアワープ用: 0x5A2AB8 (フィールドタスクの毎フレーム更新) ----
     @ 呼び出し側で 0x5A2AB8 に str pc,[sp,#-4]! を書き、0x5A2ABC にフックを入れる。
     @ 置き換わった3命令 (0x5A2AB8 push / 0x5A2ABC mov / 0x5A2AC0 ldr r6) をここで再現し、
-    @ 0x5A2AC4 に戻る。入口の時点では r0 = タスク、レジスタは元のまま。
+    @ 0x5A2AC4 に戻る。入口の時点では r0 = タスク、s0 = 経過時間(float)、レジスタは元のまま。
+    @ ※ C関数 (WarpPrepare) は s0〜s15 を壊してよいので、必ず d0-d7 を退避してから呼ぶこと。
     .global jp_hookWarp
     .type jp_hookWarp, %function
 jp_hookWarp:
     ldr   r12, [sp], #4          @ 積まれた戻り先を捨てて sp を元に戻す (r12 は作業用)
     push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
+    vpush {d0-d7}                @ 元の関数は s0 (float引数) を使う。C関数で壊れないよう退避
     bl    WarpPrepare            @ r0 = エリアID (0 = ワープなし)
+    vpop  {d0-d7}                @ s0〜s15 を元に戻す
     str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
     pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
     cmp   r12, #0
@@ -627,7 +630,7 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
-    //  カテゴリ別 一括変更 (ARコードと同じ動作) 
+    //  カテゴリ別 一括変更 (ARコードと同じ動作)
     // ------------------------------------------------------------
     static void BulkEditEntry(MenuEntry *entry)
     {
