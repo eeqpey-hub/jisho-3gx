@@ -113,7 +113,7 @@ namespace CTRPluginFramework
     static constexpr u32 OFF_ID    = 0x00;       // u16
     static constexpr u32 OFF_COUNT = 0x06;       // u16 (旧: 0x04 u8 は誤り。行の +6 が個数)
     static constexpr u32 MAX_COUNT = 99;
-    static constexpr u32 MAX_ID    = 0x05C4;
+    static constexpr u32 MAX_ID    = 0x09FE;   // 素材・消耗品まで
     static constexpr u32 MAX_BONUS = 2147483647; // 追加数値の最大(海外版エディタと同じ)
 
     struct Category
@@ -126,14 +126,20 @@ namespace CTRPluginFramework
         int  offMatk;        // u16
         const char *atkName;
         const char *matkName;
+        bool stackable;      // true: 同じ種類を1枠にまとめる (素材・消耗品)
     };
+
+    // 素材・消耗品のクオリティの位置。【未検証の仮置き】武器と同じ +0x10 と推測している。
+    // 違っていたら、かばんの素材をHexダンプで見て、ここだけ直す。
+    static constexpr int MAT_QUALITY_OFF = 0x10;
 
     static const Category g_cats[] =
     {
-        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
-        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力" },
-        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr },
-        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr },
+        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力", false },
+        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力", false },
+        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr, false },
+        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr, false },
+        { "素材・消耗品", 0x05C5, 0x09FE, MAT_QUALITY_OFF, -1, -1, -1, nullptr, nullptr, true },
     };
 
     static constexpr int K_NORMAL = 0;
@@ -837,16 +843,14 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
-    //  アイテム生成 / 一括生成 (かばんの空き枠へ新規追加)
+    //  アイテム生成 / 一括生成 / 一括削除 (かばんの連結リストを直接操作)
     //
     //  ゲーム本人が1個買ったときのRAM差分(Before/After)から分かったこと:
     //   ・行の本体は 0x38 バイト。行の直前4バイト(= 前の行の +0x38)が (次u16,前u16) のリンク。
     //   ・かばんの「生きている」先頭と件数は、保存用の 0x6DDF24 ではなく
     //       0x6DCD2C を先頭とする管理領域にある: +0x1C=件数(u16)、+0x1E=先頭の行番号(u16, 空=FFFF)
-    //     (0x6DDF24 は保存するときにここから写されるだけ。買った直後も変わらない)
     //   ・新しい行は 499 番から使われ、行は「ID・個数=1・+0xC=FFFE・+0xE=1・+0x28から 1,2,3,4」
-    //     以外は 0 で初期化される。
-    //  ※ +0xC/+0xE/+0x28.. の値は防具(アイアンヘルム)で見たもの。他の種類は未検証。
+    //     以外は 0 で初期化される。(防具で確認。他の種類は未検証)
     // ------------------------------------------------------------
     static constexpr u32 LIVE_BASE  = 0x006DCD2C;          // かばん管理領域
     static constexpr u32 LIVE_LINKP = LIVE_BASE + 0x08;    // リンク配列(=BAG_BASE-4)へのポインタ
@@ -854,6 +858,8 @@ namespace CTRPluginFramework
     static constexpr u32 LIVE_HEAD  = LIVE_BASE + 0x1E;    // 先頭の行番号 (u16)
     static constexpr u32 ROW_DATA   = 0x38;
     static constexpr u16 NO_LINK    = 0xFFFF;
+    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行に入っていたID (削除時にこれを書く・推測)
+    static constexpr size_t DUP_THRESHOLD = 3;             // 名前がこの件数以上かぶると「未実装」とみなす
 
     static u32 LinkAddr(u32 slot) { return BAG_BASE - 4 + slot * SLOT_SIZE; }
 
@@ -915,8 +921,149 @@ namespace CTRPluginFramework
         return -1;
     }
 
+    static u32 FreeRows(const BagState &b)
+    {
+        u32 n = 0;
+        for (u32 k = 0; k < BAG_SLOTS; ++k)
+            if (!b.used[k])
+                ++n;
+        return n;
+    }
+
+    static void CommitCount(const BagState &b)
+    {
+        Process::Write16(LIVE_COUNT, (u16)b.order.size());
+    }
+
+    // ------------------------------------------------------------
+    //  生成時に指定する追加項目 (クオリティ・追加効果・追加数値・素材の個数)
+    //  fields[] はアイテムIDを除いた項目。use[i]=true の項目だけ値を書く。
+    // ------------------------------------------------------------
+    struct GenSpec
+    {
+        std::vector<Field> fields;
+        std::vector<bool>  use;
+        std::vector<u32>   val;
+    };
+
+    static u32 SpecValue(const GenSpec *sp, u32 off, u32 def)
+    {
+        if (!sp)
+            return def;
+        for (size_t i = 0; i < sp->fields.size(); ++i)
+            if (sp->fields[i].off == off && sp->use[i])
+                return sp->val[i];
+        return def;
+    }
+
+    // 追加項目を選ぶ画面 (一括変更の画面と同じ作り)。キャンセルなら false
+    static bool AskGenSpec(const Category *cat, const std::string &title, GenSpec &sp, u32 &count)
+    {
+        sp.fields = FieldsFor(cat, cat && cat->stackable);   // [0] = アイテムID
+        sp.fields.erase(sp.fields.begin());
+        const size_t F = sp.fields.size();
+        sp.use.assign(F, false);
+        sp.val.assign(F, 0);
+        count = 1;
+        if (F == 0)
+            return true;
+
+        for (;;)
+        {
+            std::vector<std::string> rows;
+            for (size_t i = 0; i < F; ++i)
+                rows.push_back(sp.fields[i].label + ": " +
+                               (sp.use[i] ? FmtValue(sp.fields[i], sp.val[i]) : std::string("指定しない")));
+            rows.push_back("[この内容で生成]");
+            rows.push_back("[すべて指定しないに戻す]");
+
+            Keyboard kb(title, rows);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return false;
+            if ((size_t)sel == F)
+                break;
+            if ((size_t)sel == F + 1)
+            {
+                for (size_t i = 0; i < F; ++i) { sp.use[i] = false; sp.val[i] = 0; }
+                continue;
+            }
+            u32 cur = sp.use[sel] ? sp.val[sel] : 0, v = 0;
+            if (AskFieldValue(sp.fields[sel], cat, cur, v))
+            {
+                sp.use[sel] = true;
+                sp.val[sel] = v;
+            }
+        }
+        count = SpecValue(&sp, OFF_COUNT, 1);
+        if (count == 0)
+            count = 1;
+        return true;
+    }
+
+    static std::string SpecSummary(const GenSpec &sp)
+    {
+        std::string s;
+        for (size_t i = 0; i < sp.fields.size(); ++i)
+            if (sp.use[i])
+                s += "・" + sp.fields[i].label + ": " + FmtValue(sp.fields[i], sp.val[i]) + "\n";
+        return s;
+    }
+
+    // ------------------------------------------------------------
+    //  未実装アイテムの判定 (名前の表から)
+    //   ・名前に「未知」が付く / 「そざい」「ぶき」などの仮の名前
+    //   ・同じ名前が DUP_THRESHOLD 件以上ある (兵士の剣などは2件までなので残る)
+    // ------------------------------------------------------------
+    static bool IsPlaceholderName(const std::string &name)
+    {
+        if (name.find("未知") != std::string::npos)
+            return true;
+        std::string t = name;
+        size_t e = t.size();
+        while (e > 0 && ((t[e - 1] >= '0' && t[e - 1] <= '9') || (t[e - 1] >= 'A' && t[e - 1] <= 'Z') ||
+                         (t[e - 1] >= 'a' && t[e - 1] <= 'z')))
+            --e;
+        t.resize(e);
+        return t == "そざい" || t == "ぶき" || t == "ぼうぐ" || t == "どうぐ" || t == "かぐ";
+    }
+
+    static bool NameTableLoaded() { return g_itemNames[0].name != nullptr; }
+
+    static bool IsUnimplemented(u32 id)
+    {
+        static std::vector<char> tbl;
+        static bool built = false;
+        if (!built)
+        {
+            built = true;
+            tbl.assign(MAX_ID + 1, 0);
+            std::vector<std::pair<std::string, u32> > v;
+            for (const NameEntry *e = g_itemNames; e->name; ++e)
+                if (e->id <= MAX_ID)
+                    v.push_back(std::make_pair(std::string(e->name), (u32)e->id));
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+            for (size_t i = 0; i < v.size();)
+            {
+                size_t j = i;
+                while (j < v.size() && v[j].first == v[i].first)
+                    ++j;
+                const bool dup = (j - i) >= DUP_THRESHOLD;
+                for (size_t k = i; k < j; ++k)
+                    if (dup || IsPlaceholderName(v[k].first))
+                        tbl[v[k].second] = 1;
+                i = j;
+            }
+        }
+        return id <= MAX_ID && tbl[id] != 0;
+    }
+
+    // ------------------------------------------------------------
+    //  行の作成・追加
+    // ------------------------------------------------------------
     // 空き行 row に新しいアイテムを作り、リストの末尾につなぐ (件数はここでは更新しない)
-    static void AppendRow(BagState &b, u32 row, u32 id, u32 count)
+    static void AppendRow(BagState &b, u32 row, u32 id, u32 count, const GenSpec *sp)
     {
         const u32 base = SlotAddr(row);
         for (u32 o = 0; o < ROW_DATA; o += 4)
@@ -929,6 +1076,11 @@ namespace CTRPluginFramework
         Process::Write32(base + 0x2C, 2);
         Process::Write32(base + 0x30, 3);
         Process::Write32(base + 0x34, 4);
+
+        if (sp)
+            for (size_t i = 0; i < sp->fields.size(); ++i)
+                if (sp->use[i] && sp->fields[i].off != OFF_COUNT)
+                    WriteField(base, sp->fields[i], sp->val[i]);
 
         const u16 tail = b.order.empty() ? NO_LINK : b.order.back();
         Process::Write16(LinkAddr(row),     NO_LINK);
@@ -943,16 +1095,25 @@ namespace CTRPluginFramework
     }
 
     // 1つ追加。成功したら行番号、満杯なら -1。
-    // 武器・防具・道具・家具ではないID(消耗品など)は、同じIDの行があれば個数を足す(未検証)
-    static int AddOne(BagState &b, u32 id, u32 count)
+    // 素材・消耗品(と範囲外のID)は、同じID(とクオリティ)の行があれば個数を足す
+    static int AddOne(BagState &b, u32 id, u32 count, const GenSpec *sp)
     {
-        if (!FindCategory((u16)id))
+        const Category *cat = FindCategory((u16)id);
+        if (!cat || cat->stackable)
         {
+            const u32 wantQ = cat ? SpecValue(sp, (u32)cat->offQuality, 0) : 0;
             for (u16 s : b.order)
             {
                 u32 cur = 0;
                 if (!Process::Read32(SlotAddr(s) + OFF_ID, cur) || cur != id)
                     continue;
+                if (cat && cat->offQuality >= 0)
+                {
+                    u8 q = 0;
+                    Process::Read8(SlotAddr(s) + (u32)cat->offQuality, q);
+                    if (q != wantQ)
+                        continue;
+                }
                 u16 c = 0;
                 Process::Read16(SlotAddr(s) + OFF_COUNT, c);
                 u32 n = c + count;
@@ -965,22 +1126,8 @@ namespace CTRPluginFramework
         const int f = PickFreeRow(b);
         if (f < 0)
             return -1;
-        AppendRow(b, (u32)f, id, count);
+        AppendRow(b, (u32)f, id, count, sp);
         return f;
-    }
-
-    static void CommitCount(const BagState &b)
-    {
-        Process::Write16(LIVE_COUNT, (u16)b.order.size());
-    }
-
-    static u32 FreeRows(const BagState &b)
-    {
-        u32 n = 0;
-        for (u32 k = 0; k < BAG_SLOTS; ++k)
-            if (!b.used[k])
-                ++n;
-        return n;
     }
 
     static void CreateItemEntry(MenuEntry *entry)
@@ -998,10 +1145,16 @@ namespace CTRPluginFramework
 
         const Category *cat = FindCategory((u16)id);
         u32 count = 1;
-        if (!cat)
+        GenSpec sp;
+        if (cat)
+        {
+            if (!AskGenSpec(cat, Utils::Format("追加項目 [%s] %s", cat->name, IdName(id).c_str()), sp, count))
+                return;
+        }
+        else
         {
             if (!(MessageBox("確認",
-                             Utils::Format("0x%04X は武器・防具・道具・家具のどれでもありません。\n"
+                             Utils::Format("0x%04X は武器・防具・道具・家具・素材のどれでもありません。\n"
                                            "消耗品などとして追加しますか?", id),
                              DialogType::DialogYesNo))())
                 return;
@@ -1009,10 +1162,10 @@ namespace CTRPluginFramework
                 return;
         }
 
-        if (!(MessageBox("確認",
-                         Utils::Format("「%s」をかばんに追加します。\nセーブのバックアップは取りましたか?",
-                                       IdName(id).c_str()),
-                         DialogType::DialogYesNo))())
+        std::string msg = Utils::Format("「%s」をかばんに追加します。\n", IdName(id).c_str());
+        msg += SpecSummary(sp);
+        msg += "セーブのバックアップは取りましたか?";
+        if (!(MessageBox("確認", msg, DialogType::DialogYesNo))())
             return;
 
         BagState b;
@@ -1022,7 +1175,7 @@ namespace CTRPluginFramework
             MessageBox("追加できませんでした", err)();
             return;
         }
-        const int slot = AddOne(b, id, count);
+        const int slot = AddOne(b, id, count, cat ? &sp : nullptr);
         if (slot < 0)
         {
             MessageBox("追加できませんでした", "かばんに空き枠がありません。")();
@@ -1041,7 +1194,7 @@ namespace CTRPluginFramework
     static void PoolIds(u32 from, u32 to, std::vector<u32> &out)
     {
         out.clear();
-        if (g_itemNames[0].name)
+        if (NameTableLoaded())
         {
             for (const NameEntry *e = g_itemNames; e->name; ++e)
                 if (e->id >= from && e->id <= to)
@@ -1054,6 +1207,20 @@ namespace CTRPluginFramework
             for (u32 id = from; id <= to; ++id)
                 out.push_back(id);
         }
+    }
+
+    // ids が全部同じカテゴリならそれを返す (違う/カテゴリ外が混ざるなら nullptr)
+    static const Category *CommonCategory(const std::vector<u32> &ids)
+    {
+        const Category *c0 = nullptr;
+        for (u32 id : ids)
+        {
+            const Category *c = FindCategory((u16)id);
+            if (!c || (c0 && c != c0))
+                return nullptr;
+            c0 = c;
+        }
+        return c0;
     }
 
     static void BulkCreateEntry(MenuEntry *entry)
@@ -1114,10 +1281,52 @@ namespace CTRPluginFramework
             what = Utils::Format("%s を %u 個", IdName(id).c_str(), n);
         }
 
+        // 未実装アイテムの除外 (カテゴリ・ID範囲のとき)
+        if (mode != 2 && NameTableLoaded() && !ids.empty())
+        {
+            u32 unimpl = 0;
+            for (u32 id : ids)
+                if (IsUnimplemented(id))
+                    ++unimpl;
+            if (unimpl > 0)
+            {
+                if ((MessageBox("未実装アイテム",
+                                Utils::Format("対象 %u 件のうち、未実装らしいものが %u 件あります。\n"
+                                              "(未知・そざい・ぶき等、名前が%u件以上かぶるもの)\n"
+                                              "除外しますか?", (u32)ids.size(), unimpl, (u32)DUP_THRESHOLD),
+                                DialogType::DialogYesNo))())
+                {
+                    std::vector<u32> keep;
+                    for (u32 id : ids)
+                        if (!IsUnimplemented(id))
+                            keep.push_back(id);
+                    ids.swap(keep);
+                    what += " (未実装を除外)";
+                }
+            }
+        }
+
         if (ids.empty())
         {
             MessageBox("対象なし", "該当するアイテムがありません。")();
             return;
+        }
+
+        // 追加項目 (全部が同じカテゴリのときだけ指定できる)
+        GenSpec sp;
+        u32 count = 1;
+        const Category *cc = CommonCategory(ids);
+        bool useSpec = false;
+        if (cc)
+        {
+            if (!AskGenSpec(cc, Utils::Format("追加項目 [%s] (全件に適用)", cc->name), sp, count))
+                return;
+            useSpec = true;
+        }
+        else
+        {
+            MessageBox("追加項目", "対象が複数のカテゴリにまたがるため、追加項目は指定できません。\n"
+                                   "(カテゴリ別に分けて生成すると指定できます)")();
         }
 
         BagState b;
@@ -1129,6 +1338,8 @@ namespace CTRPluginFramework
         }
         const u32 freeN = FreeRows(b);
         std::string msg = Utils::Format("%s\n対象 %u 件 / かばんの空き枠 %u\n", what.c_str(), (u32)ids.size(), freeN);
+        if (useSpec)
+            msg += SpecSummary(sp);
         if (ids.size() > freeN)
             msg += "空き枠が足りないため、先頭から入る分だけ作ります。\n";
         msg += "セーブのバックアップは取りましたか?\n実行しますか?";
@@ -1138,7 +1349,7 @@ namespace CTRPluginFramework
         u32 made = 0, skipped = 0;
         for (u32 id : ids)
         {
-            if (AddOne(b, id, 1) < 0)
+            if (AddOne(b, id, count, useSpec ? &sp : nullptr) < 0)
             {
                 skipped = (u32)ids.size() - made;
                 break;
@@ -1149,6 +1360,89 @@ namespace CTRPluginFramework
 
         MessageBox("完了", Utils::Format("%u 件を処理しました。(入りきらず未処理: %u)\n"
                                          "かばん画面は、一度閉じて開き直すと反映されます。", made, skipped))();
+    }
+
+    // ------------------------------------------------------------
+    //  アイテム一括削除
+    //  連結リストから外し、件数を減らし、行のIDを空き行の値(0x666)にする。
+    //  ※ゲーム本人の削除処理は未確認。かばんから消すだけで、装備中のものは対象にしないこと。
+    // ------------------------------------------------------------
+    static void BulkDeleteEntry(MenuEntry *entry)
+    {
+        (void)entry;
+
+        std::vector<std::string> names;
+        for (const Category &c : g_cats)
+            names.push_back(Utils::Format("%s (ID 0x%04X-0x%04X)", c.name, c.idMin, c.idMax));
+        names.push_back("かばん内のすべて");
+        Keyboard kc("一括削除するカテゴリ", names);
+        const int ci = kc.Open();
+        if (ci < 0)
+            return;
+        const bool all = ((size_t)ci == sizeof(g_cats) / sizeof(g_cats[0]));
+
+        std::vector<std::string> modes;
+        modes.push_back("そのカテゴリのアイテムをすべて削除");
+        modes.push_back("未実装アイテムだけ削除");
+        Keyboard kmo("削除する対象", modes);
+        const int mo = kmo.Open();
+        if (mo < 0)
+            return;
+        if (mo == 1 && !NameTableLoaded())
+        {
+            MessageBox("名前の表なし", "名前の表が無いので、未実装の判定ができません。")();
+            return;
+        }
+
+        BagState b;
+        std::string err;
+        if (!LoadBag(b, err))
+        {
+            MessageBox("削除できませんでした", err)();
+            return;
+        }
+
+        std::vector<u16> keep, del;
+        for (u16 s : b.order)
+        {
+            u32 id = 0;
+            Process::Read32(SlotAddr(s) + OFF_ID, id);
+            bool hit = all || (id >= g_cats[ci].idMin && id <= g_cats[ci].idMax);
+            if (hit && mo == 1 && !IsUnimplemented(id))
+                hit = false;
+            (hit ? del : keep).push_back(s);
+        }
+        if (del.empty())
+        {
+            MessageBox("対象なし", "削除するアイテムがありません。")();
+            return;
+        }
+
+        std::string msg = Utils::Format("%s\n%s\nかばんから %u 件を削除します。(残り %u 件)\n"
+                                        "装備中のアイテムは、先に外してから実行してください。\n"
+                                        "セーブのバックアップは取りましたか?\n実行しますか?",
+                                        all ? "かばん内のすべて" : g_cats[ci].name,
+                                        mo == 1 ? "未実装アイテムのみ" : "すべて",
+                                        (u32)del.size(), (u32)keep.size());
+        if (!(MessageBox("一括削除の確認", msg, DialogType::DialogYesNo))())
+            return;
+
+        for (u16 s : del)
+        {
+            Process::Write32(SlotAddr(s) + OFF_ID, EMPTY_ID);
+            Process::Write16(LinkAddr(s),     NO_LINK);
+            Process::Write16(LinkAddr(s) + 2, NO_LINK);
+        }
+        for (size_t i = 0; i < keep.size(); ++i)
+        {
+            Process::Write16(LinkAddr(keep[i]),     i + 1 < keep.size() ? keep[i + 1] : NO_LINK);
+            Process::Write16(LinkAddr(keep[i]) + 2, i > 0 ? keep[i - 1] : NO_LINK);
+        }
+        Process::Write16(LIVE_HEAD,  keep.empty() ? NO_LINK : keep[0]);
+        Process::Write16(LIVE_COUNT, (u16)keep.size());
+
+        MessageBox("完了", Utils::Format("%u 件を削除しました。\n"
+                                         "かばん画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
     }
 
     // ------------------------------------------------------------
@@ -1185,6 +1479,9 @@ namespace CTRPluginFramework
                                    "IDを選ぶと、かばんの空き枠に新しいアイテムを作ります。\n"
                                    "作成後、クオリティ・追加効果なども続けて編集できます。\n"
                                    "必ずセーブのバックアップを取ってから使ってください。"));
+        menu->Append(new MenuEntry("アイテム一括削除", nullptr, BulkDeleteEntry,
+                                   "かばんのアイテムを、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。\n"
+                                   "装備中のものは先に外してください。必ずセーブのバックアップを取ってから使ってください。"));
         menu->Append(new MenuEntry("アイテム一括生成", nullptr, BulkCreateEntry,
                                    "カテゴリの全アイテム / ID範囲 / 同じアイテムN個 を、かばんの空き枠にまとめて作ります。\n"
                                    "必ずセーブのバックアップを取ってから使ってください。"));
