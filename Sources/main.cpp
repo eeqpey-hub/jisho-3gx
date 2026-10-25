@@ -58,6 +58,24 @@ extern "C"
 
     void jp_captureA(u32 r3) { g_capPtr = r3 + 4; g_capCount = g_capCount + 1; }
     void jp_captureB(u32 r4) { g_capPtr = r4 + 4; g_capCount = g_capCount + 1; }
+
+    // ---- エリアワープ用 (実機未検証) ----
+    void jp_hookWarp(void);
+    volatile u32 g_warpPending = 0;
+    volatile u32 g_warpArea    = 0;
+    volatile u32 g_warpLink    = 0;
+
+    // ゲーム本体のスレッドから呼ばれる。予約があれば 0x21EDCC(接続番号) を呼び、
+    // エリアIDを返す(0 = 何もしない)。0x21EDCC は扉が 0x5A4854 の直前に呼ぶ関数。
+    u32 WarpPrepare(void)
+    {
+        if (!g_warpPending)
+            return 0;
+        g_warpPending = 0;
+        typedef void (*SetArrivalLinkFn)(u32);
+        ((SetArrivalLinkFn)0x21EDCC)(g_warpLink);
+        return g_warpArea;
+    }
 }
 
 asm(R"(
@@ -96,6 +114,30 @@ jp_hookB2:
     ldr   r0, [r4, #0xc]         @ 0x2BA9AC
     orr   r0, r0, #1             @ 0x2BA9B0
     ldr   pc, [sp], #4           @ X+8 へ戻りつつスタックを戻す
+
+    @ ---- エリアワープ用: 0x5A2AB8 (フィールドタスクの毎フレーム更新) ----
+    @ 呼び出し側で 0x5A2AB8 に str pc,[sp,#-4]! を書き、0x5A2ABC にフックを入れる。
+    @ 置き換わった3命令 (0x5A2AB8 push / 0x5A2ABC mov / 0x5A2AC0 ldr r6) をここで再現し、
+    @ 0x5A2AC4 に戻る。入口の時点では r0 = タスク、レジスタは元のまま。
+    .global jp_hookWarp
+    .type jp_hookWarp, %function
+jp_hookWarp:
+    ldr   r12, [sp], #4          @ 積まれた戻り先を捨てて sp を元に戻す (r12 は作業用)
+    push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
+    bl    WarpPrepare            @ r0 = エリアID (0 = ワープなし)
+    str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
+    pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
+    cmp   r12, #0
+    beq   1f
+    mov   r1, r12                @ GDBで成功したのと同じ設定
+    mov   r2, #0
+    mov   r3, r12
+    ldr   pc, =0x5A4854          @ 末尾ジャンプ: 元の呼び出し元へ戻る
+1:  push  {r4-r11, lr}           @ 0x5A2AB8 の元命令
+    mov   r4, r0                 @ 0x5A2ABC の元命令
+    ldr   r6, =0x68BBB8          @ 0x5A2AC0 の元命令 (ldr r6,[pc,#3016] の値)
+    ldr   pc, =0x5A2AC4
+    .ltorg
 )");
 
 namespace CTRPluginFramework
@@ -105,6 +147,7 @@ namespace CTRPluginFramework
     // ------------------------------------------------------------
     static constexpr u32 HOOK_A = 0x002D33F8;   // 海外版 0x2E091C
     static constexpr u32 HOOK_B2 = 0x002BA9AC;  // ライフ道具(実験) 関数の途中
+    static constexpr u32 HOOK_WARP = 0x005A2ABC; // エリアワープ: 0x5A2AB8 の2命令目
 
     static constexpr u32 BAG_BASE  = 0x006DDF2C; // かばん1枠目のアイテムID
     static constexpr u32 BAG_SLOTS = 500;
@@ -584,7 +627,7 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
-    //  カテゴリ別 一括変更 (ARコードと同じ動作)
+    //  カテゴリ別 一括変更 (ARコードと同じ動作) 
     // ------------------------------------------------------------
     static void BulkEditEntry(MenuEntry *entry)
     {
@@ -636,6 +679,101 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
+    //  エリアワープ (実機未検証)
+    //  移動先 = {表示名, エリアID, 出入口の接続番号}
+    //  (エリアID, 接続番号) は実際の扉の記録から取った組み合わせ。
+    //  ★ は GDB で実際に移動を確認したもの。それ以外は未確認。
+    //  場所名は通った順番からの推定。
+    // ------------------------------------------------------------
+    struct WarpDest { const char *label; u16 area; u16 link; };
+
+    static const WarpDest g_warpDests[] =
+    {
+        { "★[2] クルブルク大通り (7)",             2,   7   },
+        { "★[25] パーテル大平原東 (39)",           25,  39  },
+        { "★[25] パーテル大平原東 ハニワ洞窟前 (128)", 25, 128 },
+        { "[210] ハニワの洞窟 (128)",              210, 128 },
+        { "[3] 郊外南 (39)",                       3,   39  },
+        { "[24] パーテル西 (125)",                 24,  125 },
+        { "[25] パーテル大平原東 (121)",           25,  121 },
+        { "[209] ハーベスの大農園 (127)",          209, 127 },
+        { "[84] 始まりの島温泉街 (137)",           84,  137 },
+        { "[82] 中心街 (131)",                     82,  131 },
+        { "[83] 太鼓の砂浜 (133)",                 83,  133 },
+        { "[86] ギガガビトのほら穴 (142)",         86,  142 },
+        { "[85] 崖の神殿 (132)",                   85,  132 },
+        { "[97] いにしえの塔 (134)",               97,  134 },
+        { "[98] 試練の間 (136)",                   98,  136 },
+        { "[7] ポルトポルト宮殿街 (71)",           7,   71  },
+        { "[8] 玄関街 (56)",                       8,   56  },
+        { "[10] 郊外 宮殿街側 (55)",               10,  55  },
+        { "[15] マバラッパ諸島 (74)",              15,  74  },
+        { "[17] ダルスモルス魔王街 (104)",         17,  104 },
+        { "[16] 砂漠街 (89)",                      16,  89  },
+        { "[19] 郊外 砂漠側 (88)",                 19,  88  },
+        { "[20] サンサン砂漠 (106)",               20,  106 },
+        { "[11] 着ぐるみキャンプ場 (197)",         11,  197 },
+        { "[31] 空島東 (83)",                      31,  83  },
+        { "[13] 空島中央 (82)",                    13,  82  },
+        { "[30] 空島西 (81)",                      30,  81  },
+        { "[36] コモレヴィ (196)",                 36,  196 },
+        { "[185] 森の洞穴 (115)",                  185, 115 },
+        { "[28] 森の奥地 (119)",                   28,  119 },
+        { "[23] 森 (122)",                         23,  122 },
+    };
+    static constexpr int WARP_COUNT = sizeof(g_warpDests) / sizeof(g_warpDests[0]);
+
+    static Hook g_hookWarp;
+    static bool g_warpHooked = false;
+
+    static bool InstallWarpHook(void)
+    {
+        if (g_warpHooked)
+            return true;
+
+        // 置き換わる3命令が想定どおりか確認 (違うバージョンなら入れない)
+        //   push {r4-r11,lr} / mov r4,r0 / ldr r6,[pc,#3016]
+        static const u32 expectW[3] = { 0xE92D4FF0, 0xE1A04000, 0xE59F6BC8 };
+        if (!CheckWords(HOOK_WARP - 4, expectW, 3))
+        {
+            MessageBox("エラー",
+                       "ワープ用のフック位置の命令が想定と違います。\nゲームのバージョンが異なる可能性があるため、機能を有効にできません。")();
+            return false;
+        }
+
+        // アイテムエディタのフックと同じ手順
+        Process::Write32(HOOK_WARP - 4, 0xE52DF004);   // str pc,[sp,#-4]!
+        g_hookWarp.Initialize(HOOK_WARP, (u32)(uintptr_t)jp_hookWarp);
+        g_hookWarp.Enable();
+
+        g_warpHooked = true;
+        return true;
+    }
+
+    // メニューから選んだときに1回だけ実行される (有効/無効の切り替えではない)
+    static void WarpEntry(MenuEntry *entry)
+    {
+        (void)entry;
+
+        if (!InstallWarpHook())
+            return;
+
+        std::vector<std::string> names;
+        for (int i = 0; i < WARP_COUNT; ++i)
+            names.push_back(g_warpDests[i].label);
+
+        Keyboard kb("移動先を選択 (★=動作確認済み)", names);
+        int sel = kb.Open();
+        if (sel < 0 || sel >= WARP_COUNT)
+            return;
+
+        g_warpArea    = g_warpDests[sel].area;
+        g_warpLink    = g_warpDests[sel].link;
+        g_warpPending = 1;     // メニューを閉じた後、ゲームが次にタスクを更新したときに実行される
+        OSD::Notify("Warp requested.");
+    }
+
+    // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
     void PatchProcess(FwkSettings &settings)
@@ -665,6 +803,9 @@ namespace CTRPluginFramework
                                    "かばんの枠番号を指定して、ID・個数・クオリティ・追加効果などを編集します。"));
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の全アイテムの項目をまとめて変更します。"));
+        menu->Append(new MenuEntry("エリアワープ (実験)", nullptr, WarpEntry,
+                                   "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
+                                   "使う前に必ずバックアップを取ってください。★のついた移動先だけ動作確認済みです。"));
 
         menu->Run();
         delete menu;
