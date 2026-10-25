@@ -16,6 +16,7 @@
 #include <3ds.h>
 #include "csvc.h"
 #include <CTRPluginFramework.hpp>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -561,8 +562,119 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
-    //  カテゴリ別 一括変更 (ARコードと同じ動作)
+    //  カテゴリ別 一括変更
+    //  1) カテゴリを選ぶ (かばん内の該当アイテムの件数を数える)
+    //  2) 変えたい項目だけ、変更後の値を選ぶ (この時点では書き込まない)
+    //  3) 「決定して適用」で、かばん内の該当アイテムすべてに書き込む
+    //  アイテムIDは、ID範囲を指定して「被りなしの連番」で割り当てるか、
+    //  1件ずつ選ぶ。選べるIDは、そのカテゴリのID範囲内だけ。
     // ------------------------------------------------------------
+    static constexpr u32 NO_ID = 0xFFFFFFFFu;   // 「このアイテムのIDは変えない」の印
+
+    static std::string IdName(u32 id)
+    {
+        const char *n = LookupName(g_itemNames, id);
+        return n ? std::string(n) : Utils::Format("0x%04X", id);
+    }
+
+    // かばんの中で、このカテゴリのアイテムがある枠と、その現在のIDを集める
+    static void CollectBagSlots(const Category &cat, std::vector<u32> &slots, std::vector<u32> &ids)
+    {
+        for (u32 slot = 0; slot < BAG_SLOTS; ++slot)
+        {
+            u16 id = 0;
+            if (!Process::Read16(SlotAddr(slot) + OFF_ID, id))
+                continue;
+            if (id < cat.idMin || id > cat.idMax)
+                continue;
+            slots.push_back(slot);
+            ids.push_back(id);
+        }
+    }
+
+    // 開始ID(と終了ID)を選び、その範囲の「被らないID」を小さい順に n 個決める
+    static bool PlanRange(const Category &cat, size_t n, std::vector<u32> &out, std::string &summary)
+    {
+        u32 from = cat.idMin;
+        if (!PickFromNames(Utils::Format("開始ID [%s]", cat.name), g_itemNames,
+                           true, cat.idMin, cat.idMax, cat.idMin, from))
+            return false;
+
+        u32 to = cat.idMax;
+        std::vector<std::string> how;
+        how.push_back(Utils::Format("かばんの件数(%u件)ぶん、連番にする", (u32)n));
+        how.push_back("終了IDも自分で選ぶ");
+        Keyboard kh(Utils::Format("開始ID: %s", IdName(from).c_str()), how);
+        const int h = kh.Open();
+        if (h < 0)
+            return false;
+        if (h == 1)
+        {
+            if (!PickFromNames(Utils::Format("終了ID [%s]", cat.name), g_itemNames,
+                               true, from, cat.idMax, cat.idMax, to))
+                return false;
+        }
+
+        // 範囲内にある、実在するIDを集める (名前の表が無いときは番号をそのまま使う)
+        std::vector<u32> pool;
+        if (g_itemNames[0].name)
+        {
+            for (const NameEntry *e = g_itemNames; e->name; ++e)
+                if (e->id >= from && e->id <= to)
+                    pool.push_back(e->id);
+            std::sort(pool.begin(), pool.end());
+            pool.erase(std::unique(pool.begin(), pool.end()), pool.end());
+        }
+        else
+        {
+            for (u32 id = from; id <= to; ++id)
+                pool.push_back(id);
+        }
+
+        if (pool.size() < n)
+        {
+            MessageBox("IDが足りません",
+                       Utils::Format("選んだ範囲のアイテムは %u 個で、かばんの %u 件より少ないです。\n"
+                                     "範囲を広げて選び直してください。",
+                                     (u32)pool.size(), (u32)n))();
+            return false;
+        }
+        out.assign(pool.begin(), pool.begin() + n);
+        summary = Utils::Format("連番 0x%04X-0x%04X (%u件)", out.front(), out.back(), (u32)n);
+        return true;
+    }
+
+    // 1件ずつ選ぶ。newIds は枠ごとの変更後ID (NO_ID なら変えない)
+    static bool PlanEach(const Category &cat, const std::vector<u32> &slots,
+                         const std::vector<u32> &curIds, std::vector<u32> &newIds)
+    {
+        for (;;)
+        {
+            std::vector<std::string> rows;
+            for (size_t i = 0; i < slots.size(); ++i)
+            {
+                std::string s = Utils::Format("%u枠目 ", slots[i] + 1) + IdName(curIds[i]);
+                if (newIds[i] != NO_ID)
+                    s += " > " + IdName(newIds[i]);
+                rows.push_back(s);
+            }
+            Keyboard kb(Utils::Format("1件ずつ選ぶ [%s] (Bで戻る)", cat.name), rows);
+            const int sel = kb.Open();
+            if (sel < 0)
+                break;
+
+            const u32 cur = (newIds[sel] != NO_ID) ? newIds[sel] : curIds[sel];
+            u32 pick = 0;
+            if (PickFromNames(Utils::Format("%u枠目 [%s]", slots[sel] + 1, cat.name), g_itemNames,
+                              true, cat.idMin, cat.idMax, cur, pick))
+                newIds[sel] = (pick == curIds[sel]) ? NO_ID : pick;
+        }
+        for (u32 v : newIds)
+            if (v != NO_ID)
+                return true;
+        return false;
+    }
+
     static void BulkEditEntry(MenuEntry *entry)
     {
         (void)entry;
@@ -577,39 +689,151 @@ namespace CTRPluginFramework
             return;
         const Category &cat = g_cats[ci];
 
-        std::vector<Field> fields = FieldsFor(&cat, false);   // [0]=ID (個数は出さない)。[1]以降が変更できる項目
-        std::vector<std::string> fn;
-        for (size_t i = 1; i < fields.size(); ++i)
-            fn.push_back(fields[i].label);
-
-        Keyboard kf(Utils::Format("[%s] 変更する項目", cat.name), fn);
-        int fi = kf.Open();
-        if (fi < 0)
-            return;
-        const Field &f = fields[fi + 1];
-
-        u32 val = 0;
-        if (!AskFieldValue(f, &cat, 0, val))
-            return;
-
-        std::string msg = Utils::Format("かばん内の「%s」すべての%sを %s にします。よろしいですか?",
-                                        cat.name, f.label.c_str(), FmtValue(f, val).c_str());
-        if (!(MessageBox("確認", msg, DialogType::DialogYesNo))())
-            return;
-
-        u32 n = 0;
-        for (u32 slot = 0; slot < BAG_SLOTS; ++slot)
+        std::vector<u32> slots, curIds;
+        CollectBagSlots(cat, slots, curIds);
+        if (slots.empty())
         {
-            const u32 base = SlotAddr(slot);
-            u16 id = 0;
-            if (!Process::Read16(base + OFF_ID, id))
-                continue;
-            if (id < cat.idMin || id > cat.idMax)
-                continue;
-            if (WriteField(base, f, val))
-                ++n;
+            MessageBox("対象なし", Utils::Format("かばんに「%s」がありません。", cat.name))();
+            return;
         }
-        MessageBox("完了", Utils::Format("%u 件を変更しました。", n))();
+        const u32 N = (u32)slots.size();
+
+        std::vector<Field> fields = FieldsFor(&cat, false);   // [0]=ID、[1]以降=ほかの項目 (個数は出さない)
+        const size_t F = fields.size();
+        std::vector<bool> use(F, false);        // その項目を変更するか
+        std::vector<u32>  val(F, 0);            // 変更後の値
+        std::vector<u32>  newIds(slots.size(), NO_ID);
+        std::string       idSummary;
+
+        for (;;)
+        {
+            bool anyId = false;
+            for (u32 v : newIds)
+                if (v != NO_ID) { anyId = true; break; }
+            bool anyField = false;
+            for (size_t i = 1; i < F; ++i)
+                if (use[i]) anyField = true;
+
+            // 行の番号 = 項目の番号 (0=アイテムID)。その次が「決定」「元に戻す」。
+            std::vector<std::string> rows;
+            rows.push_back(std::string("アイテムID: ") + (anyId ? idSummary : std::string("変更しない")));
+            for (size_t i = 1; i < F; ++i)
+                rows.push_back(fields[i].label + ": " +
+                               (use[i] ? FmtValue(fields[i], val[i]) : std::string("変更しない")));
+            rows.push_back(Utils::Format("[決定して適用] 対象 %u件", N));
+            rows.push_back("[すべて元に戻す]");
+
+            Keyboard kb(Utils::Format("一括変更 [%s] かばん内 %u件", cat.name, N), rows);
+            const int sel = kb.Open();
+
+            if (sel < 0)
+            {
+                if ((anyId || anyField) &&
+                    !(MessageBox("確認", "変更内容を破棄して戻りますか?", DialogType::DialogYesNo))())
+                    continue;
+                return;
+            }
+
+            if ((size_t)sel == F + 1)           // すべて元に戻す
+            {
+                for (size_t i = 0; i < F; ++i) { use[i] = false; val[i] = 0; }
+                for (size_t k = 0; k < newIds.size(); ++k) newIds[k] = NO_ID;
+                idSummary.clear();
+                continue;
+            }
+
+            if ((size_t)sel == F)               // 決定して適用
+            {
+                if (!anyId && !anyField)
+                {
+                    MessageBox("変更なし", "変更する項目を選んでください。")();
+                    continue;
+                }
+                std::string msg = Utils::Format("かばん内の「%s」%u件に、次を適用します。\n", cat.name, N);
+                if (anyId)
+                    msg += "・アイテムID: " + idSummary + "\n";
+                for (size_t i = 1; i < F; ++i)
+                    if (use[i])
+                        msg += "・" + fields[i].label + ": " + FmtValue(fields[i], val[i]) + "\n";
+                msg += "よろしいですか?";
+                if (!(MessageBox("確認", msg, DialogType::DialogYesNo))())
+                    continue;
+
+                u32 n = 0;
+                for (size_t k = 0; k < slots.size(); ++k)
+                {
+                    const u32 base = SlotAddr(slots[k]);
+                    bool ok = true;
+                    for (size_t i = 1; i < F; ++i)
+                        if (use[i] && !WriteField(base, fields[i], val[i]))
+                            ok = false;
+                    if (newIds[k] != NO_ID && !WriteField(base, fields[0], newIds[k]))
+                        ok = false;
+                    if (ok)
+                        ++n;
+                }
+                MessageBox("完了", Utils::Format("%u 件を変更しました。", n))();
+                return;
+            }
+
+            if (sel == 0)                       // アイテムID
+            {
+                std::vector<std::string> m;
+                m.push_back(Utils::Format("範囲を指定して連番で割り当て (被りなし・%u件)", N));
+                m.push_back("1件ずつ選ぶ");
+                m.push_back("変更しない");
+                Keyboard km(Utils::Format("アイテムID [%s] かばん内 %u件", cat.name, N), m);
+                const int mi = km.Open();
+                if (mi == 0)
+                {
+                    std::vector<u32> ids;
+                    std::string sm;
+                    if (PlanRange(cat, slots.size(), ids, sm))
+                    {
+                        newIds = ids;
+                        idSummary = sm;
+                    }
+                }
+                else if (mi == 1)
+                {
+                    PlanEach(cat, slots, curIds, newIds);
+                    u32 c = 0;
+                    for (u32 v : newIds)
+                        if (v != NO_ID) ++c;
+                    idSummary = Utils::Format("1件ずつ指定 (%u件)", c);
+                }
+                else if (mi == 2)
+                {
+                    for (size_t k = 0; k < newIds.size(); ++k) newIds[k] = NO_ID;
+                    idSummary.clear();
+                }
+                continue;
+            }
+
+            // ほかの項目
+            const size_t i = (size_t)sel;
+            if (use[i])
+            {
+                std::vector<std::string> m;
+                m.push_back("値を選び直す");
+                m.push_back("変更しない (取り消し)");
+                Keyboard km(Utils::Format("%s: %s", fields[i].label.c_str(), FmtValue(fields[i], val[i]).c_str()), m);
+                const int mi = km.Open();
+                if (mi < 0)
+                    continue;
+                if (mi == 1)
+                {
+                    use[i] = false;
+                    continue;
+                }
+            }
+            u32 v = 0;
+            if (AskFieldValue(fields[i], &cat, use[i] ? val[i] : 0, v))
+            {
+                use[i] = true;
+                val[i] = v;
+            }
+        }
     }
 
     // ------------------------------------------------------------
@@ -639,7 +863,8 @@ namespace CTRPluginFramework
                                    "編集後、同じ装備をもう一度つけ直すと反映されます(そのつけ直しでは編集メニューは出ません)。\n"
                                    "武器・防具・ライフ道具8種すべてに対応しています。"));
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
-                                   "武器・防具・ライフ道具・家具ごとに、かばん内の全アイテムの項目をまとめて変更します。"));
+                                   "武器・防具・ライフ道具・家具ごとに、かばん内の該当アイテムをまとめて変更します。\n"
+                                   "変えたい項目を選んでから「決定して適用」で書き込みます。アイテムIDは、範囲を指定して被りなしの連番にするか、1件ずつ選べます。"));
 
         menu->Run();
         delete menu;
