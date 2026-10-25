@@ -111,7 +111,7 @@ namespace CTRPluginFramework
     static constexpr u32 BAG_SLOTS = 500;
     static constexpr u32 SLOT_SIZE = 0x3C;
     static constexpr u32 OFF_ID    = 0x00;       // u16
-    static constexpr u32 OFF_COUNT = 0x04;       // u8 (要確認)
+    static constexpr u32 OFF_COUNT = 0x06;       // u16 (旧: 0x04 u8 は誤り。行の +6 が個数)
     static constexpr u32 MAX_COUNT = 99;
     static constexpr u32 MAX_ID    = 0x05C4;
     static constexpr u32 MAX_BONUS = 2147483647; // 追加数値の最大(海外版エディタと同じ)
@@ -173,7 +173,7 @@ namespace CTRPluginFramework
         v.push_back({ "アイテムID", OFF_ID,    2, true,  MAX_ID });
         v.back().kind = K_ITEMID;
         if (withCount)
-            v.push_back({ "個数",   OFF_COUNT, 1, false, MAX_COUNT });
+            v.push_back({ "個数",   OFF_COUNT, 2, false, MAX_COUNT });
         if (!c)
             return v;
         if (c->offQuality >= 0)
@@ -625,7 +625,7 @@ namespace CTRPluginFramework
             std::sort(pool.begin(), pool.end());
             pool.erase(std::unique(pool.begin(), pool.end()), pool.end());
         }
-        else
+　　　　 else
         {
             for (u32 id = from; id <= to; ++id)
                 pool.push_back(id);
@@ -837,6 +837,162 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
+    //  アイテム生成 (かばんの空き枠へ新規追加)
+    //  かばんの連結リスト:
+    //    先頭 u16 = 0x6DDF24 (空は FFFF)
+    //    各行の直前4バイト (0x6DDF28 + 0x3C*k) = (次 u16, 前 u16)  FFFF=なし
+    //    新規は末尾に追加。空き行は499番から下へ使う。
+    // ------------------------------------------------------------
+    static constexpr u32 BAG_HEAD     = 0x006DDF24;   // 先頭の行番号 (u16)
+    static constexpr u32 BAG_COUNTFLD = 0x006DDF26;   // 先頭の次の u16 (件数かもしれない・未検証)
+    static constexpr u16 NO_LINK      = 0xFFFF;
+
+    static u32 LinkAddr(u32 slot) { return BAG_BASE - 4 + slot * SLOT_SIZE; }
+
+    // 先頭から連結リストをたどる。壊れていたら false
+    static bool WalkBag(std::vector<u16> &order, std::vector<bool> &used)
+    {
+        order.clear();
+        used.assign(BAG_SLOTS, false);
+        u16 idx = 0;
+        if (!Process::Read16(BAG_HEAD, idx))
+            return false;
+        while (idx != NO_LINK)
+        {
+            if (idx >= BAG_SLOTS || used[idx] || order.size() >= BAG_SLOTS)
+                return false;
+            used[idx] = true;
+            order.push_back(idx);
+            u16 next = 0;
+            if (!Process::Read16(LinkAddr(idx), next))
+                return false;
+            idx = next;
+        }
+        return true;
+    }
+
+    // 成功したら行番号(0始まり)、失敗したら -1 (理由は err)
+    static int AddToBag(u32 id, u32 count, std::string &err, bool &countFieldUpdated)
+    {
+        countFieldUpdated = false;
+        std::vector<u16> order;
+        std::vector<bool> used;
+        if (!WalkBag(order, used))
+        {
+            err = "かばんの連結リストが想定と違います。(壊れている可能性があるので、何も書いていません)";
+            return -1;
+        }
+
+        // 武器・防具・道具・家具ではない(消耗品など)は、同じIDの行があれば個数を足す
+        if (!FindCategory((u16)id))
+        {
+            for (u16 s : order)
+            {
+                u32 cur = 0;
+                if (!Process::Read32(SlotAddr(s) + OFF_ID, cur) || cur != id)
+                    continue;
+                u16 c = 0;
+                Process::Read16(SlotAddr(s) + OFF_COUNT, c);
+                u32 n = c + count;
+                if (n > MAX_COUNT)
+                    n = MAX_COUNT;
+                Process::Write16(SlotAddr(s) + OFF_COUNT, (u16)n);
+                return (int)s;
+            }
+        }
+
+        int f = -1;
+        for (int k = (int)BAG_SLOTS - 1; k >= 0; --k)
+            if (!used[k]) { f = k; break; }
+        if (f < 0)
+        {
+            err = "かばんに空き枠がありません。";
+            return -1;
+        }
+
+        const u16 tail = order.empty() ? NO_LINK : order.back();
+        u16 fld = 0;
+        const bool fldIsCount = Process::Read16(BAG_COUNTFLD, fld) && fld == (u16)order.size();
+
+        // 1) 行を作る (0埋め → ID と個数)
+        const u32 base = SlotAddr((u32)f);
+        for (u32 o = 0; o < SLOT_SIZE; o += 4)
+            Process::Write32(base + o, 0);
+        Process::Write32(base + OFF_ID, id);
+        Process::Write16(base + OFF_COUNT, (u16)count);
+
+        // 2) 自分のリンク (次=なし、前=今の末尾)
+        Process::Write16(LinkAddr((u32)f),     NO_LINK);
+        Process::Write16(LinkAddr((u32)f) + 2, tail);
+
+        // 3) 末尾 (または先頭) からつなぐ
+        if (tail != NO_LINK)
+            Process::Write16(LinkAddr(tail), (u16)f);
+        else
+            Process::Write16(BAG_HEAD, (u16)f);
+
+        // 4) 件数らしい値のときだけ +1 (推測。違う値なら触らない)
+        if (fldIsCount)
+        {
+            Process::Write16(BAG_COUNTFLD, (u16)(order.size() + 1));
+            countFieldUpdated = true;
+        }
+        return f;
+    }
+
+    static void CreateItemEntry(MenuEntry *entry)
+    {
+        (void)entry;
+
+        u32 id = 0;
+        if (!PickFromNames("生成するアイテムID", g_itemNames, false, 0, MAX_ID, 0, id))
+            return;
+        if (id > MAX_ID)
+        {
+            MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
+            return;
+        }
+
+        const Category *cat = FindCategory((u16)id);
+        u32 count = 1;
+        if (!cat)
+        {
+            if (!(MessageBox("確認",
+                             Utils::Format("0x%04X は武器・防具・道具・家具のどれでもありません。\n"
+                                           "消耗品などとして追加しますか?", id),
+                             DialogType::DialogYesNo))())
+                return;
+            if (!AskValue("個数", false, MAX_COUNT, 1, count) || count == 0)
+                return;
+        }
+
+        const std::string label = IdName(id);
+        if (!(MessageBox("確認",
+                         Utils::Format("「%s」をかばんに追加します。\nセーブのバックアップは取りましたか?",
+                                       label.c_str()),
+                         DialogType::DialogYesNo))())
+            return;
+
+        std::string err;
+        bool cntUpd = false;
+        const int slot = AddToBag(id, count, err, cntUpd);
+        if (slot < 0)
+        {
+            MessageBox("追加できませんでした", err)();
+            return;
+        }
+
+        MessageBox("完了",
+                   Utils::Format("%d枠目に追加しました。\n"
+                                 "かばん画面は、一度閉じて開き直すと反映されます。\n"
+                                 "(件数らしい値 0x6DDF26: %s)",
+                                 slot + 1, cntUpd ? "+1 しました" : "触っていません"))();
+
+        if (MessageBox("続けて編集", "クオリティや追加効果などを編集しますか?", DialogType::DialogYesNo)())
+            EditAt(SlotAddr((u32)slot), "生成したアイテムの編集", true);
+    }
+
+    // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
     void PatchProcess(FwkSettings &settings)
@@ -865,6 +1021,11 @@ namespace CTRPluginFramework
         menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の該当アイテムをまとめて変更します。\n"
                                    "変えたい項目を選んでから「決定して適用」で書き込みます。アイテムIDは、範囲を指定して被りなしの連番にするか、1件ずつ選べます。"));
+
+        menu->Append(new MenuEntry("アイテムを生成 (かばんに追加)", nullptr, CreateItemEntry,
+                                   "IDを選ぶと、かばんの空き枠に新しいアイテムを作ります。\n"
+                                   "作成後、クオリティ・追加効果なども続けて編集できます。\n"
+                                   "必ずセーブのバックアップを取ってから使ってください。"));
 
         menu->Run();
         delete menu;
