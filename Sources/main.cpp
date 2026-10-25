@@ -625,7 +625,7 @@ namespace CTRPluginFramework
             std::sort(pool.begin(), pool.end());
             pool.erase(std::unique(pool.begin(), pool.end()), pool.end());
         }
-　　　　 else
+        else
         {
             for (u32 id = from; id <= to; ++id)
                 pool.push_back(id);
