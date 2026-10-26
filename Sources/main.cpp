@@ -1177,7 +1177,7 @@ namespace CTRPluginFramework
         return f;
     }
 
-    static void CreateIteItemEntry(MenuEntry *entry)
+    static void CreateItemEntry(MenuEntry *entry)
     {
         (void)entry;
 
