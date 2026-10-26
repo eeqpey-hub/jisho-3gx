@@ -14,44 +14,57 @@ extern "C"
 {
     void jp_lifeHook(void);
 
-    volatile u32 g_lifeWant  = 0;   // 0 = 要求なし / 0x100 | ライフID
-    volatile u32 g_lifeTries = 0;
+    volatile u32 g_lifeWant  = 0;   // 0 = 要求なし / 0x100 | ライフID (「やめる」を選ぶまで、ずっと有効)
+    volatile u32 g_lifeCalls = 0;   // 差し込み位置を通った回数 (診断用)
+    volatile u32 g_lifeSets  = 0;   // 実際にライフを書き換えた回数 (診断用)
+    volatile u32 g_lifeState = 0;   // 直前の状態 0=要求なし 1=マネージャなし 2=プレイヤーなし 3=一致済み 4=変更した
+    volatile u32 g_lifeCur   = 0;   // 直前に読んだ現在のライフ (診断用)
+    volatile u32 g_lifePlayer = 0;  // 直前のプレイヤー構造体 (診断用)
 
+    // 元のARコードと同じく、要求がある間は毎回「今のライフと違えば書き換える」。
+    // (一度変えても、ゲーム側が元に戻すことがあるため、1回だけでは足りない)
     void jp_lifeApply(void)
     {
+        g_lifeCalls = g_lifeCalls + 1;
+
         const u32 want = g_lifeWant;
         if (!(want & 0x100))
-            return;
-        const u32 life = want & 0xFF;
-
-        // 約10秒たっても反映されなければ、あきらめる(ずっと上書きし続けないため)
-        g_lifeTries = g_lifeTries + 1;
-        if (g_lifeTries > 600)
         {
-            g_lifeWant = 0;
+            g_lifeState = 0;
             return;
         }
+        const u32 life = want & 0xFF;
 
         const u32 mgr = *(volatile u32 *)0x0068BBB8;
         if (!mgr)
+        {
+            g_lifeState = 1;
             return;
+        }
         const u32 player = *(volatile u32 *)(mgr + 0x7800 + 0x28);
+        g_lifePlayer = player;
         if (!player)
+        {
+            g_lifeState = 2;
             return;
+        }
 
         typedef u32  (*GetLifeFn)(u32, u32);   // 0x1ECAF0 (player+0xDA8, 3) → 現在のライフ(下位8bit)
         typedef void (*SetLifeFn)(u32, u32);   // 0x1D5F74 (player, life)
         typedef u32  (*GetObjFn)(void);        // 0x1AD4BC ()
 
         const s32 cur = (s32)(s8)((GetLifeFn)0x001ECAF0)(player + 0xC00 + 0x1A8, 3);
+        g_lifeCur = (u32)cur;
         if (cur == (s32)life)
         {
-            g_lifeWant = 0;   // 変更できた
+            g_lifeState = 3;   // すでに一致
             return;
         }
         ((SetLifeFn)0x001D5F74)(player, life);
         const u32 obj = ((GetObjFn)0x001AD4BC)();
         *(volatile u8 *)(obj + 0x1FC00 + 0xC8) = (u8)life;
+        g_lifeSets  = g_lifeSets + 1;
+        g_lifeState = 4;
     }
 }
 
@@ -129,26 +142,49 @@ namespace CTRPluginFramework
         std::vector<std::string> names;
         for (const LifeInfo &l : g_lives)
             names.push_back(l.name);
+        const int nLives = (int)names.size();
+        names.push_back("[ライフ変更をやめる]");
+        names.push_back("[状態を見る]");
 
         Keyboard kb("変更するライフを選んでください", names);
         const int sel = kb.Open();
         if (sel < 0)
             return;
 
+        if (sel == nLives + 1)   // 状態を見る
+        {
+            static const char *states[] = { "要求なし", "マネージャなし", "プレイヤーなし", "一致済み", "変更した" };
+            MessageBox("ライフ変更の状態",
+                       Utils::Format("要求: %s\n差し込み位置を通った回数: %u\n書き換えた回数: %u\n"
+                                     "直前の状態: %s\n現在のライフ(読み取り): %d\nプレイヤー構造体: 0x%08X",
+                                     (g_lifeWant & 0x100) ? Utils::Format("ライフ%02X", (u32)(g_lifeWant & 0xFF)).c_str() : "なし",
+                                     (u32)g_lifeCalls, (u32)g_lifeSets,
+                                     states[g_lifeState > 4 ? 0 : g_lifeState], (int)g_lifeCur, (u32)g_lifePlayer))();
+            return;
+        }
+
+        if (sel == nLives)       // やめる
+        {
+            g_lifeWant = 0;
+            MessageBox("ライフ変更", "ライフ変更をやめました。")();
+            return;
+        }
+
         if (!InstallLifeHook())
             return;
 
-        g_lifeTries = 0;
-        g_lifeWant  = 0x100 | g_lives[sel].id;
+        g_lifeWant = 0x100 | g_lives[sel].id;
         MessageBox("ライフ変更",
-                   Utils::Format("「%s」に変更します。\nメニューを閉じて、ゲームを進めてください。", g_lives[sel].name))();
+                   Utils::Format("「%s」に変更します。\nメニューを閉じて、ゲームを進めてください。\n"
+                                 "「やめる」を選ぶまで、このライフに保ちます。", g_lives[sel].name))();
     }
 
     static void AddLifeChange(PluginMenu *menu)
     {
         menu->Append(new MenuEntry("ライフ変更", nullptr, LifeChangeEntry,
                                    "歯車マークを押すと、ライフの一覧(王国兵士、傭兵、…)が出ます。\n"
-                                   "選んだライフに変更します(1回だけ。ゲームを進めると反映されます)。\n"
+                                   "選んだライフに変更し、「ライフ変更をやめる」を選ぶまで保ちます。\n"
+                                   "「状態を見る」で、動作の回数を確認できます。\n"
                                    "ARコードの「ライフ変更」がONのままだと使えません。先にOFFにして、ゲームを再起動してください。"));
     }
 
