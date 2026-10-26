@@ -42,6 +42,7 @@ struct NameEntry
 static const NameEntry g_itemNames[]   = { { 0xFFFF, nullptr } };
 static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
+#include "Life.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -1768,6 +1769,8 @@ namespace CTRPluginFramework
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
 
+        AddRecommended(menu);
+
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
                                    "「Press Y to edit」と表示されてから約10秒の間だけYで編集できます。\n"
@@ -1797,7 +1800,8 @@ namespace CTRPluginFramework
         menu->Append(new MenuEntry("扉の自動記録 (開発用)", DoorLogEntry, nullptr,
                                    "有効にして扉を通ると、行き先のエリアIDと入口番号を記録します。\n"
                                    "記録は SD直下の fll_warp_notes.txt に追記されます。"));
-
+        
+        AddLifeChange(menu);
         menu->Run();
         delete menu;
         return 0;
