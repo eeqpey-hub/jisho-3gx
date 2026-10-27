@@ -43,6 +43,7 @@ static const NameEntry g_itemNames[]   = { { 0xFFFF, nullptr } };
 static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
 #include "Life.hpp"
+#include "QualityFix.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -1769,6 +1770,7 @@ namespace CTRPluginFramework
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
 
+        AddQualityFix(menu);
         AddRecommended(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
