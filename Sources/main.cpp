@@ -1530,9 +1530,9 @@ namespace CTRPluginFramework
         { "ヘイホフの家",33,38 },
         { "アイザックの家",32,34 },
         { "いにしえの塔 試練の間",97,136 },
-        { "太古の試練その1",48,139 },
-        { "闇の試練その1",58,140 },
-        { "光の試練その1",68,141 },
+        { "太古の試練その1",98,139 },
+        { "闇の試練その1",98,140 },
+        { "光の試練その1",98,141 },
         { "→クルブルク大通り へ向かう扉の前 (2/7)", 2, 7 },
         { "★郊外南: パーテル大平原東へ向かう扉の前 (25/39)", 25, 39 },
         { "→パーテル大平原東 ハニワ洞窟前 へ向かう扉の前 (25/128)", 25, 128 },
@@ -1699,11 +1699,11 @@ namespace CTRPluginFramework
         const u32 cur = CurrentAreaId();
 
         std::vector<std::string> opts;
+        opts.push_back("エリアIDと入口番号を数字で指定して移動");
         opts.push_back(Utils::Format("次のIDへ移動 (%u)", g_expArea + 1));
         opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 1 ? g_expArea - 1 : 1));
         opts.push_back(Utils::Format("+10 へ移動 (%u)", g_expArea + 10));
         opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea > 10 ? g_expArea - 10 : 1));
-        opts.push_back("エリアIDと入口番号を数字で指定して移動");
         opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
         opts.push_back("この場所を記録 (名前を入力)");
         opts.push_back("記録を表示");
