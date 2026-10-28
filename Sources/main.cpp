@@ -42,8 +42,6 @@ struct NameEntry
 static const NameEntry g_itemNames[]   = { { 0xFFFF, nullptr } };
 static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
-#include "Life.hpp"
-#include "QualityFix.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -61,30 +59,6 @@ extern "C"
 
     void jp_captureA(u32 r3) { g_capPtr = r3 + 4; g_capCount = g_capCount + 1; }
     void jp_captureB(u32 r4) { g_capPtr = r4 + 4; g_capCount = g_capCount + 1; }
-
-    // ---- エリアワープ用 (実機未検証) ----
-    void jp_hookWarp(void);
-    volatile u32 g_warpPending = 0;
-    volatile u32 g_warpArea    = 0;
-    volatile u32 g_warpLink    = 0;
-    volatile u32 g_warpTask    = 0;   // 毎フレーム更新される。エリアID = g_warpTask + 0x6B2
-
-    // ゲーム本体のスレッドから、毎フレーム呼ばれる (task = フィールドタスク)。
-    // 予約があれば 0x21EDCC(接続番号) を呼び、エリアIDを返す(0 = 何もしない)。
-    // 接続番号が0のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
-    u32 WarpPrepare(u32 task)
-    {
-        g_warpTask = task;
-        if (!g_warpPending)
-            return 0;
-        g_warpPending = 0;
-        if (g_warpLink != 0)
-        {
-            typedef void (*SetArrivalLinkFn)(u32);
-            ((SetArrivalLinkFn)0x21EDCC)(g_warpLink);
-        }
-        return g_warpArea;
-    }
 }
 
 asm(R"(
@@ -123,34 +97,6 @@ jp_hookB2:
     ldr   r0, [r4, #0xc]         @ 0x2BA9AC
     orr   r0, r0, #1             @ 0x2BA9B0
     ldr   pc, [sp], #4           @ X+8 へ戻りつつスタックを戻す
-
-    @ ---- エリアワープ用: 0x5A2AB8 (フィールドタスクの毎フレーム更新) ----
-    @ CTRPFのHookクラスは使わず、プラグイン側で2語だけ直接書き換える:
-    @     0x5A2AB8: ldr pc, [pc, #-4]
-    @     0x5A2ABC: .word jp_hookWarp
-    @ 置き換わった2命令 (0x5A2AB8 push {r4-r11,lr} / 0x5A2ABC mov r4,r0) をここで再現し、
-    @ 0x5A2AC0 (元の ldr r6,[pc,#3016]。書き換えていない) へ戻る。
-    @ ldr pc は lr を変えないので、入口の状態 (r0=タスク, lr=呼び出し元, s0=経過時間) が
-    @ そのまま届く。C関数 (WarpPrepare) は s0〜s15 を壊すので d0-d7 を退避してから呼ぶ。
-    .global jp_hookWarp
-    .type jp_hookWarp, %function
-jp_hookWarp:
-    push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
-    vpush {d0-d7}                @ 元の関数は s0 (float引数) を使うので退避
-    bl    WarpPrepare            @ r0 = エリアID (0 = ワープなし)
-    vpop  {d0-d7}                @ s0〜s15 を元に戻す
-    str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
-    pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
-    cmp   r12, #0
-    beq   1f
-    mov   r1, r12                @ GDBで成功したのと同じ設定
-    mov   r2, #0
-    mov   r3, r12
-    ldr   pc, =0x5A4854          @ 末尾ジャンプ: 元の呼び出し元へ戻る
-1:  push  {r4-r11, lr}           @ 0x5A2AB8 の元命令
-    mov   r4, r0                 @ 0x5A2ABC の元命令
-    ldr   pc, =0x5A2AC0          @ 続きの元コードへ
-    .ltorg
 )");
 
 namespace CTRPluginFramework
@@ -160,15 +106,14 @@ namespace CTRPluginFramework
     // ------------------------------------------------------------
     static constexpr u32 HOOK_A = 0x002D33F8;   // 海外版 0x2E091C
     static constexpr u32 HOOK_B2 = 0x002BA9AC;  // ライフ道具(実験) 関数の途中
-    static constexpr u32 HOOK_WARP = 0x005A2AB8; // エリアワープ: フィールドタスク更新関数の入口
 
     static constexpr u32 BAG_BASE  = 0x006DDF2C; // かばん1枠目のアイテムID
     static constexpr u32 BAG_SLOTS = 500;
     static constexpr u32 SLOT_SIZE = 0x3C;
     static constexpr u32 OFF_ID    = 0x00;       // u16
-    static constexpr u32 OFF_COUNT = 0x06;       // u16 (旧: 0x04 u8 は誤り。行の +6 が個数)
+    static constexpr u32 OFF_COUNT = 0x04;       // u8 (要確認)
     static constexpr u32 MAX_COUNT = 99;
-    static constexpr u32 MAX_ID    = 0x09FE;   // 素材・消耗品まで
+    static constexpr u32 MAX_ID    = 0x05C4;
     static constexpr u32 MAX_BONUS = 2147483647; // 追加数値の最大(海外版エディタと同じ)
 
     struct Category
@@ -181,20 +126,14 @@ namespace CTRPluginFramework
         int  offMatk;        // u16
         const char *atkName;
         const char *matkName;
-        bool stackable;      // true: 同じ種類を1枠にまとめる (素材・消耗品)
     };
-
-    // 素材・消耗品のクオリティの位置。【未検証の仮置き】武器と同じ +0x10 と推測している。
-    // 違っていたら、かばんの素材をHexダンプで見て、ここだけ直す。
-    static constexpr int MAT_QUALITY_OFF = 0x10;
 
     static const Category g_cats[] =
     {
-        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力", false },
-        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力", false },
-        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr, false },
-        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr, false },
-        { "素材・消耗品", 0x05C5, 0x09FE, MAT_QUALITY_OFF, -1, -1, -1, nullptr, nullptr, true },
+        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力" },
+        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力" },
+        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr },
+        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr },
     };
 
     static constexpr int K_NORMAL = 0;
@@ -234,7 +173,7 @@ namespace CTRPluginFramework
         v.push_back({ "アイテムID", OFF_ID,    2, true,  MAX_ID });
         v.back().kind = K_ITEMID;
         if (withCount)
-            v.push_back({ "個数",   OFF_COUNT, 2, false, MAX_COUNT });
+            v.push_back({ "個数",   OFF_COUNT, 1, false, MAX_COUNT });
         if (!c)
             return v;
         if (c->offQuality >= 0)
@@ -898,1288 +837,193 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
-    //  アイテム生成 / 一括生成 / 一括削除 (かばんの連結リストを直接操作)
-    //
-    //  ゲーム本人が1個買ったときのRAM差分(Before/After)から分かったこと:
-    //   ・行の本体は 0x38 バイト。行の直前4バイト(= 前の行の +0x38)が (次u16,前u16) のリンク。
-    //   ・かばんの「生きている」先頭と件数は、保存用の 0x6DDF24 ではなく
-    //       0x6DCD2C を先頭とする管理領域にある: +0x1C=件数(u16)、+0x1E=先頭の行番号(u16, 空=FFFF)
-    //   ・新しい行は 499 番から使われ、行は「ID・個数=1・+0xC=FFFE・+0xE=1・+0x28から 1,2,3,4」
-    //     以外は 0 で初期化される。(防具で確認。他の種類は未検証)
+    //  武器の固有効果を変更
+    //  固有効果は、かばんの1つ1つのアイテムではなく、ゲームがメモリに読み込んでいる
+    //  「武器のデータ表」(行番号=アイテムID、行の14バイト目の2バイトが効果ID)で決まる。
+    //  この表をメモリ上で書き換える。同じIDの武器すべてに効き、自分のゲームの中だけで有効。
+    //  ゲームを終了すると元に戻る。表の場所はメモリを検索して見つける。
     // ------------------------------------------------------------
-    static constexpr u32 LIVE_BASE  = 0x006DCD2C;          // かばん管理領域
-    static constexpr u32 LIVE_LINKP = LIVE_BASE + 0x08;    // リンク配列(=BAG_BASE-4)へのポインタ
-    static constexpr u32 LIVE_COUNT = LIVE_BASE + 0x1C;    // 件数 (u16)
-    static constexpr u32 LIVE_HEAD  = LIVE_BASE + 0x1E;    // 先頭の行番号 (u16)
-    static constexpr u32 ROW_DATA   = 0x38;
-    static constexpr u16 NO_LINK    = 0xFFFF;
-    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行に入っていたID (削除時にこれを書く・推測)
-    static constexpr size_t DUP_THRESHOLD = 3;             // 名前がこの件数以上かぶると「未実装」とみなす
+    static constexpr u32 WTAB_MAGIC    = 0x1D038013u;   // 表ファイルの先頭の目印
+    static constexpr u32 WTAB_ROWS_OFF = 0x110;         // 先頭から最初の行まで
+    static constexpr u32 WTAB_ROW_SIZE = 24;
+    static constexpr u32 WTAB_EFF_OFF  = 14;
+    static constexpr u32 WEAPON_COUNT  = 0x90;          // 武器のID 0x0000-0x008F
+    static constexpr u32 EFFECT_MAX    = 0x240;         // 効果IDの最大
 
-    static u32 LinkAddr(u32 slot) { return BAG_BASE - 4 + slot * SLOT_SIZE; }
-
-    struct BagState
+    struct WtabSig { u32 row; u32 w0, w1, w2; u16 w3; };
+    // 効果以外の列の値。表を見つけるときの照合に使う (効果を書き換えても変わらない)
+    static const WtabSig g_wtabSig[] =
     {
-        std::vector<u16>  order;   // 先頭から末尾までの行番号
-        std::vector<bool> used;
+        { 0x00, 0x00100006u, 0x00010064u, 0x02650000u, 0x03E8 },
+        { 0x01, 0x0010000Cu, 0x00010064u, 0x02660000u, 0x03E8 },
+        { 0x51, 0x00100078u, 0x00010064u, 0x042C0000u, 0x03E8 },
+        { 0x8F, 0x00020000u, 0x00010064u, 0x064C0050u, 0x03E8 },
     };
 
-    // 管理領域と連結リストを読む。想定と違えば false (何も書かない)
-    static bool LoadBag(BagState &b, std::string &err)
+    static u32  g_wtab[8];          // 見つかった表(コピー)の先頭アドレス
+    static int  g_wtabN = 0;
+    static u16  g_wOrig[WEAPON_COUNT];
+    static bool g_wHas[WEAPON_COUNT];   // 変更済みか (元の値を g_wOrig に保存)
+
+    static bool IsWeaponTable(u32 base)
     {
-        u32 p = 0;
-        if (!Process::Read32(LIVE_LINKP, p) || p != BAG_BASE - 4)
-        {
-            err = "かばんの管理領域が想定と違います。(バージョン違いの可能性。何も書いていません)";
+        u32 v = 0;
+        if (!Process::Read32(base, v) || v != WTAB_MAGIC)
             return false;
-        }
-        u16 head = 0, cnt = 0;
-        if (!Process::Read16(LIVE_HEAD, head) || !Process::Read16(LIVE_COUNT, cnt))
+        for (const WtabSig &s : g_wtabSig)
         {
-            err = "管理領域を読めません。";
-            return false;
-        }
-        b.order.clear();
-        b.used.assign(BAG_SLOTS, false);
-        u16 idx = head;
-        while (idx != NO_LINK)
-        {
-            if (idx >= BAG_SLOTS || b.used[idx] || b.order.size() >= BAG_SLOTS)
-            {
-                err = "かばんの連結リストが想定と違います。(何も書いていません)";
+            const u32 a = base + WTAB_ROWS_OFF + WTAB_ROW_SIZE * s.row;
+            u32 x0 = 0, x1 = 0, x2 = 0;
+            u16 x3 = 0;
+            if (!Process::Read32(a, x0) || !Process::Read32(a + 4, x1) ||
+                !Process::Read32(a + 8, x2) || !Process::Read16(a + 12, x3))
                 return false;
-            }
-            b.used[idx] = true;
-            b.order.push_back(idx);
-            u16 next = 0;
-            if (!Process::Read16(LinkAddr(idx), next))
-            {
-                err = "リンクを読めません。";
+            if (x0 != s.w0 || x1 != s.w1 || x2 != s.w2 || x3 != s.w3)
                 return false;
-            }
-            idx = next;
-        }
-        if (cnt != (u16)b.order.size())
-        {
-            err = Utils::Format("件数(%u)と連結リストの長さ(%u)が合いません。(何も書いていません)",
-                                (u32)cnt, (u32)b.order.size());
-            return false;
         }
         return true;
     }
 
-    static int PickFreeRow(const BagState &b)
+    // 読めない所はページ単位で飛ばしながら、16バイトおきに目印を探す
+    static void ScanPass(u32 start, u32 end, u32 off)
     {
-        for (int k = (int)BAG_SLOTS - 1; k >= 0; --k)
-            if (!b.used[k])
-                return k;
-        return -1;
+        u32 a = start + off;
+        while (a < end)
+        {
+            u32 v = 0;
+            if (!Process::Read32(a, v))
+            {
+                a = ((a | 0xFFFu) + 1) + off;
+                continue;
+            }
+            if (v == WTAB_MAGIC && g_wtabN < 8 && IsWeaponTable(a))
+                g_wtab[g_wtabN++] = a;
+            a += 16;
+        }
     }
 
-    static u32 FreeRows(const BagState &b)
+    // 0=やめた 1=見つかった 2=見つからなかった
+    static int FindWeaponTables()
     {
-        u32 n = 0;
-        for (u32 k = 0; k < BAG_SLOTS; ++k)
-            if (!b.used[k])
-                ++n;
-        return n;
+        int k = 0;                       // 前回見つけた場所がまだ有効ならそれを使う
+        for (int i = 0; i < g_wtabN; ++i)
+            if (IsWeaponTable(g_wtab[i]))
+                g_wtab[k++] = g_wtab[i];
+        g_wtabN = k;
+        if (g_wtabN > 0)
+            return 1;
+
+        if (!(MessageBox("武器データの検索",
+                         "メモリから武器のデータ表を探します。\n数十秒かかることがあります。\n(最初の1回だけです)",
+                         DialogType::DialogYesNo))())
+            return 0;
+
+        static const u32 ranges[2][2] = { { 0x08000000u, 0x10000000u }, { 0x14000000u, 0x1C000000u } };
+        for (u32 off = 0; off < 16 && g_wtabN == 0; off += 4)
+            for (int r = 0; r < 2; ++r)
+                ScanPass(ranges[r][0], ranges[r][1], off);
+        return g_wtabN > 0 ? 1 : 2;
     }
 
-    static void CommitCount(const BagState &b)
+    static u32 WeaponEffAddr(u32 base, u32 id)
     {
-        Process::Write16(LIVE_COUNT, (u16)b.order.size());
+        return base + WTAB_ROWS_OFF + WTAB_ROW_SIZE * id + WTAB_EFF_OFF;
     }
 
-    // ------------------------------------------------------------
-    //  生成時に指定する追加項目 (クオリティ・追加効果・追加数値・素材の個数)
-    //  fields[] はアイテムIDを除いた項目。use[i]=true の項目だけ値を書く。
-    // ------------------------------------------------------------
-    struct GenSpec
+    static bool ReadWeaponEff(u32 id, u16 &out)
     {
-        std::vector<Field> fields;
-        std::vector<bool>  use;
-        std::vector<u32>   val;
-    };
-
-    static u32 SpecValue(const GenSpec *sp, u32 off, u32 def)
-    {
-        if (!sp)
-            return def;
-        for (size_t i = 0; i < sp->fields.size(); ++i)
-            if (sp->fields[i].off == off && sp->use[i])
-                return sp->val[i];
-        return def;
+        return g_wtabN > 0 && Process::Read16(WeaponEffAddr(g_wtab[0], id), out);
     }
 
-    // 追加項目を選ぶ画面 (一括変更の画面と同じ作り)。キャンセルなら false
-    static bool AskGenSpec(const Category *cat, const std::string &title, GenSpec &sp, u32 &count)
+    static bool WriteWeaponEff(u32 id, u16 eff)
     {
-        sp.fields = FieldsFor(cat, cat && cat->stackable);   // [0] = アイテムID
-        sp.fields.erase(sp.fields.begin());
-        const size_t F = sp.fields.size();
-        sp.use.assign(F, false);
-        sp.val.assign(F, 0);
-        count = 1;
-        if (F == 0)
-            return true;
+        bool ok = false;
+        for (int i = 0; i < g_wtabN; ++i)
+        {
+            const u32 a = WeaponEffAddr(g_wtab[i], id);
+            u16 back = 0;
+            if (Process::Write16(a, eff) && Process::Read16(a, back) && back == eff)
+                ok = true;
+        }
+        return ok;
+    }
+
+    static std::string EffName(u32 id)
+    {
+        const char *n = LookupName(g_effectNames, id);
+        return n ? std::string(n) : Utils::Format("0x%04X", id);
+    }
+
+    static void WeaponInnateEditEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        const int found = FindWeaponTables();
+        if (found == 0)
+            return;
+        if (found == 2)
+        {
+            MessageBox("見つかりません", "武器のデータ表がメモリ上に見つかりませんでした。")();
+            return;
+        }
 
         for (;;)
         {
             std::vector<std::string> rows;
-            for (size_t i = 0; i < F; ++i)
-                rows.push_back(sp.fields[i].label + ": " +
-                               (sp.use[i] ? FmtValue(sp.fields[i], sp.val[i]) : std::string("指定しない")));
-            rows.push_back("[この内容で生成]");
-            rows.push_back("[すべて指定しないに戻す]");
-
-            Keyboard kb(title, rows);
+            rows.push_back("[変更をすべて元に戻す]");
+            for (u32 id = 0; id < WEAPON_COUNT; ++id)
+            {
+                u16 e = 0;
+                ReadWeaponEff(id, e);
+                std::string s = IdName(id) + ": " + EffName(e);
+                if (g_wHas[id])
+                    s += " *";
+                rows.push_back(s);
+            }
+            Keyboard kb("武器の固有効果を変更 (*は変更済み。Bで戻る)", rows);
             const int sel = kb.Open();
             if (sel < 0)
-                return false;
-            if ((size_t)sel == F)
-                break;
-            if ((size_t)sel == F + 1)
+                return;
+
+            if (sel == 0)
             {
-                for (size_t i = 0; i < F; ++i) { sp.use[i] = false; sp.val[i] = 0; }
+                u32 n = 0;
+                for (u32 id = 0; id < WEAPON_COUNT; ++id)
+                    if (g_wHas[id] && WriteWeaponEff(id, g_wOrig[id]))
+                    {
+                        g_wHas[id] = false;
+                        ++n;
+                    }
+                MessageBox("元に戻しました", Utils::Format("%u 本ぶんを元に戻しました。", n))();
                 continue;
             }
-            u32 cur = sp.use[sel] ? sp.val[sel] : 0, v = 0;
-            if (AskFieldValue(sp.fields[sel], cat, cur, v))
+
+            const u32 id = (u32)sel - 1;
+            u16 cur = 0;
+            ReadWeaponEff(id, cur);
+            u32 pick = 0;
+            if (!PickFromNames(Utils::Format("固有効果 [%s]", IdName(id).c_str()), g_effectNames,
+                               false, 0, 0, cur, pick))
+                continue;
+            if (pick > EFFECT_MAX)
             {
-                sp.use[sel] = true;
-                sp.val[sel] = v;
+                MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", EFFECT_MAX))();
+                continue;
             }
-        }
-        count = SpecValue(&sp, OFF_COUNT, 1);
-        if (count == 0)
-            count = 1;
-        return true;
-    }
-
-    static std::string SpecSummary(const GenSpec &sp)
-    {
-        std::string s;
-        for (size_t i = 0; i < sp.fields.size(); ++i)
-            if (sp.use[i])
-                s += "・" + sp.fields[i].label + ": " + FmtValue(sp.fields[i], sp.val[i]) + "\n";
-        return s;
-    }
-
-    // ------------------------------------------------------------
-    //  未実装アイテムの判定 (名前の表から)
-    //   ・名前に「未知」が付く / 「そざい」「ぶき」などの仮の名前
-    //   ・同じ名前が DUP_THRESHOLD 件以上ある (兵士の剣などは2件までなので残る)
-    // ------------------------------------------------------------
-    static bool IsPlaceholderName(const std::string &name)
-    {
-        if (name.find("未知") != std::string::npos)
-            return true;
-        std::string t = name;
-        size_t e = t.size();
-        while (e > 0 && ((t[e - 1] >= '0' && t[e - 1] <= '9') || (t[e - 1] >= 'A' && t[e - 1] <= 'Z') ||
-                         (t[e - 1] >= 'a' && t[e - 1] <= 'z')))
-            --e;
-        t.resize(e);
-        return t == "そざい" || t == "ぶき" || t == "ぼうぐ" || t == "どうぐ" || t == "かぐ";
-    }
-
-    static bool NameTableLoaded() { return g_itemNames[0].name != nullptr; }
-
-    static bool IsUnimplemented(u32 id)
-    {
-        static std::vector<char> tbl;
-        static bool built = false;
-        if (!built)
-        {
-            built = true;
-            tbl.assign(MAX_ID + 1, 0);
-            std::vector<std::pair<std::string, u32> > v;
-            for (const NameEntry *e = g_itemNames; e->name; ++e)
-                if (e->id <= MAX_ID)
-                    v.push_back(std::make_pair(std::string(e->name), (u32)e->id));
-            std::sort(v.begin(), v.end());
-            v.erase(std::unique(v.begin(), v.end()), v.end());
-            for (size_t i = 0; i < v.size();)
+            if (!g_wHas[id])
             {
-                size_t j = i;
-                while (j < v.size() && v[j].first == v[i].first)
-                    ++j;
-                const bool dup = (j - i) >= DUP_THRESHOLD;
-                for (size_t k = i; k < j; ++k)
-                    if (dup || IsPlaceholderName(v[k].first))
-                        tbl[v[k].second] = 1;
-                i = j;
+                g_wOrig[id] = cur;
+                g_wHas[id]  = true;
             }
-        }
-        return id <= MAX_ID && tbl[id] != 0;
-    }
-
-    // ------------------------------------------------------------
-    //  行の作成・追加
-    // ------------------------------------------------------------
-    // 空き行 row に新しいアイテムを作り、リストの末尾につなぐ (件数はここでは更新しない)
-    static void AppendRow(BagState &b, u32 row, u32 id, u32 count, const GenSpec *sp)
-    {
-        const u32 base = SlotAddr(row);
-        for (u32 o = 0; o < ROW_DATA; o += 4)
-            Process::Write32(base + o, 0);
-        Process::Write32(base + OFF_ID, id);
-        Process::Write16(base + OFF_COUNT, (u16)count);
-        Process::Write16(base + 0x0C, 0xFFFE);
-        Process::Write16(base + 0x0E, 0x0001);
-        Process::Write32(base + 0x28, 1);
-        Process::Write32(base + 0x2C, 2);
-        Process::Write32(base + 0x30, 3);
-        Process::Write32(base + 0x34, 4);
-
-        if (sp)
-            for (size_t i = 0; i < sp->fields.size(); ++i)
-                if (sp->use[i] && sp->fields[i].off != OFF_COUNT)
-                    WriteField(base, sp->fields[i], sp->val[i]);
-
-        const u16 tail = b.order.empty() ? NO_LINK : b.order.back();
-        Process::Write16(LinkAddr(row),     NO_LINK);
-        Process::Write16(LinkAddr(row) + 2, tail);
-        if (tail != NO_LINK)
-            Process::Write16(LinkAddr(tail), (u16)row);
-        else
-            Process::Write16(LIVE_HEAD, (u16)row);
-
-        b.order.push_back((u16)row);
-        b.used[row] = true;
-    }
-
-    // 1つ追加。成功したら行番号、満杯なら -1。
-    // 素材・消耗品(と範囲外のID)は、同じID(とクオリティ)の行があれば個数を足す
-    static int AddOne(BagState &b, u32 id, u32 count, const GenSpec *sp)
-    {
-        const Category *cat = FindCategory((u16)id);
-        if (!cat || cat->stackable)
-        {
-            const u32 wantQ = cat ? SpecValue(sp, (u32)cat->offQuality, 0) : 0;
-            for (u16 s : b.order)
+            if (!WriteWeaponEff(id, (u16)pick))
             {
-                u32 cur = 0;
-                if (!Process::Read32(SlotAddr(s) + OFF_ID, cur) || cur != id)
-                    continue;
-                if (cat && cat->offQuality >= 0)
-                {
-                    u8 q = 0;
-                    Process::Read8(SlotAddr(s) + (u32)cat->offQuality, q);
-                    if (q != wantQ)
-                        continue;
-                }
-                u16 c = 0;
-                Process::Read16(SlotAddr(s) + OFF_COUNT, c);
-                u32 n = c + count;
-                if (n > MAX_COUNT)
-                    n = MAX_COUNT;
-                Process::Write16(SlotAddr(s) + OFF_COUNT, (u16)n);
-                return (int)s;
+                MessageBox("失敗", "書き込めませんでした。")();
+                continue;
             }
-        }
-        const int f = PickFreeRow(b);
-        if (f < 0)
-            return -1;
-        AppendRow(b, (u32)f, id, count, sp);
-        return f;
-    }
-
-    static void CreateItemEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        u32 id = 0;
-        if (!PickFromNames("生成するアイテムID", g_itemNames, false, 0, MAX_ID, 0, id))
-            return;
-        if (id > MAX_ID)
-        {
-            MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
-            return;
-        }
-
-        const Category *cat = FindCategory((u16)id);
-        u32 count = 1;
-        GenSpec sp;
-        if (cat)
-        {
-            if (!AskGenSpec(cat, Utils::Format("追加項目 [%s] %s", cat->name, IdName(id).c_str()), sp, count))
-                return;
-        }
-        else
-        {
-            if (!(MessageBox("確認",
-                             Utils::Format("0x%04X は武器・防具・道具・家具・素材のどれでもありません。\n"
-                                           "消耗品などとして追加しますか?", id),
-                             DialogType::DialogYesNo))())
-                return;
-            if (!AskValue("個数", false, MAX_COUNT, 1, count) || count == 0)
-                return;
-        }
-
-        std::string msg = Utils::Format("「%s」をかばんに追加します。\n", IdName(id).c_str());
-        msg += SpecSummary(sp);
-        msg += "セーブのバックアップは取りましたか?";
-        if (!(MessageBox("確認", msg, DialogType::DialogYesNo))())
-            return;
-
-        BagState b;
-        std::string err;
-        if (!LoadBag(b, err))
-        {
-            MessageBox("追加できませんでした", err)();
-            return;
-        }
-        const int slot = AddOne(b, id, count, cat ? &sp : nullptr);
-        if (slot < 0)
-        {
-            MessageBox("追加できませんでした", "かばんに空き枠がありません。")();
-            return;
-        }
-        CommitCount(b);
-
-        MessageBox("完了", Utils::Format("%d枠目に追加しました。\n"
-                                         "かばん画面は、一度閉じて開き直すと反映されます。", slot + 1))();
-
-        if (MessageBox("続けて編集", "クオリティや追加効果などを編集しますか?", DialogType::DialogYesNo)())
-            EditAt(SlotAddr((u32)slot), "生成したアイテムの編集", true);
-    }
-
-    // 範囲内の実在するID (名前の表が無いときは番号をそのまま) を小さい順に集める
-    static void PoolIds(u32 from, u32 to, std::vector<u32> &out)
-    {
-        out.clear();
-        if (NameTableLoaded())
-        {
-            for (const NameEntry *e = g_itemNames; e->name; ++e)
-                if (e->id >= from && e->id <= to)
-                    out.push_back(e->id);
-            std::sort(out.begin(), out.end());
-            out.erase(std::unique(out.begin(), out.end()), out.end());
-        }
-        else
-        {
-            for (u32 id = from; id <= to; ++id)
-                out.push_back(id);
-        }
-    }
-
-    // ids が全部同じカテゴリならそれを返す (違う/カテゴリ外が混ざるなら nullptr)
-    static const Category *CommonCategory(const std::vector<u32> &ids)
-    {
-        const Category *c0 = nullptr;
-        for (u32 id : ids)
-        {
-            const Category *c = FindCategory((u16)id);
-            if (!c || (c0 && c != c0))
-                return nullptr;
-            c0 = c;
-        }
-        return c0;
-    }
-
-    static void BulkCreateEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        std::vector<std::string> modes;
-        modes.push_back("カテゴリの全アイテムを1つずつ");
-        modes.push_back("ID範囲を指定して1つずつ");
-        modes.push_back("同じアイテムをN個 (別枠)");
-        Keyboard km("一括生成", modes);
-        const int mode = km.Open();
-        if (mode < 0)
-            return;
-
-        std::vector<u32> ids;
-        std::string what;
-
-        if (mode == 0)
-        {
-            std::vector<std::string> names;
-            for (const Category &c : g_cats)
-                names.push_back(Utils::Format("%s (ID 0x%04X-0x%04X)", c.name, c.idMin, c.idMax));
-            Keyboard kc("生成するカテゴリ", names);
-            const int ci = kc.Open();
-            if (ci < 0)
-                return;
-            PoolIds(g_cats[ci].idMin, g_cats[ci].idMax, ids);
-            what = Utils::Format("%s の全アイテム", g_cats[ci].name);
-        }
-        else if (mode == 1)
-        {
-            u32 from = 0, to = MAX_ID;
-            if (!PickFromNames("開始ID", g_itemNames, false, 0, MAX_ID, 0, from))
-                return;
-            if (!PickFromNames("終了ID", g_itemNames, false, 0, MAX_ID, MAX_ID, to))
-                return;
-            if (from > to)
-                std::swap(from, to);
-            if (to > MAX_ID)
-                to = MAX_ID;
-            PoolIds(from, to, ids);
-            what = Utils::Format("ID 0x%04X-0x%04X", from, to);
-        }
-        else
-        {
-            u32 id = 0, n = 1;
-            if (!PickFromNames("生成するアイテムID", g_itemNames, false, 0, MAX_ID, 0, id))
-                return;
-            if (id > MAX_ID)
-            {
-                MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
-                return;
-            }
-            if (!AskValue("個数(枠の数)", false, BAG_SLOTS, 1, n) || n == 0)
-                return;
-            ids.assign(n, id);
-            what = Utils::Format("%s を %u 個", IdName(id).c_str(), n);
-        }
-
-        // 未実装アイテムの除外 (カテゴリ・ID範囲のとき)
-        if (mode != 2 && NameTableLoaded() && !ids.empty())
-        {
-            u32 unimpl = 0;
-            for (u32 id : ids)
-                if (IsUnimplemented(id))
-                    ++unimpl;
-            if (unimpl > 0)
-            {
-                if ((MessageBox("未実装アイテム",
-                                Utils::Format("対象 %u 件のうち、未実装らしいものが %u 件あります。\n"
-                                              "(未知・そざい・ぶき等、名前が%u件以上かぶるもの)\n"
-                                              "除外しますか?", (u32)ids.size(), unimpl, (u32)DUP_THRESHOLD),
-                                DialogType::DialogYesNo))())
-                {
-                    std::vector<u32> keep;
-                    for (u32 id : ids)
-                        if (!IsUnimplemented(id))
-                            keep.push_back(id);
-                    ids.swap(keep);
-                    what += " (未実装を除外)";
-                }
-            }
-        }
-
-        if (ids.empty())
-        {
-            MessageBox("対象なし", "該当するアイテムがありません。")();
-            return;
-        }
-
-        // 追加項目 (全部が同じカテゴリのときだけ指定できる)
-        GenSpec sp;
-        u32 count = 1;
-        const Category *cc = CommonCategory(ids);
-        bool useSpec = false;
-        if (cc)
-        {
-            if (!AskGenSpec(cc, Utils::Format("追加項目 [%s] (全件に適用)", cc->name), sp, count))
-                return;
-            useSpec = true;
-        }
-        else
-        {
-            MessageBox("追加項目", "対象が複数のカテゴリにまたがるため、追加項目は指定できません。\n"
-                                   "(カテゴリ別に分けて生成すると指定できます)")();
-        }
-
-        BagState b;
-        std::string err;
-        if (!LoadBag(b, err))
-        {
-            MessageBox("追加できませんでした", err)();
-            return;
-        }
-        const u32 freeN = FreeRows(b);
-        std::string msg = Utils::Format("%s\n対象 %u 件 / かばんの空き枠 %u\n", what.c_str(), (u32)ids.size(), freeN);
-        if (useSpec)
-            msg += SpecSummary(sp);
-        if (ids.size() > freeN)
-            msg += "空き枠が足りないため、先頭から入る分だけ作ります。\n";
-        msg += "セーブのバックアップは取りましたか?\n実行しますか?";
-        if (!(MessageBox("一括生成の確認", msg, DialogType::DialogYesNo))())
-            return;
-
-        u32 made = 0, skipped = 0;
-        for (u32 id : ids)
-        {
-            if (AddOne(b, id, count, useSpec ? &sp : nullptr) < 0)
-            {
-                skipped = (u32)ids.size() - made;
-                break;
-            }
-            ++made;
-        }
-        CommitCount(b);
-
-        MessageBox("完了", Utils::Format("%u 件を処理しました。(入りきらず未処理: %u)\n"
-                                         "かばん画面は、一度閉じて開き直すと反映されます。", made, skipped))();
-    }
-
-    // ------------------------------------------------------------
-    //  アイテム一括削除
-    //  連結リストから外し、件数を減らし、行のIDを空き行の値(0x666)にする。
-    //  ※ゲーム本人の削除処理は未確認。かばんから消すだけで、装備中のものは対象にしないこと。
-    // ------------------------------------------------------------
-    static void BulkDeleteEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        std::vector<std::string> names;
-        for (const Category &c : g_cats)
-            names.push_back(Utils::Format("%s (ID 0x%04X-0x%04X)", c.name, c.idMin, c.idMax));
-        names.push_back("かばん内のすべて");
-        Keyboard kc("一括削除するカテゴリ", names);
-        const int ci = kc.Open();
-        if (ci < 0)
-            return;
-        const bool all = ((size_t)ci == sizeof(g_cats) / sizeof(g_cats[0]));
-
-        std::vector<std::string> modes;
-        modes.push_back("そのカテゴリのアイテムをすべて削除");
-        modes.push_back("未実装アイテムだけ削除");
-        Keyboard kmo("削除する対象", modes);
-        const int mo = kmo.Open();
-        if (mo < 0)
-            return;
-        if (mo == 1 && !NameTableLoaded())
-        {
-            MessageBox("名前の表なし", "名前の表が無いので、未実装の判定ができません。")();
-            return;
-        }
-
-        BagState b;
-        std::string err;
-        if (!LoadBag(b, err))
-        {
-            MessageBox("削除できませんでした", err)();
-            return;
-        }
-
-        std::vector<u16> keep, del;
-        for (u16 s : b.order)
-        {
-            u32 id = 0;
-            Process::Read32(SlotAddr(s) + OFF_ID, id);
-            bool hit = all || (id >= g_cats[ci].idMin && id <= g_cats[ci].idMax);
-            if (hit && mo == 1 && !IsUnimplemented(id))
-                hit = false;
-            (hit ? del : keep).push_back(s);
-        }
-        if (del.empty())
-        {
-            MessageBox("対象なし", "削除するアイテムがありません。")();
-            return;
-        }
-
-        std::string msg = Utils::Format("%s\n%s\nかばんから %u 件を削除します。(残り %u 件)\n"
-                                        "装備中のアイテムは、先に外してから実行してください。\n"
-                                        "セーブのバックアップは取りましたか?\n実行しますか?",
-                                        all ? "かばん内のすべて" : g_cats[ci].name,
-                                        mo == 1 ? "未実装アイテムのみ" : "すべて",
-                                        (u32)del.size(), (u32)keep.size());
-        if (!(MessageBox("一括削除の確認", msg, DialogType::DialogYesNo))())
-            return;
-
-        for (u16 s : del)
-        {
-            Process::Write32(SlotAddr(s) + OFF_ID, EMPTY_ID);
-            Process::Write16(LinkAddr(s),     NO_LINK);
-            Process::Write16(LinkAddr(s) + 2, NO_LINK);
-        }
-        for (size_t i = 0; i < keep.size(); ++i)
-        {
-            Process::Write16(LinkAddr(keep[i]),     i + 1 < keep.size() ? keep[i + 1] : NO_LINK);
-            Process::Write16(LinkAddr(keep[i]) + 2, i > 0 ? keep[i - 1] : NO_LINK);
-        }
-        Process::Write16(LIVE_HEAD,  keep.empty() ? NO_LINK : keep[0]);
-        Process::Write16(LIVE_COUNT, (u16)keep.size());
-
-        MessageBox("完了", Utils::Format("%u 件を削除しました。\n"
-                                         "かばん画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
-    }
-
-    // ------------------------------------------------------------
-    //  エリアワープ (実機未検証)
-    //  移動先 = {表示名, エリアID, 出入口の接続番号}
-    //  (エリアID, 接続番号) は実際の扉の記録から取った組み合わせ。
-    //  ★ は GDB で実際に移動を確認したもの。それ以外は未確認。
-    //  場所名は通った順番からの推定。
-    // ------------------------------------------------------------
-    struct WarpDest { const char *label; u16 area; u16 link; };
-
-    // 規則 (ユーザーの実機テストで判明):
-    //   ワープの組 (area, link) は「その行き先 area へ向かう、番号 link の扉」の前に出る。
-    //   出る場所は、その扉があるエリア (= 行き先の隣のエリア) になる。
-    //   例: (25,39) = 郊外南の、パーテル大平原東へ向かう扉の前
-    //       ( 3,39) = パーテル大平原東の、郊外南へ向かう扉の前
-    //   ★ はこの規則で実機確認したもの。他は規則からの推測 (場所名は通った順番からの推定)。
-    //   エリアXの出入口に出たいときは、Xの中でその扉を通ったときの記録 (行き先, 番号) を使う。
-    static const WarpDest g_warpDests[] =
-    {
-        { "パーテル大平原 東", 3, 39 },
-        { "クルブルク城 謁見の間",143,27 },
-        { "王国兵士の詰所",2,15 },
-        { "バラード酒場",251,2 },
-        { "ククの家",33,36 },
-        { "イムカの家",33,37 },
-        { "王立クルブルク工房",1,21 },
-        { "コンガス食堂",152,5 },
-        { "王立クルブルク図書館",2,16 },
-        { "ヘイホフの家",33,38 },
-        { "アイザックの家",32,34 },
-        { "いにしえの塔 試練の間",97,136 },
-        { "太古の試練その1",98,139 },
-        { "闇の試練その1",98,140 },
-        { "光の試練その1",98,141 },
-        { "→クルブルク大通り へ向かう扉の前 (2/7)", 2, 7 },
-        { "★郊外南: パーテル大平原東へ向かう扉の前 (25/39)", 25, 39 },
-        { "→パーテル大平原東 ハニワ洞窟前 へ向かう扉の前 (25/128)", 25, 128 },
-        { "→パーテル西 へ向かう扉の前 (24/125)", 24, 125 },
-        { "→パーテル大平原東 へ向かう扉の前 (25/121)", 25, 121 },
-        { "→ハーベスの大農園 へ向かう扉の前 (209/127)", 209, 127 },
-        { "→始まりの島温泉街 へ向かう扉の前 (84/137)", 84, 137 },
-        { "→中心街 へ向かう扉の前 (82/131)", 82, 131 },
-        { "→太鼓の砂浜 へ向かう扉の前 (83/133)", 83, 133 },
-        { "→ギガガビトのほら穴 へ向かう扉の前 (86/142)", 86, 142 },
-        { "→崖の神殿 へ向かう扉の前 (85/132)", 85, 132 },
-        { "→いにしえの塔 へ向かう扉の前 (97/134)", 97, 134 },
-        { "→試練の間 へ向かう扉の前 (98/136)", 98, 136 },
-        { "→ポルトポルト宮殿街 へ向かう扉の前 (7/71)", 7, 71 },
-        { "→玄関街 へ向かう扉の前 (8/56)", 8, 56 },
-        { "→郊外 宮殿街側 へ向かう扉の前 (10/55)", 10, 55 },
-        { "→マバラッパ諸島 へ向かう扉の前 (15/74)", 15, 74 },
-        { "→ダルスモルス魔王街 へ向かう扉の前 (17/104)", 17, 104 },
-        { "→砂漠街 へ向かう扉の前 (16/89)", 16, 89 },
-        { "→郊外 砂漠側 へ向かう扉の前 (19/88)", 19, 88 },
-        { "→サンサン砂漠 へ向かう扉の前 (20/106)", 20, 106 },
-        { "→着ぐるみキャンプ場 へ向かう扉の前 (11/197)", 11, 197 },
-        { "→空島東 へ向かう扉の前 (31/83)", 31, 83 },
-        { "→空島中央 へ向かう扉の前 (13/82)", 13, 82 },
-        { "→空島西 へ向かう扉の前 (30/81)", 30, 81 },
-        { "→コモレヴィ へ向かう扉の前 (36/196)", 36, 196 },
-        { "→森の洞穴 へ向かう扉の前 (185/115)", 185, 115 },
-        { "→森の奥地 へ向かう扉の前 (28/119)", 28, 119 },
-        { "→森 へ向かう扉の前 (23/122)", 23, 122 },
-    };
-    static constexpr int WARP_COUNT = sizeof(g_warpDests) / sizeof(g_warpDests[0]);
-
-    static bool g_warpHooked = false;
-
-    static bool InstallWarpHook(void)
-    {
-        if (g_warpHooked)
-            return true;
-
-        // 入口の2命令が想定どおりか確認 (違うバージョンなら入れない)
-        //   push {r4-r11,lr} / mov r4,r0
-        static const u32 expectW[2] = { 0xE92D4FF0, 0xE1A04000 };
-        if (!CheckWords(HOOK_WARP, expectW, 2))
-        {
-            MessageBox("エラー",
-                       "ワープ用のフック位置の命令が想定と違います。\nゲームのバージョンが異なる可能性があるため、機能を有効にできません。")();
-            return false;
-        }
-
-        // CTRPFのHookクラスは使わず、2語を直接書く。
-        // 先にジャンプ先の値(2語目)を書き、そのあとで ldr pc 命令(1語目)を書く。
-        Process::Write32(HOOK_WARP + 4, (u32)(uintptr_t)jp_hookWarp);
-        Process::Write32(HOOK_WARP,     0xE51FF004);   // ldr pc, [pc, #-4]
-
-        g_warpHooked = true;
-        return true;
-    }
-
-    // メニューから選んだときに1回だけ実行される (有効/無効の切り替えではない)
-    static void WarpEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        if (!InstallWarpHook())
-            return;
-
-        std::vector<std::string> names;
-        for (int i = 0; i < WARP_COUNT; ++i)
-            names.push_back(g_warpDests[i].label);
-
-        Keyboard kb("移動先を選択 (その行き先へ向かう扉の前に出ます)", names);
-        int sel = kb.Open();
-        if (sel < 0 || sel >= WARP_COUNT)
-            return;
-
-        g_warpArea    = g_warpDests[sel].area;
-        g_warpLink    = g_warpDests[sel].link;
-        g_warpPending = 1;     // メニューを閉じた後、ゲームが次にタスクを更新したときに実行される
-        OSD::Notify("Warp requested.");
-    }
-
-    // ------------------------------------------------------------
-    //  探索ワープ / 場所の記録 (開発用・実機未検証)
-    //  GDBなしで、移動先のデータ (エリアID・入口番号・場所名) を集めるための機能。
-    //   ・探索ワープ: エリアIDを +1 / -1 / 直接入力 で移動し、着いた場所の名前を記録する
-    //   ・扉の自動記録: 有効にして扉を通ると、行き先エリアIDと入口番号を記録する
-    //  記録は SD カード直下の fll_warp_notes.txt に追記される (書けない場合は画面の一覧のみ)。
-    //  存在しないエリアIDへ移動すると、落ちる可能性がある。必ずバックアップを取ること。
-    // ------------------------------------------------------------
-    #ifndef WARP_LOG_TO_FILE
-    #define WARP_LOG_TO_FILE 1      // ビルドが通らないときは 0 にするとファイル出力を外せる
-    #endif
-
-    static std::vector<std::string> g_notes;
-    static u32 g_expArea = 2;
-    static u32 g_expLink = 0;
-
-    static void AppendNote(const std::string &line)
-    {
-        g_notes.push_back(line);
-    #if WARP_LOG_TO_FILE
-        File f;
-        if (File::Open(f, "/fll_warp_notes.txt", File::WRITE | File::CREATE | File::APPEND) == 0)
-        {
-            f.WriteLine(line);
-            f.Close();
-        }
-        else
-            OSD::Notify("note: file open failed (memory only)");
-    #endif
-    }
-
-    static void RequestWarp(u32 area, u32 link)
-    {
-        if (area < 1)   area = 1;
-        if (area > 999) area = 999;
-        g_expArea = area;
-        g_expLink = link;
-        g_warpArea    = area;
-        g_warpLink    = link;
-        g_warpPending = 1;
-        OSD::Notify(Utils::Format("Warp: area %u link %u", area, link));
-    }
-
-    static u32 CurrentAreaId(void)
-    {
-        u16 a = 0;
-        if (g_warpTask != 0)
-            Process::Read16(g_warpTask + 0x6B2, a);
-        return a;
-    }
-
-    static void ShowNotes(void)
-    {
-        if (g_notes.empty())
-        {
-            MessageBox("記録", "まだ記録がありません。")();
-            return;
-        }
-        std::string text;
-        int shown = 0;
-        for (int i = (int)g_notes.size() - 1; i >= 0 && shown < 12; --i, ++shown)
-            text += g_notes[i] + "\n";
-        MessageBox("記録 (新しい順 最大12件)", text)();
-    }
-
-    static void RecordHere(void)
-    {
-        std::string name;
-        Keyboard kb("この場所の名前を入力 (記録します)");
-        if (kb.Open(name) != 0)
-            return;
-        AppendNote(Utils::Format("area=%u link=%u name=%s", CurrentAreaId(), g_expLink, name.c_str()));
-        OSD::Notify("Recorded.");
-    }
-
-    static void ExploreEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        if (!InstallWarpHook())
-            return;
-
-        const u32 cur = CurrentAreaId();
-
-        std::vector<std::string> opts;
-        opts.push_back("エリアIDと入口番号を数字で指定して移動");
-        opts.push_back(Utils::Format("次のIDへ移動 (%u)", g_expArea + 1));
-        opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 1 ? g_expArea - 1 : 1));
-        opts.push_back(Utils::Format("+10 へ移動 (%u)", g_expArea + 10));
-        opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea > 10 ? g_expArea - 10 : 1));
-        opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
-        opts.push_back("この場所を記録 (名前を入力)");
-        opts.push_back("記録を表示");
-
-        u32 sel = 0;
-        if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の移動=ID %u 入口 %u", cur, g_expArea, g_expLink),
-                       opts, sel))
-            return;
-
-        switch (sel)
-        {
-        case 0: RequestWarp(g_expArea + 1, g_expLink); break;
-        case 1: RequestWarp(g_expArea > 1 ? g_expArea - 1 : 1, g_expLink); break;
-        case 2: RequestWarp(g_expArea + 10, g_expLink); break;
-        case 3: RequestWarp(g_expArea > 10 ? g_expArea - 10 : 1, g_expLink); break;
-        case 4:
-        {
-            u32 area = g_expArea, link = g_expLink;
-            if (!AskValue("エリアID (1〜999)", false, 999, g_expArea, area))
-                return;
-            if (!AskValue("入口番号 (0 = 標準の入口)", false, 999, g_expLink, link))
-                return;
-            RequestWarp(area, link);
-            break;
-        }
-        case 5: RequestWarp(g_expArea, g_expLink); break;
-        case 6: RecordHere(); break;
-        case 7: ShowNotes(); break;
-        default: break;
-        }
-    }
-
-    // 有効な間、毎フレーム呼ばれる。扉を通ってオブジェクトの中身が変わるたびに記録する。
-    // (同じ扉を続けて通ると、中身が変わらないので記録されない)
-    static void DoorLogEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        static u32 lastWord = 0xFFFFFFFF;
-
-        u32 w = 0;
-        if (!Process::Read32(0x16D5D4A8, w))   // ChangeMapオブジェクトの +12 (エリアID16bit) と +14 (入口番号16bit)
-            return;
-        if (w == lastWord)
-            return;
-        lastWord = w;
-
-        const u32 area = w & 0xFFFF;
-        const u32 link = w >> 16;
-        if (area == 0)
-            return;
-
-        // here = いま居るエリア (扉を通る前)。この扉の前に出るワープの組は (dest, link)。
-        //   → ワープすると「here のエリアの、この扉の前」に出る。
-        const u32 here = CurrentAreaId();
-        AppendNote(Utils::Format("DOOR here=%u dest=%u link=%u  (warp %u/%u lands in area %u)", here, area, link, area, link, here));
-        OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, area, link));
-    }
-
-    // ------------------------------------------------------------
-    //  プレイヤー切り替え (実機GDBで確認済みのアドレス / 日本語版 v1.7L)
-    //    0x7208DC : シーンフロー管理 (+36 byte=切替要求, +44 int=要求状態, +48 int=現在状態)
-    //               状態番号: 1=IDLE, 8=Title, 9=Field
-    //    0x687D14 : 状態1(IDLE)が起動するメッセージ番号 (halfword, 通常0)
-    //    0x6B95EC : ルートタスク (子リスト head=+340, next=+344)
-    //    0x46FEEC : メッセージ送信 Send(受け取り先, メッセージ)
-    //    0x6D9D1C : スロット選択タスク(ExSaveSelect)を作るメッセージ
-    //    ExSaveSelect (vtable 0x66D898):
-    //        +0x91B9 byte=現在状態 / +0x91B8 byte=次の状態 / +0x91BC int=選択スロット
-    //        状態0x0A=UIを開く, 0x0B=決定待ち, 0x0C以降=読み込み(状態0x1Aで本体)
-    //    0x68BAD1 : byte (既存データ決定では 0)
-    //    0x71BA40 : スロット管理 (+0 byte=現在スロット, +4..+24=スロットごとのフラグ) / 起動時に0で初期化される
-    //    0x719374 : セーブ関連の管理オブジェクト。init=0x28299C / 毎フレーム更新=0x28238C / 終了=0x257D88
-    //               通常はタイトルのタスクがこれを行う。直接版では ExSaveSelect の更新を差し替えて代行する
-    //    FLOW+12  : シーンフローのリスナー枠 (状態変更直後にゲームのスレッドから呼ばれる)
-    //  ルートA: タイトル経由  (「ゲームを始める」を押す操作とスロット決定を自動化)
-    //  ルートB: 直接          (フィールドを片付け -> スロット選択タスクだけ作る -> 読み込み -> フィールド再開)
-    // ------------------------------------------------------------
-    namespace PlayerSwitch
-    {
-        static constexpr u32 FLOW_OBJ     = 0x7208DC;
-        static constexpr u32 ROOT_TASK    = 0x6B95EC;
-        static constexpr u32 VPTR_EXSEL   = 0x66D898;
-        static constexpr u32 VPTR_TITLE   = 0x669154;
-        static constexpr u32 VPTR_FIELD   = 0x669038;
-        static constexpr u32 STATE_IDLE   = 1;
-        static constexpr u32 STATE_TITLE  = 8;
-        static constexpr u32 STATE_FIELD  = 9;
-        static constexpr u32 IDLE_MSG_ADDR = 0x687D14;
-        static constexpr u32 FN_SEND      = 0x46FEEC;
-        static constexpr u32 DESC_EXSEL   = 0x6D9D1C;
-        static constexpr u32 MGR_OBJ      = 0x719374;   // セーブ関連の管理オブジェクト (タイトルが初期化/毎フレーム更新/終了処理を行う)
-        static constexpr u32 FN_MGR_INIT  = 0x28299C;
-        static constexpr u32 FN_MGR_UPDATE = 0x28238C;
-        static constexpr u32 FN_MGR_TERM  = 0x257D88;
-        static constexpr u32 FN_EXSEL_UPDATE = 0x411E98;   // ExSaveSelect の更新 (vtable[5])
-        static constexpr u32 VTBL_EXSEL_UPDATE = 0x66D8AC; // = VPTR_EXSEL + 5*4
-        static constexpr u32 SLOT_VAR     = 0x71BA40;   // +0 byte=現在スロット, +4..+24 word=スロットごとの読み込み済みフラグ
-        static constexpr u32 MAX_FRAMES   = 60 * 90;
-        static constexpr u32 UI_WAIT      = 5;
-
-        typedef s32 (*SendFn)(u32 receiver, u32 message);
-        typedef void (*FnU32)(u32);
-
-        enum Phase { IDLE,
-                     T_SELECT, T_RESULT, T_FIELD,                  // ルートA
-                     D_BLANK, D_SEL, D_DONE, D_RESTART };           // ルートB
-
-        static int   g_slot  = -1;
-        static Phase g_phase = IDLE;
-        static u32   g_timer = 0;
-        static u32   g_wait  = 0;
-        static u32   g_settle = 0;
-        static volatile bool g_sent = false;
-        static bool g_mgrInit = false;
-        static bool g_vtblPatched = false;
-        static volatile s32  g_sendResult = 0;
-        static int   g_lastSt = -1;
-        static int   g_lastTitleSt = -1;
-        static u32   g_skipWait = 0;
-
-        static u32 FindByVptr(u32 node, u32 vptr, int depth)
-        {
-            u32 v = 0;
-            if (depth > 4 || !Process::CheckAddress(node))
-                return 0;
-            if (Process::Read32(node, v) && v == vptr)
-                return node;
-
-            u32 child = 0;
-            if (!Process::Read32(node + 340, child))
-                return 0;
-            for (int i = 0; i < 64 && child && Process::CheckAddress(child); i++)
-            {
-                u32 found = FindByVptr(child, vptr, depth + 1);
-                if (found)
-                    return found;
-                if (!Process::Read32(child + 344, child))
-                    break;
-            }
-            return 0;
-        }
-
-        static u32 FindExSel(u32 node, int depth) { return FindByVptr(node, VPTR_EXSEL, depth); }
-
-        static void RequestState(u32 st)
-        {
-            Process::Write32(FLOW_OBJ + 44, st);
-            Process::Write8(FLOW_OBJ + 36, 1);
-        }
-
-        static void RestoreIdleMsg(void) { Process::Write16(IDLE_MSG_ADDR, 0); }
-
-        // ExSaveSelect の更新の差し替え: 管理オブジェクトを更新してから、本来の更新を呼ぶ
-        // (通常はタイトルのタスクが毎フレーム管理オブジェクトを更新している)
-        static void ExSelUpdateWrapper(u32 self)
-        {
-            ((FnU32)FN_MGR_UPDATE)(MGR_OBJ);
-            ((FnU32)FN_EXSEL_UPDATE)(self);
-        }
-
-        // 後片付け: 差し替えの復元と、管理オブジェクトの終了処理
-        static void CleanupDirect(void)
-        {
-            if (g_vtblPatched)
-            {
-                Process::Write32(VTBL_EXSEL_UPDATE, FN_EXSEL_UPDATE);
-                g_vtblPatched = false;
-            }
-            if (g_mgrInit)
-            {
-                ((FnU32)FN_MGR_TERM)(MGR_OBJ);
-                g_mgrInit = false;
-            }
-        }
-
-        // ゲーム起動時の SlotReset (0x21B1B0) と同じ初期化
-        static void ResetSlotState(void)
-        {
-            Process::Write8(SLOT_VAR, 0);
-            for (u32 o = 4; o <= 24; o += 4)
-                Process::Write32(SLOT_VAR + o, 0);
-        }
-
-        // シーンフローのリスナー (FLOW+12)。状態変更の直後に、ゲーム本来のスレッドから呼ばれる
-        static void FlowListener(s32 state, u32 arg)
-        {
-            (void)arg;
-            if (state != (s32)STATE_IDLE)
-                return;
-            Process::Write32(FLOW_OBJ + 12, 0);   // 1回だけ実行
-            ResetSlotState();
-            ((FnU32)FN_MGR_INIT)(MGR_OBJ);        // タイトルの初期化と同じ
-            g_mgrInit = true;
-            g_vtblPatched = Process::Write32(VTBL_EXSEL_UPDATE, (u32)&ExSelUpdateWrapper);
-            g_sendResult = ((SendFn)FN_SEND)(ROOT_TASK, DESC_EXSEL);
-            g_sent = true;
-        }
-
-        static void Abort(const char *msg)
-        {
-            OSD::Notify(msg);
-            Process::Write32(FLOW_OBJ + 12, 0);
-            CleanupDirect();
-            RestoreIdleMsg();
-            g_phase = IDLE;
-        }
-
-        // ---------------- ルートA: タイトル経由 ----------------
-        static void FrameTitleRoute(u32 cur)
-        {
-            if (g_phase == T_FIELD)
-            {
-                if (cur == STATE_FIELD)
-                {
-                    g_phase = IDLE;
-                    OSD::Notify("PS: done");
-                }
-                return;
-            }
-
-            u32 tobj = FindByVptr(ROOT_TASK, VPTR_TITLE, 0);
-            if (tobj)
-            {
-                u8 ts = 0;
-                Process::Read8(tobj + 364, ts);
-                if ((int)ts != g_lastTitleSt)
-                {
-                    g_lastTitleSt = ts;
-                    OSD::Notify(Utils::Format("PT: title state %02X", ts));
-                }
-                // 「ゲームを始める」待ち(状態04)を飛ばす
-                if (g_phase == T_SELECT && ts == 0x04)
-                {
-                    if (g_skipWait == 0)
-                    {
-                        Process::Write8(tobj + 365, 0x12);
-                        Process::Write8(tobj + 364, 0x10);
-                        OSD::Notify("PS: skip title press");
-                    }
-                    else if (g_skipWait == 30)
-                    {
-                        Process::Write8(tobj + 384, 0);
-                        Process::Write8(tobj + 377, 0);
-                        OSD::Notify("PS: title poke B");
-                    }
-                    g_skipWait++;
-                }
-            }
-
-            u32 obj = FindExSel(ROOT_TASK, 0);
-            if (!obj)
-            {
-                if (g_timer == 300)
-                    OSD::Notify("PS: select task not found");
-                return;
-            }
-
-            u8 st = 0;
-            Process::Read8(obj + 0x91B9, st);
-            if ((int)st != g_lastSt)
-            {
-                g_lastSt = st;
-                OSD::Notify(Utils::Format("PS: select state %02X", st));
-            }
-
-            if (g_phase == T_SELECT)
-            {
-                if (st != 0x0B)
-                    return;
-                Process::Write8(obj + 0x190, 2);
-                Process::Write32(obj + 388, (u32)g_slot);
-                Process::Write8(obj + 381, 0x0C);
-                g_wait  = 0;
-                g_phase = T_RESULT;
-                OSD::Notify("PS: try UI poke");
-            }
-            else if (g_phase == T_RESULT)
-            {
-                if (st != 0x0B)
-                {
-                    g_phase = T_FIELD;
-                    OSD::Notify("PS: accepted");
-                    return;
-                }
-                if (++g_wait < UI_WAIT)
-                    return;
-                Process::Write32(obj + 0x91BC, (u32)g_slot);
-                Process::Write8(0x68BAD1, 0);
-                Process::Write8(obj + 0x91B8, 0x0C);
-                g_phase = T_FIELD;
-                OSD::Notify("PS: direct decide");
-            }
-        }
-
-        // ---------------- ルートB: 直接 ----------------
-        static void FrameDirectRoute(u32 cur)
-        {
-            switch (g_phase)
-            {
-            case D_BLANK:
-            {
-                // ゲームのスレッドで、フィールド片付け後の初期化とタスク作成が行われるのを待つ
-                if (!g_sent)
-                {
-                    if (++g_wait > 600)
-                        Abort("PS: flow listener not called");
-                    return;
-                }
-                OSD::Notify(Utils::Format("PS: send result=%d vtbl=%d", (int)g_sendResult, (int)g_vtblPatched));
-                g_wait = 0;
-                g_lastSt = -1;
-                g_phase = D_SEL;
-                break;
-            }
-            case D_SEL:
-            {
-                u32 obj = FindExSel(ROOT_TASK, 0);
-                if (!obj)
-                {
-                    if (++g_wait > 300)
-                        Abort("PS: select task not created");
-                    return;
-                }
-                u8 st = 0, nx = 0;
-                Process::Read8(obj + 0x91B9, st);
-                Process::Read8(obj + 0x91B8, nx);
-                if ((int)st != g_lastSt)
-                {
-                    g_lastSt = st;
-                    OSD::Notify(Utils::Format("PS: select state %02X", st));
-                }
-
-                // UIを開く(0A)/決定待ち(0B)に来たら、決定済みにして読み込み(0C以降)へ進める
-                if (st == 0x0A || st == 0x0B || nx == 0x0A || nx == 0x0B)
-                {
-                    Process::Write32(obj + 0x91BC, (u32)g_slot);
-                    Process::Write8(0x68BAD1, 0);
-                    Process::Write8(obj + 0x91B8, 0x0C);
-                    OSD::Notify("PS: decide -> load");
-                    g_wait = 0;
-                    g_phase = D_DONE;
-                }
-                else
-                {
-                    if (st == 0x01 && g_wait == 600)
-                    {
-                        u8 rw1 = 0, rw2 = 0; u32 fl = 0;
-                        Process::Read8(obj + 0x23C0 + 0x5C, rw1);
-                        Process::Read8(obj + 0x4AB8 + 0x5C, rw2);
-                        Process::Read32(obj + 372, fl);
-                        OSD::Notify(Utils::Format("PS: stuck st1 rw1=%d rw2=%d fl=%X", rw1, rw2, fl));
-                    }
-                    if (++g_wait > MAX_FRAMES)
-                        Abort("PS: select timeout");
-                }
-                break;
-            }
-            case D_DONE:
-            {
-                // スロット選択タスクが自分で終了するのを待つ
-                if (FindExSel(ROOT_TASK, 0))
-                {
-                    if (++g_wait > MAX_FRAMES)
-                        Abort("PS: load timeout");
-                    return;
-                }
-                OSD::Notify("PS: load finished");
-                CleanupDirect();
-                g_wait = 0;
-                g_phase = D_RESTART;
-                break;
-            }
-            case D_RESTART:
-            {
-                if (FindByVptr(ROOT_TASK, VPTR_FIELD, 0))
-                {
-                    RestoreIdleMsg();
-                    g_phase = IDLE;
-                    OSD::Notify("PS: done");
-                    return;
-                }
-                // ゲーム側が自分でフィールドを作らない場合は、2秒待って要求する
-                if (++g_wait == 120)
-                {
-                    RestoreIdleMsg();
-                    RequestState(STATE_FIELD);
-                    OSD::Notify("PS: request field");
-                }
-                else if (g_wait > 1800)
-                    Abort("PS: field timeout");
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
-        // menu->Callback で毎フレーム呼ばれる
-        static void OnFrame(void)
-        {
-            if (g_phase == IDLE)
-                return;
-
-            u32 cur = 0;
-            Process::Read32(FLOW_OBJ + 48, cur);
-
-            if (g_phase >= D_BLANK)
-            {
-                FrameDirectRoute(cur);
-                return;
-            }
-
-            if (++g_timer > MAX_FRAMES)
-            {
-                g_phase = IDLE;
-                OSD::Notify("PS: timeout");
-                return;
-            }
-            FrameTitleRoute(cur);
-        }
-
-        static bool CheckStart(int &slotOut)
-        {
-            u32 cur = 0;
-            Process::Read32(FLOW_OBJ + 48, cur);
-            if (cur != STATE_FIELD)
-            {
-                OSD::Notify("Fieldでのみ使えます");
-                return false;
-            }
-            if (g_phase != IDLE)
-            {
-                OSD::Notify("処理中です");
-                return false;
-            }
-            Keyboard kb("プレイヤーを選択", { "プレイヤー 1", "プレイヤー 2", "プレイヤー 3" });
-            int r = kb.Open();
-            if (r < 0)
-                return false;
-            slotOut = r;
-            return true;
-        }
-
-        // ルートA
-        static void EntryTitle(MenuEntry *entry)
-        {
-            (void)entry;
-            int r = -1;
-            if (!CheckStart(r))
-                return;
-            g_slot = r; g_timer = 0; g_wait = 0; g_lastSt = -1; g_lastTitleSt = -1; g_skipWait = 0;
-            g_phase = T_SELECT;
-            RequestState(STATE_TITLE);
-            OSD::Notify("Switching (title)...");
-        }
-
-        // ルートB
-        static void EntryDirect(MenuEntry *entry)
-        {
-            (void)entry;
-            int r = -1;
-            if (!CheckStart(r))
-                return;
-            // 状態IDLEが新しいシーンを作らないよう、メッセージ番号を範囲外にしておく
-            if (!Process::Write16(IDLE_MSG_ADDR, 0x7FFF))
-            {
-                OSD::Notify("PS: cannot patch table");
-                return;
-            }
-            g_slot = r; g_timer = 0; g_wait = 0; g_settle = 0; g_lastSt = -1;
-            g_sent = false;
-            Process::Write32(FLOW_OBJ + 24, 0);
-            Process::Write32(FLOW_OBJ + 12, (u32)&FlowListener);
-            g_phase = D_BLANK;
-            RequestState(STATE_IDLE);
-            OSD::Notify("Switching (direct)...");
+            if (pick == g_wOrig[id])
+                g_wHas[id] = false;
+            MessageBox("変更しました",
+                       IdName(id) + " の固有効果を\n" + EffName(pick) +
+                       "\nにしました。\n武器をつけ直すと反映されます。")();
         }
     }
 
@@ -2204,9 +1048,6 @@ namespace CTRPluginFramework
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
 
-        AddQualityFix(menu);
-        AddRecommended(menu);
-
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
                                    "「Press Y to edit」と表示されてから約10秒の間だけYで編集できます。\n"
@@ -2216,36 +1057,12 @@ namespace CTRPluginFramework
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の該当アイテムをまとめて変更します。\n"
                                    "変えたい項目を選んでから「決定して適用」で書き込みます。アイテムIDは、範囲を指定して被りなしの連番にするか、1件ずつ選べます。"));
 
-        menu->Append(new MenuEntry("アイテムを生成 (かばんに追加)", nullptr, CreateItemEntry,
-                                   "IDを選ぶと、かばんの空き枠に新しいアイテムを作ります。\n"
-                                   "作成後、クオリティ・追加効果なども続けて編集できます。\n"
-                                   "必ずセーブのバックアップを取ってから使ってください。"));
-        menu->Append(new MenuEntry("アイテム一括削除", nullptr, BulkDeleteEntry,
-                                   "かばんのアイテムを、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。\n"
-                                   "装備中のものは先に外してください。必ずセーブのバックアップを取ってから使ってください。"));
-        menu->Append(new MenuEntry("アイテム一括生成", nullptr, BulkCreateEntry,
-                                   "カテゴリの全アイテム / ID範囲 / 同じアイテムN個 を、かばんの空き枠にまとめて作ります。\n"
-                                   "必ずセーブのバックアップを取ってから使ってください。"));
-        menu->Append(new MenuEntry("エリアワープ (実験)", nullptr, WarpEntry,
-                                   "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
-                                   "出る場所は、選んだ行き先へ向かう扉の前です(扉がある側のエリア)。\n使う前に必ずバックアップを取ってください。★のついた2つだけ動作確認済みです。"));
-        menu->Append(new MenuEntry("探索ワープ (開発用)", nullptr, ExploreEntry,
-                                   "エリアIDを +1/-1/数字入力で移動し、着いた場所に名前をつけて記録します。\n"
-                                   "記録は SD直下の fll_warp_notes.txt にも追記されます。\n"
-                                   "存在しないIDだと落ちる可能性があります。必ずバックアップを取ってください。"));
-        menu->Append(new MenuEntry("扉の自動記録 (開発用)", DoorLogEntry, nullptr,
-                                   "有効にして扉を通ると、行き先のエリアIDと入口番号を記録します。\n"
-                                   "記録は SD直下の fll_warp_notes.txt に追記されます。"));
-        
-        menu->Append(new MenuEntry("プレイヤー切り替え 直接版 (実験)", nullptr, PlayerSwitch::EntryDirect,
-                                   "タイトルを経由せず、フィールドを片付けてから読み込みだけを行って戻ります。\n"
-                                   "使う前に必ずセーブのバックアップを取ってください。切り替え後、確認できるまでセーブしないでください。\n"
-                                   "固まった場合は、セーブせずにゲームを再起動してください。"));
-        menu->Append(new MenuEntry("プレイヤー切り替え タイトル経由 (実験)", nullptr, PlayerSwitch::EntryTitle,
-                                   "タイトル画面を一瞬経由して、自動でスロットを選びます。"));
-        menu->Callback(PlayerSwitch::OnFrame);
+        menu->Append(new MenuEntry("武器の固有効果を変更", nullptr, WeaponInnateEditEntry,
+                                   "武器ごとの固有効果を、メモリ上の武器データ表を書き換えて変更します。\n"
+                                   "同じIDの武器すべてに効きます。自分のゲームの中だけで有効で、ゲームを終了すると元に戻ります。\n"
+                                   "変更したあと、武器をつけ直すと反映されます。\n"
+                                   "最初の1回は、表の場所をメモリから探すため時間がかかります。"));
 
-        AddLifeChange(menu);
         menu->Run();
         delete menu;
         return 0;
