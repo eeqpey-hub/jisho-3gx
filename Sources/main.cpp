@@ -70,7 +70,7 @@ extern "C"
     volatile u32 g_warpTask    = 0;   // 毎フレーム更新される。エリアID = g_warpTask + 0x6B2
 
     // ゲーム本体のスレッドから、毎フレーム呼ばれる (task = フィールドタスク)。
-    // 予約があれば 0x21EDCC(接続番号) を呼び、エリアIDを返す(0 = 何もしない)。
+    // 予約があれば 0x21EDCC(接続番号) を呼び、「エリアID+1」を返す(0 = 何もしない)。
     // 接続番号が0のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
     u32 WarpPrepare(u32 task)
     {
@@ -83,7 +83,7 @@ extern "C"
             typedef void (*SetArrivalLinkFn)(u32);
             ((SetArrivalLinkFn)0x21EDCC)(g_warpLink);
         }
-        return g_warpArea;
+        return g_warpArea + 1;   // エリアID+1 を返す (0 = ワープなし。エリアID 0 も指定できる)
     }
 }
 
@@ -137,12 +137,13 @@ jp_hookB2:
 jp_hookWarp:
     push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
     vpush {d0-d7}                @ 元の関数は s0 (float引数) を使うので退避
-    bl    WarpPrepare            @ r0 = エリアID (0 = ワープなし)
+    bl    WarpPrepare            @ r0 = エリアID+1 (0 = ワープなし)
     vpop  {d0-d7}                @ s0〜s15 を元に戻す
     str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
     pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
     cmp   r12, #0
     beq   1f
+    sub   r12, r12, #1           @ エリアID+1 → エリアID (0 も有効)
     mov   r1, r12                @ GDBで成功したのと同じ設定
     mov   r2, #0
     mov   r3, r12
@@ -182,6 +183,7 @@ namespace CTRPluginFramework
         const char *atkName;
         const char *matkName;
         bool stackable;      // true: 同じ種類を1枠にまとめる (素材・消耗品)
+        int  offName;        // 製作者名 (UTF-16LE 最大6文字=12バイト) の位置 / -1 = なし
     };
 
     // 素材・消耗品のクオリティの位置。【未検証の仮置き】武器と同じ +0x10 と推測している。
@@ -190,11 +192,11 @@ namespace CTRPluginFramework
 
     static const Category g_cats[] =
     {
-        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力", false },
-        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力", false },
-        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr, false },
-        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr, false },
-        { "素材・消耗品", 0x05C5, 0x09FE, MAT_QUALITY_OFF, -1, -1, -1, nullptr, nullptr, true },
+        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力", false, 0x20 },
+        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力", false, 0x24 },
+        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr, false, 0x10 },
+        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr, false, 0x10 },
+        { "素材・消耗品", 0x05C5, 0x09FE, MAT_QUALITY_OFF, -1, -1, -1, nullptr, nullptr, true, -1 },
     };
 
     static constexpr int K_NORMAL = 0;
@@ -922,6 +924,7 @@ namespace CTRPluginFramework
     {
         std::vector<u16>  order;   // 先頭から末尾までの行番号
         std::vector<bool> used;
+        u16               authorMark = 0x16D7;   // 製作者名つきの行の +0xE の値 (かばん内の実物から取る)
     };
 
     // 管理領域と連結リストを読む。想定と違えば false (何も書かない)
@@ -958,6 +961,18 @@ namespace CTRPluginFramework
                 return false;
             }
             idx = next;
+        }
+        // 製作者名つきの行は +0xE が 0x16D7 (名前なしの行は 0x0001)。かばんに実物があればその値を使う
+        b.authorMark = 0x16D7;
+        for (u16 s : b.order)
+        {
+            u16 c = 0, e = 0;
+            if (Process::Read16(SlotAddr(s) + 0x0C, c) && Process::Read16(SlotAddr(s) + 0x0E, e) &&
+                c == 0xFFFE && e != 0 && e != 1)
+            {
+                b.authorMark = e;
+                break;
+            }
         }
         if (cnt != (u16)b.order.size())
         {
@@ -999,7 +1014,197 @@ namespace CTRPluginFramework
         std::vector<Field> fields;
         std::vector<bool>  use;
         std::vector<u32>   val;
+        // 製作者名 (武器・防具・ライフ道具・家具だけ)
+        bool               hasName = false;
+        bool               useName = false;
+        u32                nameOff = 0;
+        std::vector<u16>   name;       // 最大6文字 (UTF-16)
     };
+
+    // ---- 製作者名の入力 ----
+    static constexpr size_t NAME_CHARS = 6;
+
+    static std::vector<u16> Utf8ToUtf16(const std::string &s)
+    {
+        std::vector<u16> o;
+        size_t i = 0;
+        while (i < s.size())
+        {
+            const u8 c = (u8)s[i];
+            u32 cp = 0;
+            size_t n = 0;
+            if (c < 0x80)              { cp = c;        n = 1; }
+            else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; n = 2; }
+            else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; n = 3; }
+            else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; n = 4; }
+            else { ++i; continue; }
+            if (i + n > s.size())
+                break;
+            for (size_t k = 1; k < n; ++k)
+                cp = (cp << 6) | ((u8)s[i + k] & 0x3F);
+            i += n;
+            if (cp != 0 && cp <= 0xFFFF)
+                o.push_back((u16)cp);
+        }
+        return o;
+    }
+
+    static std::string Utf16ToUtf8(const std::vector<u16> &v)
+    {
+        std::string o;
+        for (u16 c : v)
+        {
+            if (c == 0)
+                break;
+            if (c < 0x80)
+                o += (char)c;
+            else if (c < 0x800)
+            {
+                o += (char)(0xC0 | (c >> 6));
+                o += (char)(0x80 | (c & 0x3F));
+            }
+            else
+            {
+                o += (char)(0xE0 | (c >> 12));
+                o += (char)(0x80 | ((c >> 6) & 0x3F));
+                o += (char)(0x80 | (c & 0x3F));
+            }
+        }
+        return o;
+    }
+
+    static const char *const KANA_ROWS[] =
+    {
+        "あいうえお", "かきくけこ", "さしすせそ", "たちつてと", "なにぬねの",
+        "はひふへほ", "まみむめも", "やゆよ", "らりるれろ", "わをん",
+        "がぎぐげご", "ざじずぜぞ", "だぢづでど", "ばびぶべぼ", "ぱぴぷぺぽ", "ぁぃぅぇぉっゃゅょ",
+        "アイウエオ", "カキクケコ", "サシスセソ", "タチツテト", "ナニヌネノ",
+        "ハヒフヘホ", "マミムメモ", "ヤユヨ", "ラリルレロ", "ワヲン",
+        "ガギグゲゴ", "ザジズゼゾ", "ダヂヅデド", "バビブベボ", "パピプペポ", "ヴァィゥェォッャュョ",
+        "０１２３４５６７８９", "ＡＢＣＤＥＦＧＨＩＪ", "ＫＬＭＮＯＰＱＲＳＴ", "ＵＶＷＸＹＺ", "ー・！？"
+    };
+
+    // かばんの中にある、製作者名つきのアイテムから名前をコピーする
+    static bool CopyNameFromBag(std::vector<u16> &out)
+    {
+        BagState b;
+        std::string err;
+        if (!LoadBag(b, err))
+        {
+            MessageBox("コピーできません", err)();
+            return false;
+        }
+        std::vector<std::string> labels;
+        std::vector<std::vector<u16> > names;
+        for (u16 s : b.order)
+        {
+            u32 id = 0;
+            Process::Read32(SlotAddr(s) + OFF_ID, id);
+            const Category *c = FindCategory((u16)id);
+            if (!c || c->offName < 0)
+                continue;
+            std::vector<u16> nm;
+            for (size_t i = 0; i < NAME_CHARS; ++i)
+            {
+                u16 ch = 0;
+                Process::Read16(SlotAddr(s) + (u32)c->offName + (u32)i * 2, ch);
+                if (ch == 0)
+                    break;
+                nm.push_back(ch);
+            }
+            if (nm.empty())
+                continue;
+            labels.push_back(Utils::Format("%u枠目 %s: ", s + 1, IdName(id).c_str()) + Utf16ToUtf8(nm));
+            names.push_back(nm);
+            if (labels.size() >= 60)
+                break;
+        }
+        if (labels.empty())
+        {
+            MessageBox("コピーできません", "かばんに、製作者名つきのアイテムがありません。")();
+            return false;
+        }
+        Keyboard kb("名前をコピーするアイテム", labels);
+        const int sel = kb.Open();
+        if (sel < 0)
+            return false;
+        out = names[sel];
+        return true;
+    }
+
+    // 製作者名を決める。決定したら true (name に入る)、キャンセルなら false
+    static bool AskMakerName(std::vector<u16> &name)
+    {
+        std::vector<u16> cur = name;
+        for (;;)
+        {
+            std::vector<std::string> rows;
+            rows.push_back("[かな・記号を1文字追加]");
+            rows.push_back("[キーボードで英数字を入力]");
+            rows.push_back("[かばんのアイテムから名前をコピー]");
+            rows.push_back("[1文字消す]");
+            rows.push_back("[全部消す]");
+            rows.push_back("[決定]");
+            Keyboard kb(Utils::Format("製作者名: 「%s」 (%u/%u文字)", Utf16ToUtf8(cur).c_str(),
+                                      (u32)cur.size(), (u32)NAME_CHARS), rows);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return false;
+            if (sel == 5)
+            {
+                name = cur;
+                return true;
+            }
+            if (sel == 0)
+            {
+                if (cur.size() >= NAME_CHARS)
+                {
+                    MessageBox("文字数", "6文字までです。")();
+                    continue;
+                }
+                std::vector<std::string> groups;
+                for (const char *g : KANA_ROWS)
+                    groups.push_back(g);
+                Keyboard kg("文字の行を選ぶ", groups);
+                const int gi = kg.Open();
+                if (gi < 0)
+                    continue;
+                const std::vector<u16> chars = Utf8ToUtf16(KANA_ROWS[gi]);
+                std::vector<std::string> cs;
+                for (u16 c : chars)
+                    cs.push_back(Utf16ToUtf8(std::vector<u16>(1, c)));
+                Keyboard kk("文字を選ぶ", cs);
+                const int ki = kk.Open();
+                if (ki >= 0)
+                    cur.push_back(chars[ki]);
+            }
+            else if (sel == 1)
+            {
+                std::string in;
+                Keyboard ka("英数字を入力 (最大6文字)");
+                if (ka.Open(in) == 0)
+                {
+                    std::vector<u16> v = Utf8ToUtf16(in);
+                    if (v.size() > NAME_CHARS)
+                        v.resize(NAME_CHARS);
+                    cur = v;
+                }
+            }
+            else if (sel == 2)
+            {
+                std::vector<u16> v;
+                if (CopyNameFromBag(v))
+                    cur = v;
+            }
+            else if (sel == 3)
+            {
+                if (!cur.empty())
+                    cur.pop_back();
+            }
+            else if (sel == 4)
+                cur.clear();
+        }
+    }
 
     static u32 SpecValue(const GenSpec *sp, u32 off, u32 def)
     {
@@ -1019,16 +1224,25 @@ namespace CTRPluginFramework
         const size_t F = sp.fields.size();
         sp.use.assign(F, false);
         sp.val.assign(F, 0);
+        sp.hasName = (cat && cat->offName >= 0);
+        sp.useName = false;
+        sp.nameOff = sp.hasName ? (u32)cat->offName : 0;
+        sp.name.clear();
         count = 1;
-        if (F == 0)
+        if (F == 0 && !sp.hasName)
             return true;
 
+        const size_t N    = sp.hasName ? 1 : 0;
+        const size_t iGen = F + N;
         for (;;)
         {
             std::vector<std::string> rows;
             for (size_t i = 0; i < F; ++i)
                 rows.push_back(sp.fields[i].label + ": " +
                                (sp.use[i] ? FmtValue(sp.fields[i], sp.val[i]) : std::string("指定しない")));
+            if (sp.hasName)
+                rows.push_back(std::string("製作者名: ") +
+                               (sp.useName ? "「" + Utf16ToUtf8(sp.name) + "」" : std::string("指定しない")));
             rows.push_back("[この内容で生成]");
             rows.push_back("[すべて指定しないに戻す]");
 
@@ -1036,11 +1250,23 @@ namespace CTRPluginFramework
             const int sel = kb.Open();
             if (sel < 0)
                 return false;
-            if ((size_t)sel == F)
+            if ((size_t)sel == iGen)
                 break;
-            if ((size_t)sel == F + 1)
+            if ((size_t)sel == iGen + 1)
             {
                 for (size_t i = 0; i < F; ++i) { sp.use[i] = false; sp.val[i] = 0; }
+                sp.useName = false;
+                sp.name.clear();
+                continue;
+            }
+            if (sp.hasName && (size_t)sel == F)
+            {
+                std::vector<u16> nm = sp.name;
+                if (AskMakerName(nm))
+                {
+                    sp.name    = nm;
+                    sp.useName = !nm.empty();
+                }
                 continue;
             }
             u32 cur = sp.use[sel] ? sp.val[sel] : 0, v = 0;
@@ -1062,6 +1288,8 @@ namespace CTRPluginFramework
         for (size_t i = 0; i < sp.fields.size(); ++i)
             if (sp.use[i])
                 s += "・" + sp.fields[i].label + ": " + FmtValue(sp.fields[i], sp.val[i]) + "\n";
+        if (sp.useName)
+            s += "・製作者名: " + Utf16ToUtf8(sp.name) + "\n";
         return s;
     }
 
@@ -1136,6 +1364,17 @@ namespace CTRPluginFramework
             for (size_t i = 0; i < sp->fields.size(); ++i)
                 if (sp->use[i] && sp->fields[i].off != OFF_COUNT)
                     WriteField(base, sp->fields[i], sp->val[i]);
+
+        // 製作者名: UTF-16LE で最大6文字(12バイト)。余りは0。名前つきの行は +0xE に印が付き、
+        // 末尾の 1,2,3,4 の目印は無い (実物の行に合わせる)
+        if (sp && sp->useName)
+        {
+            for (u32 o = 0x28; o < ROW_DATA; o += 4)
+                Process::Write32(base + o, 0);
+            for (u32 i = 0; i < NAME_CHARS; ++i)
+                Process::Write16(base + sp->nameOff + i * 2, i < sp->name.size() ? sp->name[i] : (u16)0);
+            Process::Write16(base + 0x0E, b.authorMark);
+        }
 
         const u16 tail = b.order.empty() ? NO_LINK : b.order.back();
         Process::Write16(LinkAddr(row),     NO_LINK);
@@ -1528,7 +1767,7 @@ namespace CTRPluginFramework
         { "コンガス食堂",152,5 },
         { "王立クルブルク図書館",2,16 },
         { "ヘイホフの家",33,38 },
-        { "アイザックの家",32,34 },
+        { "アイザックの家",254,34 },
         { "いにしえの塔 試練の間",97,136 },
         { "太古の試練その1",98,139 },
         { "闇の試練その1",98,140 },
@@ -1647,8 +1886,7 @@ namespace CTRPluginFramework
 
     static void RequestWarp(u32 area, u32 link)
     {
-        if (area < 1)   area = 1;
-        if (area > 999) area = 999;
+        if (area > 999) area = 999;   // 0 も指定できる (存在しないIDだと落ちる可能性あり)
         g_expArea = area;
         g_expLink = link;
         g_warpArea    = area;
@@ -1698,40 +1936,55 @@ namespace CTRPluginFramework
 
         const u32 cur = CurrentAreaId();
 
+        // 項目の「表示」と「動作」は、必ずペアで追加する (opts と acts を同時に push_back する)。
+        // 表示順を変えたいときは、下の並びの行を入れ替えるだけでよい (switch は動作名で分岐する)。
+        enum Act { ACT_INPUT, ACT_NEXT, ACT_PREV, ACT_PLUS10, ACT_MINUS10, ACT_AGAIN, ACT_RECORD, ACT_SHOW };
         std::vector<std::string> opts;
+        std::vector<int> acts;
+
         opts.push_back("エリアIDと入口番号を数字で指定して移動");
+        acts.push_back(ACT_INPUT);
         opts.push_back(Utils::Format("次のIDへ移動 (%u)", g_expArea + 1));
-        opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 1 ? g_expArea - 1 : 1));
+        acts.push_back(ACT_NEXT);
+        opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 0 ? g_expArea - 1 : 0));
+        acts.push_back(ACT_PREV);
         opts.push_back(Utils::Format("+10 へ移動 (%u)", g_expArea + 10));
-        opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea > 10 ? g_expArea - 10 : 1));
+        acts.push_back(ACT_PLUS10);
+        opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea >= 10 ? g_expArea - 10 : 0));
+        acts.push_back(ACT_MINUS10);
         opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
+        acts.push_back(ACT_AGAIN);
         opts.push_back("この場所を記録 (名前を入力)");
+        acts.push_back(ACT_RECORD);
         opts.push_back("記録を表示");
+        acts.push_back(ACT_SHOW);
 
         u32 sel = 0;
         if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の移動=ID %u 入口 %u", cur, g_expArea, g_expLink),
                        opts, sel))
             return;
+        if (sel >= acts.size())
+            return;
 
-        switch (sel)
+        switch (acts[sel])
         {
-        case 0: RequestWarp(g_expArea + 1, g_expLink); break;
-        case 1: RequestWarp(g_expArea > 1 ? g_expArea - 1 : 1, g_expLink); break;
-        case 2: RequestWarp(g_expArea + 10, g_expLink); break;
-        case 3: RequestWarp(g_expArea > 10 ? g_expArea - 10 : 1, g_expLink); break;
-        case 4:
+        case ACT_INPUT:
         {
             u32 area = g_expArea, link = g_expLink;
-            if (!AskValue("エリアID (1〜999)", false, 999, g_expArea, area))
+            if (!AskValue("エリアID (0〜999)", false, 999, g_expArea, area))
                 return;
             if (!AskValue("入口番号 (0 = 標準の入口)", false, 999, g_expLink, link))
                 return;
             RequestWarp(area, link);
             break;
         }
-        case 5: RequestWarp(g_expArea, g_expLink); break;
-        case 6: RecordHere(); break;
-        case 7: ShowNotes(); break;
+        case ACT_NEXT:    RequestWarp(g_expArea + 1, g_expLink); break;
+        case ACT_PREV:    RequestWarp(g_expArea > 0 ? g_expArea - 1 : 0, g_expLink); break;
+        case ACT_PLUS10:  RequestWarp(g_expArea + 10, g_expLink); break;
+        case ACT_MINUS10: RequestWarp(g_expArea >= 10 ? g_expArea - 10 : 0, g_expLink); break;
+        case ACT_AGAIN:   RequestWarp(g_expArea, g_expLink); break;
+        case ACT_RECORD:  RecordHere(); break;
+        case ACT_SHOW:    ShowNotes(); break;
         default: break;
         }
     }
@@ -1763,55 +2016,40 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
-    //  プレイヤー切り替え (実機GDBで確認済みのアドレス / 日本語版 v1.7L)
+    //  プレイヤー切り替え (Field -> Title -> スロット自動決定 -> Field)
+    //  アドレスは実機GDBで確認済み (日本語版 v1.7L)
     //    0x7208DC : シーンフロー管理 (+36 byte=切替要求, +44 int=要求状態, +48 int=現在状態)
-    //               状態番号: 1=IDLE, 8=Title, 9=Field
-    //    0x687D14 : 状態1(IDLE)が起動するメッセージ番号 (halfword, 通常0)
+    //               状態番号: 8=Title, 9=Field
     //    0x6B95EC : ルートタスク (子リスト head=+340, next=+344)
-    //    0x46FEEC : メッセージ送信 Send(受け取り先, メッセージ)
-    //    0x6D9D1C : スロット選択タスク(ExSaveSelect)を作るメッセージ
-    //    ExSaveSelect (vtable 0x66D898):
-    //        +0x91B9 byte=現在状態 / +0x91B8 byte=次の状態 / +0x91BC int=選択スロット
-    //        状態0x0A=UIを開く, 0x0B=決定待ち, 0x0C以降=読み込み(状態0x1Aで本体)
-    //    0x68BAD1 : byte (既存データ決定では 0)
-    //    0x71BA40 : スロット管理 (+0 byte=現在スロット, +4..+24=スロットごとのフラグ) / 起動時に0で初期化される
-    //    FLOW+12  : シーンフローのリスナー枠 (状態変更直後にゲームのスレッドから呼ばれる)
-    //  ルートA: タイトル経由  (「ゲームを始める」を押す操作とスロット決定を自動化)
-    //  ルートB: 直接          (フィールドを片付け -> スロット選択タスクだけ作る -> 読み込み -> フィールド再開)
+    //    0x66D898 : cAppSaveTask_ExSaveSelect の vtable
+    //    ExSaveSelect: +0x91B9 byte=現在状態(0x0B=決定待ち) / +0x91B8 byte=次の状態
+    //                  +0x91BC int=選択スロット / +381 byte=UI状態(0x0C=決定)
+    //                  +388 int=UIの選択スロット / +0x190 sbyte=決定の種類(2=既存データ)
+    //    0x228DD8 : SetSlot(int)   0x68BAD1 : byte (既存データ決定では 0)
+    //  方法1: UI側の値 (+381/+388/+0x190) を書いて、ゲームに決定させる
+    //  方法2: 方法1で決定されなければ、決定後の処理を直接再現する
     // ------------------------------------------------------------
     namespace PlayerSwitch
     {
-        static constexpr u32 FLOW_OBJ     = 0x7208DC;
-        static constexpr u32 ROOT_TASK    = 0x6B95EC;
-        static constexpr u32 VPTR_EXSEL   = 0x66D898;
-        static constexpr u32 VPTR_TITLE   = 0x669154;
-        static constexpr u32 VPTR_FIELD   = 0x669038;
-        static constexpr u32 STATE_IDLE   = 1;
-        static constexpr u32 STATE_TITLE  = 8;
-        static constexpr u32 STATE_FIELD  = 9;
-        static constexpr u32 IDLE_MSG_ADDR = 0x687D14;
-        static constexpr u32 FN_SEND      = 0x46FEEC;
-        static constexpr u32 DESC_EXSEL   = 0x6D9D1C;
-        static constexpr u32 SLOT_VAR     = 0x71BA40;   // +0 byte=現在スロット, +4..+24 word=スロットごとの読み込み済みフラグ
-        static constexpr u32 MAX_FRAMES   = 60 * 90;
-        static constexpr u32 UI_WAIT      = 5;
+        static constexpr u32 FLOW_OBJ    = 0x7208DC;
+        static constexpr u32 ROOT_TASK   = 0x6B95EC;
+        static constexpr u32 VPTR_EXSEL  = 0x66D898;
+        static constexpr u32 VPTR_TITLE  = 0x669154;   // cAppTitleTask の vtable (状態は +364 byte)
+        static constexpr u32 STATE_TITLE = 8;
+        static constexpr u32 STATE_FIELD = 9;
+        static constexpr u32 MAX_FRAMES  = 60 * 90;   // 約90秒でタイムアウト
+        static constexpr u32 UI_WAIT     = 20;        // 方法1を試してから方法2に移るまでのフレーム数
 
-        typedef s32 (*SendFn)(u32 receiver, u32 message);
-
-        enum Phase { IDLE,
-                     T_SELECT, T_RESULT, T_FIELD,                  // ルートA
-                     D_BLANK, D_SEL, D_DONE, D_RESTART };           // ルートB
+        enum Phase { IDLE, WAIT_SELECT, WAIT_RESULT, WAIT_FIELD };
 
         static int   g_slot  = -1;
         static Phase g_phase = IDLE;
         static u32   g_timer = 0;
         static u32   g_wait  = 0;
-        static u32   g_settle = 0;
-        static volatile bool g_sent = false;
-        static volatile s32  g_sendResult = 0;
         static int   g_lastSt = -1;
         static int   g_lastTitleSt = -1;
-        static u32   g_skipWait = 0;
+
+        typedef void (*SetSlotFn)(s32);
 
         static u32 FindByVptr(u32 node, u32 vptr, int depth)
         {
@@ -1837,46 +2075,23 @@ namespace CTRPluginFramework
 
         static u32 FindExSel(u32 node, int depth) { return FindByVptr(node, VPTR_EXSEL, depth); }
 
-        static void RequestState(u32 st)
+        // menu->Callback で毎フレーム呼ばれる
+        static void OnFrame(void)
         {
-            Process::Write32(FLOW_OBJ + 44, st);
-            Process::Write8(FLOW_OBJ + 36, 1);
-        }
-
-        static void RestoreIdleMsg(void) { Process::Write16(IDLE_MSG_ADDR, 0); }
-
-        // ゲーム起動時の SlotReset (0x21B1B0) と同じ初期化
-        static void ResetSlotState(void)
-        {
-            Process::Write8(SLOT_VAR, 0);
-            for (u32 o = 4; o <= 24; o += 4)
-                Process::Write32(SLOT_VAR + o, 0);
-        }
-
-        // シーンフローのリスナー (FLOW+12)。状態変更の直後に、ゲーム本来のスレッドから呼ばれる
-        static void FlowListener(s32 state, u32 arg)
-        {
-            (void)arg;
-            if (state != (s32)STATE_IDLE)
+            if (g_phase == IDLE)
                 return;
-            Process::Write32(FLOW_OBJ + 12, 0);   // 1回だけ実行
-            ResetSlotState();
-            g_sendResult = ((SendFn)FN_SEND)(ROOT_TASK, DESC_EXSEL);
-            g_sent = true;
-        }
 
-        static void Abort(const char *msg)
-        {
-            OSD::Notify(msg);
-            Process::Write32(FLOW_OBJ + 12, 0);
-            RestoreIdleMsg();
-            g_phase = IDLE;
-        }
+            if (++g_timer > MAX_FRAMES)
+            {
+                g_phase = IDLE;
+                OSD::Notify("PS: timeout");
+                return;
+            }
 
-        // ---------------- ルートA: タイトル経由 ----------------
-        static void FrameTitleRoute(u32 cur)
-        {
-            if (g_phase == T_FIELD)
+            u32 cur = 0;
+            Process::Read32(FLOW_OBJ + 48, cur);
+
+            if (g_phase == WAIT_FIELD)
             {
                 if (cur == STATE_FIELD)
                 {
@@ -1886,6 +2101,7 @@ namespace CTRPluginFramework
                 return;
             }
 
+            // タイトルタスクの状態 (調査用): 変わるたびに表示
             u32 tobj = FindByVptr(ROOT_TASK, VPTR_TITLE, 0);
             if (tobj)
             {
@@ -1895,23 +2111,6 @@ namespace CTRPluginFramework
                 {
                     g_lastTitleSt = ts;
                     OSD::Notify(Utils::Format("PT: title state %02X", ts));
-                }
-                // 「ゲームを始める」待ち(状態04)を飛ばす
-                if (g_phase == T_SELECT && ts == 0x04)
-                {
-                    if (g_skipWait == 0)
-                    {
-                        Process::Write8(tobj + 365, 0x12);
-                        Process::Write8(tobj + 364, 0x10);
-                        OSD::Notify("PS: skip title press");
-                    }
-                    else if (g_skipWait == 30)
-                    {
-                        Process::Write8(tobj + 384, 0);
-                        Process::Write8(tobj + 377, 0);
-                        OSD::Notify("PS: title poke B");
-                    }
-                    g_skipWait++;
                 }
             }
 
@@ -1931,216 +2130,71 @@ namespace CTRPluginFramework
                 OSD::Notify(Utils::Format("PS: select state %02X", st));
             }
 
-            if (g_phase == T_SELECT)
+            if (g_phase == WAIT_SELECT)
             {
                 if (st != 0x0B)
-                    return;
+                    return;   // まだ決定待ちではない
+
+                // 方法1: UI側の値を書く (決定の種類 -> 選択スロット -> UI状態)
                 Process::Write8(obj + 0x190, 2);
                 Process::Write32(obj + 388, (u32)g_slot);
                 Process::Write8(obj + 381, 0x0C);
                 g_wait  = 0;
-                g_phase = T_RESULT;
+                g_phase = WAIT_RESULT;
                 OSD::Notify("PS: try UI poke");
             }
-            else if (g_phase == T_RESULT)
+            else if (g_phase == WAIT_RESULT)
             {
                 if (st != 0x0B)
                 {
-                    g_phase = T_FIELD;
+                    g_phase = WAIT_FIELD;   // 決定が通った
                     OSD::Notify("PS: accepted");
                     return;
                 }
                 if (++g_wait < UI_WAIT)
                     return;
+
+                // 方法2: 決定後の処理を直接再現する (状態0x0Bの決定処理と同じ)
                 Process::Write32(obj + 0x91BC, (u32)g_slot);
+                ((SetSlotFn)0x228DD8)((s32)g_slot);
                 Process::Write8(0x68BAD1, 0);
                 Process::Write8(obj + 0x91B8, 0x0C);
-                g_phase = T_FIELD;
+                g_phase = WAIT_FIELD;
                 OSD::Notify("PS: direct decide");
             }
         }
 
-        // ---------------- ルートB: 直接 ----------------
-        static void FrameDirectRoute(u32 cur)
+        static void Entry(MenuEntry *entry)
         {
-            switch (g_phase)
-            {
-            case D_BLANK:
-            {
-                // ゲームのスレッドで、フィールド片付け後の初期化とタスク作成が行われるのを待つ
-                if (!g_sent)
-                {
-                    if (++g_wait > 600)
-                        Abort("PS: flow listener not called");
-                    return;
-                }
-                OSD::Notify(Utils::Format("PS: send result=%d", (int)g_sendResult));
-                g_wait = 0;
-                g_lastSt = -1;
-                g_phase = D_SEL;
-                break;
-            }
-            case D_SEL:
-            {
-                u32 obj = FindExSel(ROOT_TASK, 0);
-                if (!obj)
-                {
-                    if (++g_wait > 300)
-                        Abort("PS: select task not created");
-                    return;
-                }
-                u8 st = 0, nx = 0;
-                Process::Read8(obj + 0x91B9, st);
-                Process::Read8(obj + 0x91B8, nx);
-                if ((int)st != g_lastSt)
-                {
-                    g_lastSt = st;
-                    OSD::Notify(Utils::Format("PS: select state %02X", st));
-                }
-
-                // UIを開く(0A)/決定待ち(0B)に来たら、決定済みにして読み込み(0C以降)へ進める
-                if (st == 0x0A || st == 0x0B || nx == 0x0A || nx == 0x0B)
-                {
-                    Process::Write32(obj + 0x91BC, (u32)g_slot);
-                    Process::Write8(0x68BAD1, 0);
-                    Process::Write8(obj + 0x91B8, 0x0C);
-                    OSD::Notify("PS: decide -> load");
-                    g_wait = 0;
-                    g_phase = D_DONE;
-                }
-                else
-                {
-                    if (st == 0x01 && g_wait == 600)
-                    {
-                        u8 rw1 = 0, rw2 = 0; u32 fl = 0;
-                        Process::Read8(obj + 0x23C0 + 0x5C, rw1);
-                        Process::Read8(obj + 0x4AB8 + 0x5C, rw2);
-                        Process::Read32(obj + 372, fl);
-                        OSD::Notify(Utils::Format("PS: stuck st1 rw1=%d rw2=%d fl=%X", rw1, rw2, fl));
-                    }
-                    if (++g_wait > MAX_FRAMES)
-                        Abort("PS: select timeout");
-                }
-                break;
-            }
-            case D_DONE:
-            {
-                // スロット選択タスクが自分で終了するのを待つ
-                if (FindExSel(ROOT_TASK, 0))
-                {
-                    if (++g_wait > MAX_FRAMES)
-                        Abort("PS: load timeout");
-                    return;
-                }
-                OSD::Notify("PS: load finished");
-                g_wait = 0;
-                g_phase = D_RESTART;
-                break;
-            }
-            case D_RESTART:
-            {
-                if (FindByVptr(ROOT_TASK, VPTR_FIELD, 0))
-                {
-                    RestoreIdleMsg();
-                    g_phase = IDLE;
-                    OSD::Notify("PS: done");
-                    return;
-                }
-                // ゲーム側が自分でフィールドを作らない場合は、2秒待って要求する
-                if (++g_wait == 120)
-                {
-                    RestoreIdleMsg();
-                    RequestState(STATE_FIELD);
-                    OSD::Notify("PS: request field");
-                }
-                else if (g_wait > 1800)
-                    Abort("PS: field timeout");
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
-        // menu->Callback で毎フレーム呼ばれる
-        static void OnFrame(void)
-        {
-            if (g_phase == IDLE)
-                return;
-
-            u32 cur = 0;
-            Process::Read32(FLOW_OBJ + 48, cur);
-
-            if (g_phase >= D_BLANK)
-            {
-                FrameDirectRoute(cur);
-                return;
-            }
-
-            if (++g_timer > MAX_FRAMES)
-            {
-                g_phase = IDLE;
-                OSD::Notify("PS: timeout");
-                return;
-            }
-            FrameTitleRoute(cur);
-        }
-
-        static bool CheckStart(int &slotOut)
-        {
+            (void)entry;
             u32 cur = 0;
             Process::Read32(FLOW_OBJ + 48, cur);
             if (cur != STATE_FIELD)
             {
                 OSD::Notify("Fieldでのみ使えます");
-                return false;
+                return;
             }
             if (g_phase != IDLE)
             {
                 OSD::Notify("処理中です");
-                return false;
+                return;
             }
+
             Keyboard kb("プレイヤーを選択", { "プレイヤー 1", "プレイヤー 2", "プレイヤー 3" });
             int r = kb.Open();
             if (r < 0)
-                return false;
-            slotOut = r;
-            return true;
-        }
+                return;
 
-        // ルートA
-        static void EntryTitle(MenuEntry *entry)
-        {
-            (void)entry;
-            int r = -1;
-            if (!CheckStart(r))
-                return;
-            g_slot = r; g_timer = 0; g_wait = 0; g_lastSt = -1; g_lastTitleSt = -1; g_skipWait = 0;
-            g_phase = T_SELECT;
-            RequestState(STATE_TITLE);
-            OSD::Notify("Switching (title)...");
-        }
+            g_slot   = r;
+            g_timer  = 0;
+            g_wait   = 0;
+            g_lastSt = -1;
+            g_lastTitleSt = -1;
+            g_phase  = WAIT_SELECT;
 
-        // ルートB
-        static void EntryDirect(MenuEntry *entry)
-        {
-            (void)entry;
-            int r = -1;
-            if (!CheckStart(r))
-                return;
-            // 状態IDLEが新しいシーンを作らないよう、メッセージ番号を範囲外にしておく
-            if (!Process::Write16(IDLE_MSG_ADDR, 0x7FFF))
-            {
-                OSD::Notify("PS: cannot patch table");
-                return;
-            }
-            g_slot = r; g_timer = 0; g_wait = 0; g_settle = 0; g_lastSt = -1;
-            g_sent = false;
-            Process::Write32(FLOW_OBJ + 24, 0);
-            Process::Write32(FLOW_OBJ + 12, (u32)&FlowListener);
-            g_phase = D_BLANK;
-            RequestState(STATE_IDLE);
-            OSD::Notify("Switching (direct)...");
+            Process::Write32(FLOW_OBJ + 44, STATE_TITLE);
+            Process::Write8(FLOW_OBJ + 36, 1);
+            OSD::Notify("Switching...");
         }
     }
 
@@ -2198,12 +2252,9 @@ namespace CTRPluginFramework
                                    "有効にして扉を通ると、行き先のエリアIDと入口番号を記録します。\n"
                                    "記録は SD直下の fll_warp_notes.txt に追記されます。"));
         
-        menu->Append(new MenuEntry("プレイヤー切り替え 直接版 (実験)", nullptr, PlayerSwitch::EntryDirect,
-                                   "タイトルを経由せず、フィールドを片付けてから読み込みだけを行って戻ります。\n"
-                                   "使う前に必ずセーブのバックアップを取ってください。切り替え後、確認できるまでセーブしないでください。\n"
-                                   "固まった場合は、セーブせずにゲームを再起動してください。"));
-        menu->Append(new MenuEntry("プレイヤー切り替え タイトル経由 (実験)", nullptr, PlayerSwitch::EntryTitle,
-                                   "タイトル画面を一瞬経由して、自動でスロットを選びます。"));
+        menu->Append(new MenuEntry("プレイヤー切り替え (実験)", nullptr, PlayerSwitch::Entry,
+                                   "フィールドで実行します。タイトルを経由して、選んだプレイヤーのデータで自動的に始め直します。\n"
+                                   "使う前に必ずセーブのバックアップを取ってください。切り替え後、確認できるまでセーブしないでください。"));
         menu->Callback(PlayerSwitch::OnFrame);
 
         AddLifeChange(menu);
