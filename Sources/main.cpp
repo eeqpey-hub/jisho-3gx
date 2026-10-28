@@ -1529,7 +1529,7 @@ namespace CTRPluginFramework
         { "コンガス食堂",152,5 },
         { "王立クルブルク図書館",2,16 },
         { "ヘイホフの家",33,38 },
-        { "アイザックの家",32,34 },
+        { "アイザックの家",254,34 },
         { "いにしえの塔 試練の間",97,136 },
         { "太古の試練その1",98,139 },
         { "闇の試練その1",98,140 },
@@ -1698,28 +1698,39 @@ namespace CTRPluginFramework
 
         const u32 cur = CurrentAreaId();
 
+        // 項目の「表示」と「動作」は、必ずペアで追加する (opts と acts を同時に push_back する)。
+        // 表示順を変えたいときは、下の並びの行を入れ替えるだけでよい (switch は動作名で分岐する)。
+        enum Act { ACT_INPUT, ACT_NEXT, ACT_PREV, ACT_PLUS10, ACT_MINUS10, ACT_AGAIN, ACT_RECORD, ACT_SHOW };
         std::vector<std::string> opts;
+        std::vector<int> acts;
+
         opts.push_back("エリアIDと入口番号を数字で指定して移動");
+        acts.push_back(ACT_INPUT);
         opts.push_back(Utils::Format("次のIDへ移動 (%u)", g_expArea + 1));
+        acts.push_back(ACT_NEXT);
         opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 0 ? g_expArea - 1 : 0));
+        acts.push_back(ACT_PREV);
         opts.push_back(Utils::Format("+10 へ移動 (%u)", g_expArea + 10));
+        acts.push_back(ACT_PLUS10);
         opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea >= 10 ? g_expArea - 10 : 0));
+        acts.push_back(ACT_MINUS10);
         opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
+        acts.push_back(ACT_AGAIN);
         opts.push_back("この場所を記録 (名前を入力)");
+        acts.push_back(ACT_RECORD);
         opts.push_back("記録を表示");
+        acts.push_back(ACT_SHOW);
 
         u32 sel = 0;
         if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の移動=ID %u 入口 %u", cur, g_expArea, g_expLink),
                        opts, sel))
             return;
+        if (sel >= acts.size())
+            return;
 
-        switch (sel)
+        switch (acts[sel])
         {
-        case 0: RequestWarp(g_expArea + 1, g_expLink); break;
-        case 1: RequestWarp(g_expArea > 0 ? g_expArea - 1 : 0, g_expLink); break;
-        case 2: RequestWarp(g_expArea + 10, g_expLink); break;
-        case 3: RequestWarp(g_expArea >= 10 ? g_expArea - 10 : 0, g_expLink); break;
-        case 4:
+        case ACT_INPUT:
         {
             u32 area = g_expArea, link = g_expLink;
             if (!AskValue("エリアID (0〜999)", false, 999, g_expArea, area))
@@ -1729,9 +1740,13 @@ namespace CTRPluginFramework
             RequestWarp(area, link);
             break;
         }
-        case 5: RequestWarp(g_expArea, g_expLink); break;
-        case 6: RecordHere(); break;
-        case 7: ShowNotes(); break;
+        case ACT_NEXT:    RequestWarp(g_expArea + 1, g_expLink); break;
+        case ACT_PREV:    RequestWarp(g_expArea > 0 ? g_expArea - 1 : 0, g_expLink); break;
+        case ACT_PLUS10:  RequestWarp(g_expArea + 10, g_expLink); break;
+        case ACT_MINUS10: RequestWarp(g_expArea >= 10 ? g_expArea - 10 : 0, g_expLink); break;
+        case ACT_AGAIN:   RequestWarp(g_expArea, g_expLink); break;
+        case ACT_RECORD:  RecordHere(); break;
+        case ACT_SHOW:    ShowNotes(); break;
         default: break;
         }
     }
