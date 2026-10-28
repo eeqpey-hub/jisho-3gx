@@ -1,6 +1,6 @@
 // Life.hpp  ―  ライフ変更 と おすすめ(スクリーンショット無効)
 //
-// main.cpp への追加は3か所だけ(説明は返信を見る):
+// main.cpp への追加は3か所だけ:
 //   1) 先頭付近に   #include "Life.hpp"
 //   2) main() の SynchronizeWithFrame の次の行に   AddRecommended(menu);
 //   3) main() の menu->Run(); の直前に             AddLifeChange(menu);
@@ -8,25 +8,27 @@
 
 // ------------------------------------------------------------
 //  ライフ変更の本体 (ゲーム本体のスレッドから、毎フレーム呼ばれる)
-//  元のARコードと同じ処理を C++ で書き直したもの。置き場(コード領域)は使わない。
+//  元のARコードと同じ処理を C++ で書き直したもの。コード置き場は使わない。
+//  差し込み位置は2か所:
+//    A) 0x5A4C30 (元のARコードと同じ場所。ある条件のときだけ通る)
+//    B) 0x5A4A5C (A を含む関数の入り口。毎フレーム通るはず)
 // ------------------------------------------------------------
 extern "C"
 {
-    void jp_lifeHook(void);
+    void jp_lifeHookA(void);
+    void jp_lifeHookB(void);
 
-    volatile u32 g_lifeWant  = 0;   // 0 = 要求なし / 0x100 | ライフID (「やめる」を選ぶまで、ずっと有効)
-    volatile u32 g_lifeCalls = 0;   // 差し込み位置を通った回数 (診断用)
-    volatile u32 g_lifeSets  = 0;   // 実際にライフを書き換えた回数 (診断用)
-    volatile u32 g_lifeState = 0;   // 直前の状態 0=要求なし 1=マネージャなし 2=プレイヤーなし 3=一致済み 4=変更した
-    volatile u32 g_lifeCur   = 0;   // 直前に読んだ現在のライフ (診断用)
-    volatile u32 g_lifePlayer = 0;  // 直前のプレイヤー構造体 (診断用)
+    volatile u32 g_lifeWant   = 0;   // 0 = 要求なし / 0x100 | ライフID (「やめる」を選ぶまで有効)
+    volatile u32 g_lifeCallsA = 0;   // 差し込みAを通った回数 (診断用)
+    volatile u32 g_lifeCallsB = 0;   // 差し込みBを通った回数 (診断用)
+    volatile u32 g_lifeSets   = 0;   // 実際にライフを書き換えた回数 (診断用)
+    volatile u32 g_lifeState  = 0;   // 0=要求なし 1=マネージャなし 2=プレイヤーなし 3=一致済み 4=変更した
+    volatile u32 g_lifeCur    = 0;   // 直前に読んだ現在のライフ (診断用)
+    volatile u32 g_lifePlayer = 0;   // 直前のプレイヤー構造体 (診断用)
 
-    // 元のARコードと同じく、要求がある間は毎回「今のライフと違えば書き換える」。
-    // (一度変えても、ゲーム側が元に戻すことがあるため、1回だけでは足りない)
-    void jp_lifeApply(void)
+    // 要求がある間は、毎回「今のライフと違えば書き換える」(元のARコードと同じ)
+    static void LifeBody(void)
     {
-        g_lifeCalls = g_lifeCalls + 1;
-
         const u32 want = g_lifeWant;
         if (!(want & 0x100))
         {
@@ -57,7 +59,7 @@ extern "C"
         g_lifeCur = (u32)cur;
         if (cur == (s32)life)
         {
-            g_lifeState = 3;   // すでに一致
+            g_lifeState = 3;
             return;
         }
         ((SetLifeFn)0x001D5F74)(player, life);
@@ -66,23 +68,41 @@ extern "C"
         g_lifeSets  = g_lifeSets + 1;
         g_lifeState = 4;
     }
+
+    void jp_lifeApplyA(void) { g_lifeCallsA = g_lifeCallsA + 1; LifeBody(); }
+    void jp_lifeApplyB(void) { g_lifeCallsB = g_lifeCallsB + 1; LifeBody(); }
 }
 
-// 0x5A4C30 の2命令 (ldr r0,=0x73FE3C / bl 0x23C83C) を置き換えて、ここに来る。
-// 置き換えた2命令を再現してから、変更処理を呼び、0x5A4C38 に戻る。
 asm(R"(
     .arm
     .text
     .align 2
 
-    .global jp_lifeHook
-    .type jp_lifeHook, %function
-jp_lifeHook:
+@ A: 0x5A4C30 の2命令 (ldr r0,=0x73FE3C / bl 0x23C83C) を置き換えて、ここに来る。
+@    置き換えた2命令を再現してから、変更処理を呼び、0x5A4C38 に戻る。
+    .global jp_lifeHookA
+    .type jp_lifeHookA, %function
+jp_lifeHookA:
     ldr   r0, =0x0073FE3C
     ldr   r12, =0x0023C83C
     blx   r12
-    bl    jp_lifeApply
+    bl    jp_lifeApplyA
     ldr   pc, =0x005A4C38
+    .ltorg
+
+@ B: 0x5A4A5C の2命令 (push {r4-r8,lr} / mov r4,r0) を置き換えて、ここに来る。
+@    s0 (浮動小数点の引数) など、関数の引数を壊さないように保存する。
+    .global jp_lifeHookB
+    .type jp_lifeHookB, %function
+jp_lifeHookB:
+    push  {r4-r8, lr}
+    mov   r4, r0
+    push  {r0-r3, r12, lr}
+    vpush {d0-d7}
+    bl    jp_lifeApplyB
+    vpop  {d0-d7}
+    pop   {r0-r3, r12, lr}
+    ldr   pc, =0x005A4A64
     .ltorg
 )");
 
@@ -91,29 +111,43 @@ namespace CTRPluginFramework
     // ------------------------------------------------------------
     //  ライフ変更
     // ------------------------------------------------------------
-    static Hook g_hookLife;
-    static bool g_lifeHookInstalled = false;
+    static Hook g_hookLifeA;
+    static Hook g_hookLifeB;
+    static bool g_lifeInstalledA = false;
+    static bool g_lifeInstalledB = false;
+    static bool g_lifeInstallTried = false;
 
-    static bool InstallLifeHook(void)
+    // メニューを開いたときに、差し込みを入れる (ライフを選ぶ前から動かして、回数を数えるため)
+    static void InstallLifeHooks(void)
     {
-        if (g_lifeHookInstalled)
-            return true;
+        if (g_lifeInstallTried)
+            return;
+        g_lifeInstallTried = true;
 
-        // 置き換える2命令が想定どおりか確認 (元のARコードのライフ変更がONのままだと、ここで止まる)
-        u32 a = 0, b = 0;
-        if (!Process::Read32(0x005A4C30, a) || !Process::Read32(0x005A4C34, b)
-            || a != 0xE59F00EC || b != 0xEBF25F00)
+        u32 a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+        const bool okA = Process::Read32(0x005A4C30, a0) && Process::Read32(0x005A4C34, a1)
+                         && a0 == 0xE59F00EC && a1 == 0xEBF25F00;
+        const bool okB = Process::Read32(0x005A4A5C, b0) && Process::Read32(0x005A4A60, b1)
+                         && b0 == 0xE92D41F0 && b1 == 0xE1A04000;
+
+        if (okA)
         {
-            MessageBox("エラー",
-                       "ライフ変更の差し込み位置の命令が想定と違います。\n"
-                       "ARコードのライフ変更がONのままか、ゲームのバージョンが違う可能性があります。")();
-            return false;
+            g_hookLifeA.Initialize(0x005A4C30, (u32)(uintptr_t)jp_lifeHookA);
+            g_hookLifeA.Enable();
+            g_lifeInstalledA = true;
         }
-
-        g_hookLife.Initialize(0x005A4C30, (u32)(uintptr_t)jp_lifeHook);
-        g_hookLife.Enable();
-        g_lifeHookInstalled = true;
-        return true;
+        if (okB)
+        {
+            g_hookLifeB.Initialize(0x005A4A5C, (u32)(uintptr_t)jp_lifeHookB);
+            g_hookLifeB.Enable();
+            g_lifeInstalledB = true;
+        }
+        if (!okA || !okB)
+            MessageBox("お知らせ",
+                       Utils::Format("差し込み位置の命令が想定と違うため、入れなかった場所があります。\n"
+                                     "A(0x5A4C30): %s\nB(0x5A4A5C): %s\n"
+                                     "ARコードのライフ変更がONのままだと、Aは入りません。",
+                                     okA ? "入れた" : "入れていない", okB ? "入れた" : "入れていない"))();
     }
 
     struct LifeInfo
@@ -139,6 +173,8 @@ namespace CTRPluginFramework
     {
         (void)entry;
 
+        InstallLifeHooks();   // 開いた時点で入れる。ライフを選ぶ前から回数を数える
+
         std::vector<std::string> names;
         for (const LifeInfo &l : g_lives)
             names.push_back(l.name);
@@ -154,12 +190,17 @@ namespace CTRPluginFramework
         if (sel == nLives + 1)   // 状態を見る
         {
             static const char *states[] = { "要求なし", "マネージャなし", "プレイヤーなし", "一致済み", "変更した" };
+            const std::string want = (g_lifeWant & 0x100)
+                                         ? Utils::Format("ライフ%02X", (u32)(g_lifeWant & 0xFF))
+                                         : std::string("なし");
             MessageBox("ライフ変更の状態",
-                       Utils::Format("要求: %s\n差し込み位置を通った回数: %u\n書き換えた回数: %u\n"
-                                     "直前の状態: %s\n現在のライフ(読み取り): %d\nプレイヤー構造体: 0x%08X",
-                                     (g_lifeWant & 0x100) ? Utils::Format("ライフ%02X", (u32)(g_lifeWant & 0xFF)).c_str() : "なし",
-                                     (u32)g_lifeCalls, (u32)g_lifeSets,
-                                     states[g_lifeState > 4 ? 0 : g_lifeState], (int)g_lifeCur, (u32)g_lifePlayer))();
+                       Utils::Format("要求: %s\n差し込みA(%s)を通った回数: %u\n差し込みB(%s)を通った回数: %u\n"
+                                     "書き換えた回数: %u\n直前の状態: %s\n現在のライフ(読み取り): %d\nプレイヤー構造体: 0x%08X",
+                                     want.c_str(),
+                                     g_lifeInstalledA ? "入れた" : "なし", (u32)g_lifeCallsA,
+                                     g_lifeInstalledB ? "入れた" : "なし", (u32)g_lifeCallsB,
+                                     (u32)g_lifeSets, states[g_lifeState > 4 ? 0 : g_lifeState],
+                                     (int)g_lifeCur, (u32)g_lifePlayer))();
             return;
         }
 
@@ -170,8 +211,11 @@ namespace CTRPluginFramework
             return;
         }
 
-        if (!InstallLifeHook())
+        if (!g_lifeInstalledA && !g_lifeInstalledB)
+        {
+            MessageBox("エラー", "差し込みを入れられなかったので、ライフ変更は使えません。")();
             return;
+        }
 
         g_lifeWant = 0x100 | g_lives[sel].id;
         MessageBox("ライフ変更",
@@ -185,7 +229,7 @@ namespace CTRPluginFramework
                                    "歯車マークを押すと、ライフの一覧(王国兵士、傭兵、…)が出ます。\n"
                                    "選んだライフに変更し、「ライフ変更をやめる」を選ぶまで保ちます。\n"
                                    "「状態を見る」で、動作の回数を確認できます。\n"
-                                   "ARコードの「ライフ変更」がONのままだと使えません。先にOFFにして、ゲームを再起動してください。"));
+                                   "ARコードの「ライフ変更」がONのままだと、一部が使えません。先にOFFにして、ゲームを再起動してください。"));
     }
 
     // ------------------------------------------------------------
