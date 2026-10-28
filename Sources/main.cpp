@@ -70,7 +70,7 @@ extern "C"
     volatile u32 g_warpTask    = 0;   // 毎フレーム更新される。エリアID = g_warpTask + 0x6B2
 
     // ゲーム本体のスレッドから、毎フレーム呼ばれる (task = フィールドタスク)。
-    // 予約があれば 0x21EDCC(接続番号) を呼び、エリアIDを返す(0 = 何もしない)。
+    // 予約があれば 0x21EDCC(接続番号) を呼び、「エリアID+1」を返す(0 = 何もしない)。
     // 接続番号が0のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
     u32 WarpPrepare(u32 task)
     {
@@ -83,7 +83,7 @@ extern "C"
             typedef void (*SetArrivalLinkFn)(u32);
             ((SetArrivalLinkFn)0x21EDCC)(g_warpLink);
         }
-        return g_warpArea;
+        return g_warpArea + 1;   // エリアID+1 を返す (0 = ワープなし。エリアID 0 も指定できる)
     }
 }
 
@@ -137,12 +137,13 @@ jp_hookB2:
 jp_hookWarp:
     push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
     vpush {d0-d7}                @ 元の関数は s0 (float引数) を使うので退避
-    bl    WarpPrepare            @ r0 = エリアID (0 = ワープなし)
+    bl    WarpPrepare            @ r0 = エリアID+1 (0 = ワープなし)
     vpop  {d0-d7}                @ s0〜s15 を元に戻す
     str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
     pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
     cmp   r12, #0
     beq   1f
+    sub   r12, r12, #1           @ エリアID+1 → エリアID (0 も有効)
     mov   r1, r12                @ GDBで成功したのと同じ設定
     mov   r2, #0
     mov   r3, r12
@@ -1647,8 +1648,7 @@ namespace CTRPluginFramework
 
     static void RequestWarp(u32 area, u32 link)
     {
-        if (area < 1)   area = 1;
-        if (area > 999) area = 999;
+        if (area > 999) area = 999;   // 0 も指定できる (存在しないIDだと落ちる可能性あり)
         g_expArea = area;
         g_expLink = link;
         g_warpArea    = area;
@@ -1701,9 +1701,9 @@ namespace CTRPluginFramework
         std::vector<std::string> opts;
         opts.push_back("エリアIDと入口番号を数字で指定して移動");
         opts.push_back(Utils::Format("次のIDへ移動 (%u)", g_expArea + 1));
-        opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 1 ? g_expArea - 1 : 1));
+        opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 0 ? g_expArea - 1 : 0));
         opts.push_back(Utils::Format("+10 へ移動 (%u)", g_expArea + 10));
-        opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea > 10 ? g_expArea - 10 : 1));
+        opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea >= 10 ? g_expArea - 10 : 0));
         opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
         opts.push_back("この場所を記録 (名前を入力)");
         opts.push_back("記録を表示");
@@ -1716,13 +1716,13 @@ namespace CTRPluginFramework
         switch (sel)
         {
         case 0: RequestWarp(g_expArea + 1, g_expLink); break;
-        case 1: RequestWarp(g_expArea > 1 ? g_expArea - 1 : 1, g_expLink); break;
+        case 1: RequestWarp(g_expArea > 0 ? g_expArea - 1 : 0, g_expLink); break;
         case 2: RequestWarp(g_expArea + 10, g_expLink); break;
-        case 3: RequestWarp(g_expArea > 10 ? g_expArea - 10 : 1, g_expLink); break;
+        case 3: RequestWarp(g_expArea >= 10 ? g_expArea - 10 : 0, g_expLink); break;
         case 4:
         {
             u32 area = g_expArea, link = g_expLink;
-            if (!AskValue("エリアID (1〜999)", false, 999, g_expArea, area))
+            if (!AskValue("エリアID (0〜999)", false, 999, g_expArea, area))
                 return;
             if (!AskValue("入口番号 (0 = 標準の入口)", false, 999, g_expLink, link))
                 return;
