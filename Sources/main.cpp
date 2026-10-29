@@ -67,25 +67,23 @@ extern "C"
     volatile u32 g_warpPending = 0;
     volatile u32 g_warpArea    = 0;
     volatile u32 g_warpLink    = 0;
-    volatile u32 g_warpUseLink = 1;   // 1 = 入口番号を渡す (0 も指定できる) / 0 = 渡さない (標準の入口)
     volatile u32 g_warpTask    = 0;   // 毎フレーム更新される。エリアID = g_warpTask + 0x6B2
 
     // ゲーム本体のスレッドから、毎フレーム呼ばれる (task = フィールドタスク)。
-    // 予約があれば 0x21EDCC(入口番号) を呼び、「エリアID+1」を返す(0 = 何もしない)。
-    // g_warpUseLink が 0 のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
-    // 入口番号 0 も、エリアID 0 も、普通の値として扱う。
+    // 予約があれば 0x21EDCC(接続番号) を呼び、エリアIDを返す(0 = 何もしない)。
+    // 接続番号が0のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
     u32 WarpPrepare(u32 task)
     {
         g_warpTask = task;
         if (!g_warpPending)
             return 0;
         g_warpPending = 0;
-        if (g_warpUseLink)
+        if (g_warpLink != 0)
         {
             typedef void (*SetArrivalLinkFn)(u32);
             ((SetArrivalLinkFn)0x21EDCC)(g_warpLink);
         }
-        return g_warpArea + 1;   // エリアID+1 (0 = ワープなし と区別するため)
+        return g_warpArea;
     }
 }
 
@@ -139,13 +137,12 @@ jp_hookB2:
 jp_hookWarp:
     push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
     vpush {d0-d7}                @ 元の関数は s0 (float引数) を使うので退避
-    bl    WarpPrepare            @ r0 = エリアID+1 (0 = ワープなし)
+    bl    WarpPrepare            @ r0 = エリアID (0 = ワープなし)
     vpop  {d0-d7}                @ s0〜s15 を元に戻す
     str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
     pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
     cmp   r12, #0
     beq   1f
-    sub   r12, r12, #1           @ エリアID+1 → エリアID (0 も有効)
     mov   r1, r12                @ GDBで成功したのと同じ設定
     mov   r2, #0
     mov   r3, r12
@@ -1613,25 +1610,17 @@ namespace CTRPluginFramework
 
         g_warpArea    = g_warpDests[sel].area;
         g_warpLink    = g_warpDests[sel].link;
-        g_warpUseLink = 1;
         g_warpPending = 1;     // メニューを閉じた後、ゲームが次にタスクを更新したときに実行される
         OSD::Notify("Warp requested.");
     }
 
     // ------------------------------------------------------------
-    //  探索ワープ / 扉の記録 (開発用)
-    //  ・探索ワープ: 「出たいエリア」と「入口番号」を数字で指定して移動する
-    //  ・扉の自動記録: 有効にして扉を通ると、here / dest / 入口番号 を記録する
+    //  探索ワープ / 場所の記録 (開発用・実機未検証)
+    //  GDBなしで、移動先のデータ (エリアID・入口番号・場所名) を集めるための機能。
+    //   ・探索ワープ: エリアIDを +1 / -1 / 直接入力 で移動し、着いた場所の名前を記録する
+    //   ・扉の自動記録: 有効にして扉を通ると、行き先エリアIDと入口番号を記録する
     //  記録は SD カード直下の fll_warp_notes.txt に追記される (書けない場合は画面の一覧のみ)。
     //  存在しないエリアIDへ移動すると、落ちる可能性がある。必ずバックアップを取ること。
-    //
-    //  here = 扉を通る前に居たエリア (扉がある側) / dest = 扉の向こう側のエリア
-    //  入口番号 L の扉は、here 側と dest 側の2か所にある (両側で同じ番号)。
-    //   ・ここ(here)に出たいとき      → (here, L) を指定
-    //   ・扉の先(dest)に出たいとき    → (dest, L) を指定
-    //  ゲーム本体は (行き先エリア, L) を渡すと「その行き先へ向かう扉の前」に出る
-    //  (= 反対側のエリアに出る) ので、数字指定ワープは入口番号 L の反対側のエリアを
-    //  調べて、本体に渡す値へ変換している。反対側が未登録の入口番号は、変換できない。
     // ------------------------------------------------------------
     #ifndef WARP_LOG_TO_FILE
     #define WARP_LOG_TO_FILE 1      // ビルドが通らないときは 0 にするとファイル出力を外せる
@@ -1640,7 +1629,6 @@ namespace CTRPluginFramework
     static std::vector<std::string> g_notes;
     static u32 g_expArea = 2;
     static u32 g_expLink = 0;
-    static int g_expMode = 0;       // 0 = 入口番号を指定 / 1 = エリアだけ指定 (標準の入口)
 
     static void AppendNote(const std::string &line)
     {
@@ -1657,99 +1645,16 @@ namespace CTRPluginFramework
     #endif
     }
 
-    // 入口番号 → その入口が結ぶ2つのエリア。扉の自動記録のログ末尾の
-    // 「{ 番号, here, dest },」をそのまま足せる。(扉を通ると、実行中も自動で覚える)
-    struct LinkEnd { u16 link; u16 a; u16 b; };
-    static const LinkEnd g_linkEnds[] =
+    static void RequestWarp(u32 area, u32 link)
     {
-        {  39,   3,  25 },   // 郊外南 <-> パーテル大平原東
-        { 125,  24,  25 },   // パーテル西 <-> パーテル大平原東
-        { 128,  25, 210 },   // パーテル大平原東 <-> ハニワの洞窟
-        { 133,  82,  83 },
-        { 142,  83,  86 },
-        { 132,  82,  85 },
-        { 136,  97,  98 },
-        {  88,  16,  19 },
-        {  83,  11,  31 },
-        {  81,  13,  30 },
-    };
-    static std::vector<LinkEnd> g_linkLearned;
-
-    static void LearnLink(u32 link, u32 a, u32 b)
-    {
-        for (size_t i = 0; i < g_linkLearned.size(); ++i)
-        {
-            const LinkEnd &e = g_linkLearned[i];
-            if (e.link == link && ((e.a == a && e.b == b) || (e.a == b && e.b == a)))
-                return;
-        }
-        LinkEnd e;
-        e.link = (u16)link;
-        e.a    = (u16)a;
-        e.b    = (u16)b;
-        g_linkLearned.push_back(e);
-    }
-
-    // 戻り値: 0 = 反対側が見つかった / 1 = 入口番号が未登録 / 2 = そのエリアは、この入口の端ではない
-    static int FindOtherEnd(u32 area, u32 link, u32 &other, u32 &ea, u32 &eb)
-    {
-        bool known = false;
-        for (int pass = 0; pass < 2; ++pass)
-        {
-            const size_t n = (pass == 0) ? g_linkLearned.size() : (sizeof(g_linkEnds) / sizeof(g_linkEnds[0]));
-            for (size_t i = 0; i < n; ++i)
-            {
-                const LinkEnd &e = (pass == 0) ? g_linkLearned[i] : g_linkEnds[i];
-                if (e.link != link)
-                    continue;
-                known = true;
-                ea = e.a;
-                eb = e.b;
-                if (e.a == area) { other = e.b; return 0; }
-                if (e.b == area) { other = e.a; return 0; }
-            }
-        }
-        return known ? 2 : 1;
-    }
-
-    // ゲーム本体へ予約する。area は本体に渡す値 (= その入口が向かう側のエリア)。
-    static void RequestWarpRaw(u32 area, u32 link, bool useLink)
-    {
-        if (area > 999) area = 999;   // 0 も指定できる (存在しないIDだと落ちる可能性あり)
+        if (area < 1)   area = 1;
+        if (area > 999) area = 999;
+        g_expArea = area;
+        g_expLink = link;
         g_warpArea    = area;
         g_warpLink    = link;
-        g_warpUseLink = useLink ? 1 : 0;
         g_warpPending = 1;
-        OSD::Notify(Utils::Format("Warp: engine area %u link %u%s", area, link, useLink ? "" : " (default)"));
-    }
-
-    // 「area の、番号 link の入口の前」に出る。
-    static void WarpToEntrance(u32 area, u32 link)
-    {
-        u32 other = 0, ea = 0, eb = 0;
-        const int r = FindOtherEnd(area, link, other, ea, eb);
-
-        if (r == 2)
-        {
-            MessageBox("移動できません",
-                       Utils::Format("入口番号 %u は、エリア %u とエリア %u をつなぐ入口です。\n"
-                                     "エリア %u には、この入口はありません。", link, ea, eb, area))();
-            return;
-        }
-        if (r == 1)
-        {
-            if (!(MessageBox("入口番号が未登録",
-                             Utils::Format("入口番号 %u の両側のエリアが、まだ登録されていません。\n\n"
-                                           "このまま続けると、エリア %u へ向かう扉の前 (隣のエリア側) に出ます。\n"
-                                           "続けますか?\n\n"
-                                           "(「扉の自動記録」を有効にして、その入口の扉を通ると登録されます)",
-                                           link, area),
-                             DialogType::DialogYesNo))())
-                return;
-            RequestWarpRaw(area, link, true);
-            return;
-        }
-        RequestWarpRaw(other, link, true);
+        OSD::Notify(Utils::Format("Warp: area %u link %u", area, link));
     }
 
     static u32 CurrentAreaId(void)
@@ -1774,6 +1679,16 @@ namespace CTRPluginFramework
         MessageBox("記録 (新しい順 最大12件)", text)();
     }
 
+    static void RecordHere(void)
+    {
+        std::string name;
+        Keyboard kb("この場所の名前を入力 (記録します)");
+        if (kb.Open(name) != 0)
+            return;
+        AppendNote(Utils::Format("area=%u link=%u name=%s", CurrentAreaId(), g_expLink, name.c_str()));
+        OSD::Notify("Recorded.");
+    }
+
     static void ExploreEntry(MenuEntry *entry)
     {
         (void)entry;
@@ -1783,64 +1698,41 @@ namespace CTRPluginFramework
 
         const u32 cur = CurrentAreaId();
 
-        // 項目の「表示」と「動作」は、必ずペアで追加する (opts と acts を同時に push_back する)。
-        // 表示順を変えたいときは、下の並びの行を入れ替えるだけでよい (switch は動作名で分岐する)。
-        enum Act { ACT_INPUT, ACT_AREA_ONLY, ACT_AGAIN, ACT_SHOW };
         std::vector<std::string> opts;
-        std::vector<int> acts;
-
-        opts.push_back("エリアIDと入口番号を数字で指定");
-        acts.push_back(ACT_INPUT);
-        opts.push_back("エリアIDだけ数字で指定 (標準の入口)");
-        acts.push_back(ACT_AREA_ONLY);
+        opts.push_back("エリアIDと入口番号を数字で指定して移動");
+        opts.push_back(Utils::Format("次のIDへ移動 (%u)", g_expArea + 1));
+        opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 1 ? g_expArea - 1 : 1));
+        opts.push_back(Utils::Format("+10 へ移動 (%u)", g_expArea + 10));
+        opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea > 10 ? g_expArea - 10 : 1));
         opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
-        acts.push_back(ACT_AGAIN);
+        opts.push_back("この場所を記録 (名前を入力)");
         opts.push_back("記録を表示");
-        acts.push_back(ACT_SHOW);
 
         u32 sel = 0;
-        if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の指定=ID %u 入口 %u", cur, g_expArea, g_expLink),
+        if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の移動=ID %u 入口 %u", cur, g_expArea, g_expLink),
                        opts, sel))
             return;
-        if (sel >= acts.size())
-            return;
 
-        switch (acts[sel])
+        switch (sel)
         {
-        case ACT_INPUT:
+        case 0: RequestWarp(g_expArea + 1, g_expLink); break;
+        case 1: RequestWarp(g_expArea > 1 ? g_expArea - 1 : 1, g_expLink); break;
+        case 2: RequestWarp(g_expArea + 10, g_expLink); break;
+        case 3: RequestWarp(g_expArea > 10 ? g_expArea - 10 : 1, g_expLink); break;
+        case 4:
         {
             u32 area = g_expArea, link = g_expLink;
-            if (!AskValue("出たいエリアID (0〜999)", false, 999, g_expArea, area))
+            if (!AskValue("エリアID (1〜999)", false, 999, g_expArea, area))
                 return;
-            if (!AskValue("その入口番号 (0〜999)", false, 999, g_expLink, link))
+            if (!AskValue("入口番号 (0 = 標準の入口)", false, 999, g_expLink, link))
                 return;
-            g_expArea = area;
-            g_expLink = link;
-            g_expMode = 0;
-            WarpToEntrance(area, link);
+            RequestWarp(area, link);
             break;
         }
-        case ACT_AREA_ONLY:
-        {
-            u32 area = g_expArea;
-            if (!AskValue("エリアID (0〜999)", false, 999, g_expArea, area))
-                return;
-            g_expArea = area;
-            g_expMode = 1;
-            RequestWarpRaw(area, 0, false);
-            break;
-        }
-        case ACT_AGAIN:
-            if (g_expMode == 0)
-                WarpToEntrance(g_expArea, g_expLink);
-            else
-                RequestWarpRaw(g_expArea, 0, false);
-            break;
-        case ACT_SHOW:
-            ShowNotes();
-            break;
-        default:
-            break;
+        case 5: RequestWarp(g_expArea, g_expLink); break;
+        case 6: RecordHere(); break;
+        case 7: ShowNotes(); break;
+        default: break;
         }
     }
 
@@ -1851,13 +1743,6 @@ namespace CTRPluginFramework
         (void)entry;
         static u32 lastWord = 0xFFFFFFFF;
 
-        // here (いま居るエリア) を読むには、ワープ用のフックが必要 (タスクの場所を毎フレーム受け取る)
-        if (g_warpTask == 0)
-        {
-            InstallWarpHook();
-            return;
-        }
-
         u32 w = 0;
         if (!Process::Read32(0x16D5D4A8, w))   // ChangeMapオブジェクトの +12 (エリアID16bit) と +14 (入口番号16bit)
             return;
@@ -1865,17 +1750,16 @@ namespace CTRPluginFramework
             return;
         lastWord = w;
 
-        const u32 dest = w & 0xFFFF;
+        const u32 area = w & 0xFFFF;
         const u32 link = w >> 16;
-        if (dest == 0)
+        if (area == 0)
             return;
 
-        // here = 扉を通る前に居たエリア / dest = 扉の向こう
+        // here = いま居るエリア (扉を通る前)。この扉の前に出るワープの組は (dest, link)。
+        //   → ワープすると「here のエリアの、この扉の前」に出る。
         const u32 here = CurrentAreaId();
-        LearnLink(link, here, dest);
-        AppendNote(Utils::Format("DOOR here=%u dest=%u link=%u | ここに出る: %u/%u  扉の先に出る: %u/%u | { %u, %u, %u },",
-                                 here, dest, link, here, link, dest, link, link, here, dest));
-        OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, dest, link));
+        AppendNote(Utils::Format("DOOR here=%u dest=%u link=%u  (warp %u/%u lands in area %u)", here, area, link, area, link, here));
+        OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, area, link));
     }
 
     // ------------------------------------------------------------
@@ -2300,6 +2184,362 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
+    //  固有効果を変更 (武器・防具)
+    //  固有効果は、かばんの1つ1つのアイテムではなく、ゲームがメモリに読み込んでいる
+    //  「データ表」(1アイテム1行。行の決まった位置の2バイトが効果ID)で決まる。
+    //  この表をメモリ上で書き換える。同じIDのアイテムすべてに効き、自分のゲームの中だけで有効。
+    //  ゲームを終了すると元に戻る。表の場所は、メモリを検索して見つける。
+    //   武器: 行 = ID (0x0000-0x008F)、1行24バイト、行の+14
+    //   防具: 行 = ID - 0x99 (0x0099-0x0386)、1行48バイト、行の+38
+    //  ライフ道具は、表がまだ見つかっていないため対象外。
+    // ------------------------------------------------------------
+    static constexpr u32 INN_MAGIC      = 0x1D038013u;   // 表ファイルの先頭の目印
+    static constexpr u32 INN_ROWS_OFF_W = 0x110;
+    static constexpr u32 INN_ROWS_OFF_A = 0x14C;
+    static constexpr u32 INN_EFFECT_MAX = 0x240;         // 効果IDの最大
+    static constexpr int INN_CATS       = 2;
+    static constexpr u32 INN_MAX_ITEMS  = 0x400;         // 1カテゴリの最大アイテム数
+
+    // 照合用: 固有効果より前にある列の値 (効果を書き換えても変わらない)
+    static const u8 s_w_0[14] = { 0x06, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x65, 0x02, 0xE8, 0x03 };
+    static const u8 s_w_1[14] = { 0x0C, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x66, 0x02, 0xE8, 0x03 };
+    static const u8 s_w_81[14] = { 0x78, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2C, 0x04, 0xE8, 0x03 };
+    static const u8 s_w_143[14] = { 0x00, 0x00, 0x02, 0x00, 0x64, 0x00, 0x01, 0x00, 0x50, 0x00, 0x4C, 0x06, 0xE8, 0x03 };
+    static const u8 s_a_0[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_1[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_150[36] = { 0x00, 0x00, 0x80, 0x3F, 0x16, 0x00, 0x16, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_300[36] = { 0x00, 0x00, 0x80, 0x3F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_500[36] = { 0x00, 0x00, 0x80, 0x3F, 0x22, 0x00, 0x11, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_749[36] = { 0x00, 0x00, 0x80, 0x3F, 0x06, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+
+    struct InnateRow { u32 row; const u8 *bytes; };
+    static const InnateRow g_innSigW[] =
+    {
+        { 0, s_w_0 },
+        { 1, s_w_1 },
+        { 81, s_w_81 },
+        { 143, s_w_143 }
+    };
+    static const InnateRow g_innSigA[] =
+    {
+        { 0, s_a_0 },
+        { 1, s_a_1 },
+        { 150, s_a_150 },
+        { 300, s_a_300 },
+        { 500, s_a_500 },
+        { 749, s_a_749 }
+    };
+
+    struct InnateCat
+    {
+        const char       *name;
+        u32               idMin, idMax;      // アイテムIDの範囲 (行 = id - idMin)
+        u32               rowsOff;           // 表の先頭から最初の行まで
+        u32               rowSize;
+        u32               effOff;            // 行の中の固有効果の位置 (u16)
+        u32               sigLen;            // 照合するバイト数
+        const InnateRow  *sigs;
+        int               sigN;
+    };
+
+    static const InnateCat g_innCats[INN_CATS] =
+    {
+        { "武器", 0x0000, 0x008F, INN_ROWS_OFF_W, 24, 14, 14, g_innSigW, 4 },
+        { "防具", 0x0099, 0x0386, INN_ROWS_OFF_A, 48, 38, 36, g_innSigA, 6 },
+    };
+
+    static u32  g_innTab[INN_CATS][8];                          // 見つかった表(コピー)の先頭アドレス
+    static int  g_innTabN[INN_CATS] = { 0, 0 };
+    static u16  g_innOrig[INN_CATS][INN_MAX_ITEMS];             // 変更前の効果ID
+    static bool g_innHas[INN_CATS][INN_MAX_ITEMS];              // 変更済みか
+
+    static u32 InnCount(const InnateCat &c) { return c.idMax - c.idMin + 1; }
+
+    static u32 InnEffAddr(const InnateCat &c, u32 base, u32 id)
+    {
+        return base + c.rowsOff + c.rowSize * (id - c.idMin) + c.effOff;
+    }
+
+    static bool InnIsTable(const InnateCat &c, u32 base)
+    {
+        u32 v = 0;
+        if (!Process::Read32(base, v) || v != INN_MAGIC)
+            return false;
+        for (int k = 0; k < c.sigN; ++k)
+        {
+            const u32 a = base + c.rowsOff + c.rowSize * c.sigs[k].row;
+            const u8 *want = c.sigs[k].bytes;
+            u32 i = 0;
+            for (; i + 4 <= c.sigLen; i += 4)
+            {
+                u32 x = 0;
+                if (!Process::Read32(a + i, x))
+                    return false;
+                const u32 w = (u32)want[i] | ((u32)want[i + 1] << 8) | ((u32)want[i + 2] << 16) | ((u32)want[i + 3] << 24);
+                if (x != w)
+                    return false;
+            }
+            if (i + 2 <= c.sigLen)
+            {
+                u16 x = 0;
+                if (!Process::Read16(a + i, x))
+                    return false;
+                const u16 w = (u16)((u32)want[i] | ((u32)want[i + 1] << 8));
+                if (x != w)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    static void InnAdd(int ci, u32 base)
+    {
+        for (int i = 0; i < g_innTabN[ci]; ++i)
+            if (g_innTab[ci][i] == base)
+                return;
+        if (g_innTabN[ci] < 8)
+            g_innTab[ci][g_innTabN[ci]++] = base;
+    }
+
+    // 読めない所はページ単位で飛ばしながら、16バイトおきに目印を探す
+    // 見つかった表は、武器・防具のどちらのものか調べて、それぞれに記録する
+    static void InnScanPass(u32 start, u32 end, u32 off)
+    {
+        u32 a = start + off;
+        while (a < end)
+        {
+            u32 v = 0;
+            if (!Process::Read32(a, v))
+            {
+                a = ((a | 0xFFFu) + 1) + off;
+                continue;
+            }
+            if (v == INN_MAGIC)
+                for (int ci = 0; ci < INN_CATS; ++ci)
+                    if (InnIsTable(g_innCats[ci], a))
+                        InnAdd(ci, a);
+            a += 16;
+        }
+    }
+
+    // 0=やめた 1=見つかった 2=見つからなかった
+    static int InnFind(int ci)
+    {
+        for (int c = 0; c < INN_CATS; ++c)     // 前回見つけた場所がまだ有効なものだけ残す
+        {
+            int k = 0;
+            for (int i = 0; i < g_innTabN[c]; ++i)
+                if (InnIsTable(g_innCats[c], g_innTab[c][i]))
+                    g_innTab[c][k++] = g_innTab[c][i];
+            g_innTabN[c] = k;
+        }
+        if (g_innTabN[ci] > 0)
+            return 1;
+
+        if (!(MessageBox("データの検索",
+                         "メモリから固有効果のデータ表を探します。\n数十秒かかることがあります。\n(最初の1回だけです)",
+                         DialogType::DialogYesNo))())
+            return 0;
+
+        static const u32 ranges[2][2] = { { 0x08000000u, 0x10000000u }, { 0x14000000u, 0x1C000000u } };
+        for (u32 off = 0; off < 16 && g_innTabN[ci] == 0; off += 4)
+            for (int r = 0; r < 2; ++r)
+                InnScanPass(ranges[r][0], ranges[r][1], off);
+        return g_innTabN[ci] > 0 ? 1 : 2;
+    }
+
+    static bool InnRead(int ci, u32 id, u16 &out)
+    {
+        return g_innTabN[ci] > 0 && Process::Read16(InnEffAddr(g_innCats[ci], g_innTab[ci][0], id), out);
+    }
+
+    static bool InnWrite(int ci, u32 id, u16 eff)
+    {
+        bool ok = false;
+        for (int i = 0; i < g_innTabN[ci]; ++i)
+        {
+            const u32 a = InnEffAddr(g_innCats[ci], g_innTab[ci][i], id);
+            u16 back = 0;
+            if (Process::Write16(a, eff) && Process::Read16(a, back) && back == eff)
+                ok = true;
+        }
+        return ok;
+    }
+
+    // 1件の効果を変える (元の値を保存しておく)。変更できたら true
+    static bool InnSet(int ci, u32 id, u16 eff)
+    {
+        const InnateCat &c = g_innCats[ci];
+        const u32 k = id - c.idMin;
+        u16 cur = 0;
+        InnRead(ci, id, cur);
+        if (!g_innHas[ci][k])
+        {
+            g_innOrig[ci][k] = cur;
+            g_innHas[ci][k]  = true;
+        }
+        if (!InnWrite(ci, id, eff))
+            return false;
+        if (eff == g_innOrig[ci][k])
+            g_innHas[ci][k] = false;
+        return true;
+    }
+
+    static std::string InnEffName(u32 id)
+    {
+        const char *n = LookupName(g_effectNames, id);
+        return n ? std::string(n) : Utils::Format("0x%04X", id);
+    }
+
+    // カテゴリ全体 / ID範囲を、同じ固有効果にまとめて変える
+    static void InnBulk(int ci)
+    {
+        const InnateCat &c = g_innCats[ci];
+        u32 from = c.idMin, to = c.idMax;
+
+        std::vector<std::string> sc;
+        sc.push_back(Utils::Format("%sすべて (%u件)", c.name, InnCount(c)));
+        sc.push_back("ID範囲を指定する");
+        Keyboard ks(Utils::Format("%sの固有効果を一括変更: 対象", c.name), sc);
+        const int s = ks.Open();
+        if (s < 0)
+            return;
+        if (s == 1)
+        {
+            if (!PickFromNames(Utils::Format("開始 [%s]", c.name), g_itemNames, true, c.idMin, c.idMax, c.idMin, from))
+                return;
+            if (!PickFromNames(Utils::Format("終了 [%s]", c.name), g_itemNames, true, from, c.idMax, c.idMax, to))
+                return;
+        }
+
+        std::vector<std::string> fl;
+        fl.push_back("すべて");
+        fl.push_back("今、固有効果が付いているものだけ");
+        fl.push_back("今、固有効果が「なし」のものだけ");
+        Keyboard kf("どれを変更しますか?", fl);
+        const int f = kf.Open();
+        if (f < 0)
+            return;
+
+        u32 eff = 0;
+        if (!PickFromNames(Utils::Format("固有効果 [%s 一括]", c.name), g_effectNames, false, 0, 0, 0, eff))
+            return;
+        if (eff > INN_EFFECT_MAX)
+        {
+            MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
+            return;
+        }
+
+        std::vector<u32> ids;
+        for (u32 id = from; id <= to; ++id)
+        {
+            u16 cur = 0;
+            if (!InnRead(ci, id, cur))
+                continue;
+            if (f == 1 && cur == 0)
+                continue;
+            if (f == 2 && cur != 0)
+                continue;
+            ids.push_back(id);
+        }
+        if (ids.empty())
+        {
+            MessageBox("対象なし", "条件に合うものがありません。")();
+            return;
+        }
+        if (!(MessageBox("確認",
+                         Utils::Format("%s %s から %s までのうち %u件の\n固有効果を\n%s\nにします。よろしいですか?",
+                                       c.name, IdName(from).c_str(), IdName(to).c_str(), (u32)ids.size(),
+                                       InnEffName(eff).c_str()),
+                         DialogType::DialogYesNo))())
+            return;
+
+        u32 n = 0;
+        for (u32 id : ids)
+            if (InnSet(ci, id, (u16)eff))
+                ++n;
+        MessageBox("変更しました",
+                   Utils::Format("%u 件の固有効果を\n%s\nにしました。\n装備を つけ直すと反映されます。", n,
+                                 InnEffName(eff).c_str()))();
+    }
+
+    static void InnateEditEntry(int ci)
+    {
+        const InnateCat &c = g_innCats[ci];
+        const int found = InnFind(ci);
+        if (found == 0)
+            return;
+        if (found == 2)
+        {
+            MessageBox("見つかりません", Utils::Format("%sのデータ表がメモリ上に見つかりませんでした。", c.name))();
+            return;
+        }
+
+        const u32 cnt = InnCount(c);
+        for (;;)
+        {
+            std::vector<std::string> rows;
+            rows.push_back("[カテゴリ全体を一括変更]");
+            rows.push_back("[変更をすべて元に戻す]");
+            for (u32 id = c.idMin; id <= c.idMax; ++id)
+            {
+                u16 e = 0;
+                InnRead(ci, id, e);
+                std::string s = IdName(id) + ": " + InnEffName(e);
+                if (g_innHas[ci][id - c.idMin])
+                    s += " *";
+                rows.push_back(s);
+            }
+            Keyboard kb(Utils::Format("%sの固有効果を変更 (*は変更済み。Bで戻る)", c.name), rows);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return;
+
+            if (sel == 0)
+            {
+                InnBulk(ci);
+                continue;
+            }
+            if (sel == 1)
+            {
+                u32 n = 0;
+                for (u32 k = 0; k < cnt; ++k)
+                    if (g_innHas[ci][k] && InnWrite(ci, c.idMin + k, g_innOrig[ci][k]))
+                    {
+                        g_innHas[ci][k] = false;
+                        ++n;
+                    }
+                MessageBox("元に戻しました", Utils::Format("%u 件を元に戻しました。", n))();
+                continue;
+            }
+
+            const u32 id = c.idMin + (u32)(sel - 2);
+            u16 cur = 0;
+            InnRead(ci, id, cur);
+            u32 pick = 0;
+            if (!PickFromNames(Utils::Format("固有効果 [%s]", IdName(id).c_str()), g_effectNames,
+                               false, 0, 0, cur, pick))
+                continue;
+            if (pick > INN_EFFECT_MAX)
+            {
+                MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
+                continue;
+            }
+            if (!InnSet(ci, id, (u16)pick))
+            {
+                MessageBox("失敗", "書き込めませんでした。")();
+                continue;
+            }
+            MessageBox("変更しました",
+                       IdName(id) + " の固有効果を\n" + InnEffName(pick) +
+                       "\nにしました。\n装備をつけ直すと反映されます。")();
+        }
+    }
+
+    static void WeaponInnateEntry(MenuEntry *entry) { (void)entry; InnateEditEntry(0); }
+    static void ArmorInnateEntry(MenuEntry *entry)  { (void)entry; InnateEditEntry(1); }
+
+    // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
     void PatchProcess(FwkSettings &settings)
@@ -2316,52 +2556,43 @@ namespace CTRPluginFramework
         if (Process::GetTitleID() != 0x00040000000E9C00ULL)
             OSD::Notify("Warning: unexpected title.");
 
-        // タイトルとバージョン表示。バージョン番号 (数字3つ) の版は使わず、名前に含める。
-        PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
+        PluginMenu *menu = new PluginMenu("ファンタジーライフ アイテムエディタ", 0, 2, 0,
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
 
-        // ---- メニューの表示順 (上から) ----
-        //   ライフ変更 / エリアワープ / 新しく装備したアイテムを編集 / アイテムを生成 /
-        //   アイテム一括生成 / アイテム一括削除 / カテゴリ別 一括変更 /
-        //   制作を即完了 / 制作の品質を固定 (AddQualityFix) / おすすめ (AddRecommended) / 以降
-        AddLifeChange(menu);
+        AddQualityFix(menu);
+        AddRecommended(menu);
 
-        menu->Append(new MenuEntry("エリアワープ", nullptr, WarpEntry,
-                                   "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
-                                   "出る場所は、選んだ行き先へ向かう扉の前です(扉がある側のエリア)。\n使う前に必ずバックアップを取ってください。"));
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
                                    "「Press Y to edit」と表示されてから約10秒の間だけYで編集できます。\n"
                                    "編集後、同じ装備をもう一度つけ直すと反映されます(そのつけ直しでは編集メニューは出ません)。\n"
                                    "武器・防具・ライフ道具8種すべてに対応しています。"));
-        menu->Append(new MenuEntry("アイテムを生成 (かばん)", nullptr, CreateItemEntry,
-                                   "IDを選ぶと、かばんの空き枠に新しいアイテムを作ります。\n"
-                                   "作成後、クオリティ・追加効果なども続けて編集できます。\n"
-                                   "必ずセーブのバックアップを取ってから使ってください。"));
-        menu->Append(new MenuEntry("アイテム一括生成 (かばん)", nullptr, BulkCreateEntry,
-                                   "カテゴリの全アイテム / ID範囲 / 同じアイテムN個 を、かばんの空き枠にまとめて作ります。\n"
-                                   "必ずセーブのバックアップを取ってから使ってください。"));
-        menu->Append(new MenuEntry("アイテム一括削除 (かばん)", nullptr, BulkDeleteEntry,
-                                   "かばんのアイテムを、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。\n"
-                                   "装備中のものは先に外してください。必ずセーブのバックアップを取ってから使ってください。"));
-        menu->Append(new MenuEntry("カテゴリ別 一括変更 (かばん)", nullptr, BulkEditEntry,
+        menu->Append(new MenuEntry("カテゴリ別 一括変更", nullptr, BulkEditEntry,
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の該当アイテムをまとめて変更します。\n"
                                    "変えたい項目を選んでから「決定して適用」で書き込みます。アイテムIDは、範囲を指定して被りなしの連番にするか、1件ずつ選べます。"));
 
-        AddQualityFix(menu);
-        AddRecommended(menu);
-
-        // ---- ここから「おすすめ」の後 ----
+        menu->Append(new MenuEntry("アイテムを生成 (かばんに追加)", nullptr, CreateItemEntry,
+                                   "IDを選ぶと、かばんの空き枠に新しいアイテムを作ります。\n"
+                                   "作成後、クオリティ・追加効果なども続けて編集できます。\n"
+                                   "必ずセーブのバックアップを取ってから使ってください。"));
+        menu->Append(new MenuEntry("アイテム一括削除", nullptr, BulkDeleteEntry,
+                                   "かばんのアイテムを、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。\n"
+                                   "装備中のものは先に外してください。必ずセーブのバックアップを取ってから使ってください。"));
+        menu->Append(new MenuEntry("アイテム一括生成", nullptr, BulkCreateEntry,
+                                   "カテゴリの全アイテム / ID範囲 / 同じアイテムN個 を、かばんの空き枠にまとめて作ります。\n"
+                                   "必ずセーブのバックアップを取ってから使ってください。"));
+        menu->Append(new MenuEntry("エリアワープ (実験)", nullptr, WarpEntry,
+                                   "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
+                                   "出る場所は、選んだ行き先へ向かう扉の前です(扉がある側のエリア)。\n使う前に必ずバックアップを取ってください。★のついた2つだけ動作確認済みです。"));
         menu->Append(new MenuEntry("探索ワープ (開発用)", nullptr, ExploreEntry,
-                                   "出たいエリアIDと入口番号を数字で指定して移動します(そのエリアの、その入口の前に出ます)。\n"
-                                   "入口番号の反対側のエリアが未登録のときは、確認が出ます。「扉の自動記録」で扉を通ると登録されます。\n"
+                                   "エリアIDを +1/-1/数字入力で移動し、着いた場所に名前をつけて記録します。\n"
+                                   "記録は SD直下の fll_warp_notes.txt にも追記されます。\n"
                                    "存在しないIDだと落ちる可能性があります。必ずバックアップを取ってください。"));
         menu->Append(new MenuEntry("扉の自動記録 (開発用)", DoorLogEntry, nullptr,
-                                   "有効にして扉を通ると、here(扉がある側)・dest(扉の向こう)・入口番号を記録します。\n"
-                                   "ここに出たい → here/入口番号、扉の先に出たい → dest/入口番号 で数字指定できます。\n"
+                                   "有効にして扉を通ると、行き先のエリアIDと入口番号を記録します。\n"
                                    "記録は SD直下の fll_warp_notes.txt に追記されます。"));
-
+        
         menu->Append(new MenuEntry("プレイヤー切り替え 直接版 (実験)", nullptr, PlayerSwitch::EntryDirect,
                                    "タイトルを経由せず、フィールドを片付けてから読み込みだけを行って戻ります。\n"
                                    "使う前に必ずセーブのバックアップを取ってください。切り替え後、確認できるまでセーブしないでください。\n"
@@ -2369,6 +2600,22 @@ namespace CTRPluginFramework
         menu->Append(new MenuEntry("プレイヤー切り替え タイトル経由 (実験)", nullptr, PlayerSwitch::EntryTitle,
                                    "タイトル画面を一瞬経由して、自動でスロットを選びます。"));
         menu->Callback(PlayerSwitch::OnFrame);
+
+        AddLifeChange(menu);
+
+        // 固有効果の変更 (メニューの一番下。ライフ道具は表が未特定のため、まだありません)
+        menu->Append(new MenuEntry("武器の固有効果を変更", nullptr, WeaponInnateEntry,
+                                   "武器ごとの固有効果を、メモリ上のデータ表を書き換えて変更します。\n"
+                                   "1つずつ変更するほか、カテゴリ全体 / ID範囲を同じ効果にまとめて変更できます。\n"
+                                   "同じIDの武器すべてに効きます。自分のゲームの中だけで有効で、ゲームを終了すると元に戻ります。\n"
+                                   "変更したあと、武器をつけ直すと反映されます。\n"
+                                   "最初の1回は、表の場所をメモリから探すため時間がかかります。"));
+        menu->Append(new MenuEntry("防具の固有効果を変更", nullptr, ArmorInnateEntry,
+                                   "防具ごとの固有効果を、メモリ上のデータ表を書き換えて変更します。\n"
+                                   "1つずつ変更するほか、カテゴリ全体 / ID範囲を同じ効果にまとめて変更できます。\n"
+                                   "同じIDの防具すべてに効きます。自分のゲームの中だけで有効で、ゲームを終了すると元に戻ります。\n"
+                                   "変更したあと、防具をつけ直すと反映されます。\n"
+                                   "最初の1回は、表の場所をメモリから探すため時間がかかります。"));
 
         menu->Run();
         delete menu;
