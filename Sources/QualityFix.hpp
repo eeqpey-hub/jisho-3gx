@@ -2,7 +2,7 @@
 //
 //  1) 制作の品質固定   : アイテム作成関数 0x3464B8 の入口で品質を書き換える
 //                        (武器・防具などは品質値、料理・薬・爆弾は極上IDへの差し替え)
-//  2) 制作を即完了     : 最初の入力の瞬間に工程番号を最終にして、完了の流れに入れる
+//  2) 制作を即完了     : 制作が始まって一定フレーム後に工程番号を最終にして、完了の流れに入れる
 //
 // 品質の値: 0=通常 1=上 2=特上 3=最高 4=ゴッド
 //   料理・薬・爆弾は「通常」と「極上」の2種類だけなので、3以上→極上 / 2以下→通常 にします。
@@ -192,8 +192,10 @@ extern "C"
 
     // 0xFFFFFFFF = 固定しない
     volatile u32 g_forceQuality = 0xFFFFFFFF;
-    // 0 = 通常 / 1 = 最初の入力で完了
+    // 0 = 通常 / 1 = 制作が始まって一定フレーム後に完了
     volatile u32 g_instantCraft = 0;
+    // 制作が始まってから、完了させるまで待つフレーム数 (60フレーム = 約1秒)
+    volatile u32 g_instantDelay = 8;
 
     // アイテム作成関数 0x3464B8 の入口で呼ばれる。req = 作成の依頼内容
     //   [req+0x00] できあがるID   [req+0x04] 元(通常)のID
@@ -235,14 +237,47 @@ extern "C"
         r[0x2C / 4] = q;
     }
 
-    // 0x420F48 (入力のたびに通る「最後の工程が完了したか」の判定) の前に呼ばれる。
+    // 0x41F1A8 (制作ミニゲームの毎フレームに通る「完了したか」の判定) の前に呼ばれる。
     //   obj = r4+0x20 の工程データ。 [obj+0xA28] = 現在の工程番号 A
-    //   ON のときは A を 0x23 (最大) にして、完了の流れに入れる。
+    //   ON のとき、制作が始まってから g_instantDelay フレーム後に A を 0x23 (最大) にして、
+    //   完了の流れに入れる。(ARコードと同じ効果。ただし工程アイコンを描いたあとに書く)
     //   そのあと、元の判定関数 0x2F5C6C を呼んで結果を返す。
     u32 InstantCompletePrepare(u32 obj)
     {
+        static u32  s_obj    = 0;
+        static u32  s_frames = 0;
+        static bool s_done   = false;
+
         if (g_instantCraft && obj >= 0x00100000 && obj < 0x20000000)
-            *(volatile u32 *)(obj + 0xA28) = 0x23;
+        {
+            volatile u32 *pA = (volatile u32 *)(obj + 0xA28);
+
+            if (obj != s_obj)                       // 別のオブジェクト = 新しい制作
+            {
+                s_obj    = obj;
+                s_frames = 0;
+                s_done   = false;
+            }
+            if (s_done && *pA != 0x23)              // 自分で書いた値が消えている = 新しい制作が始まった
+            {
+                s_frames = 0;
+                s_done   = false;
+            }
+
+            if (!s_done)
+            {
+                if (++s_frames >= g_instantDelay)
+                    s_done = true;
+            }
+            if (s_done)
+                *pA = 0x23;
+        }
+        else
+        {
+            s_obj    = 0;
+            s_frames = 0;
+            s_done   = false;
+        }
 
         typedef u32 (*CheckFn)(u32);
         return ((CheckFn)(uintptr_t)0x002F5C6C)(obj);
@@ -273,10 +308,11 @@ jp_hookQuality:
     .ltorg
 )");
 
-// ---- 即完了のフック (0x420F48) ----
-// 0x420F48: bl  0x2F5C6C        (EBFB5347)  ← ldr pc,[pc,#-4] に置き換え
-// 0x420F4C: add r6, r4, #0x1400 (E2846B05)  ← ジャンプ先アドレスを置く
-// 入ってくるとき r0 = r4+0x20。戻り値 r0 を保ったまま 0x420F50 (cmp r0,#0) へ戻る。
+// ---- 即完了のフック (0x41F1A8) ----
+// 0x41F1A8: bl  0x2F5C6C   (EBFB5AAF)  ← ldr pc,[pc,#-4] に置き換え
+// 0x41F1AC: cmp r0, #0     (E3500000)  ← ジャンプ先アドレスを置く
+// 入ってくるとき r0 = r4+0x20。判定結果 r0 を返し、cmp を実行して 0x41F1B0 へ戻る。
+// (0x41F1B0 以降は cmp の結果で条件実行されるので、cmp の直後にジャンプする)
 asm(R"(
     .arm
     .text
@@ -290,8 +326,8 @@ jp_hookComplete:
     bl    InstantCompletePrepare @ r0 = obj を渡し、判定結果を r0 で受ける
     vpop  {d0-d7}
     pop   {r1-r3, r12}
-    add   r6, r4, #0x1400        @ 0x420F4C の元命令
-    ldr   pc, =0x420F50          @ 続きの元コードへ
+    cmp   r0, #0                 @ 0x41F1AC の元命令
+    ldr   pc, =0x41F1B0          @ 続きの元コードへ
     .ltorg
 )");
 
@@ -364,9 +400,9 @@ namespace CTRPluginFramework
     // ------------------------------------------------------------
     //  制作の即完了
     // ------------------------------------------------------------
-    static constexpr u32 HOOK_COMPLETE      = 0x00420F48;
-    static constexpr u32 ORIG_COMPLETE_0    = 0xEBFB5347;   // bl 0x2F5C6C
-    static constexpr u32 ORIG_COMPLETE_1    = 0xE2846B05;   // add r6, r4, #0x1400
+    static constexpr u32 HOOK_COMPLETE      = 0x0041F1A8;
+    static constexpr u32 ORIG_COMPLETE_0    = 0xEBFB5AAF;   // bl 0x2F5C6C
+    static constexpr u32 ORIG_COMPLETE_1    = 0xE3500000;   // cmp r0, #0
     static bool g_completeHooked = false;
 
     static bool InstallCompleteHook(void)
@@ -402,12 +438,22 @@ namespace CTRPluginFramework
 
         std::vector<std::string> names;
         names.push_back("OFF (通常)");
-        names.push_back("ON (最初の入力で完了)");
+        names.push_back("ON (制作が始まって少し後に完了)");
 
         Keyboard kb("制作の即完了", names);
         int sel = kb.Open();
         if (sel < 0 || sel > 1)
             return;
+
+        if (sel == 1)
+        {
+            // 完了させるまで待つフレーム数 (60 = 約1秒)。工程アイコンが描かれたあとに書くための待ち時間
+            u32 frames = g_instantDelay;
+            Keyboard kb2("待つフレーム数 (60=約1秒、既定8)");
+            kb2.IsHexadecimal(false);
+            if (kb2.Open(frames, frames) == 0 && frames <= 600)
+                g_instantDelay = frames;
+        }
 
         g_instantCraft = (u32)sel;
         OSD::Notify(sel == 1 ? "Instant craft: ON" : "Instant craft: OFF");
@@ -416,8 +462,8 @@ namespace CTRPluginFramework
     static void AddQualityFix(PluginMenu *menu)
     {
         menu->Append(new MenuEntry("制作を即完了", nullptr, InstantCraftEntry,
-                                   "制作ミニゲームを、最初の入力で完了させます。\n"
-                                   "入力するまでは通常どおりの画面です。\n"
+                                   "制作ミニゲームを、始まって少し後に完了させます。\n"
+                                   "工程アイコンが出てから書き込むので、表示は崩れません。\n"
                                    "制作の前にONにして、終わったらOFFに戻してください。\n"
                                    "実機未検証です。必ずセーブのバックアップを取ってから使ってください。"));
 
