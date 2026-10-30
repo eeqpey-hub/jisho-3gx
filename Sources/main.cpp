@@ -45,6 +45,7 @@ static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
 #include "Life.hpp"
 #include "QualityFix.hpp"
+#include "MaterialZero.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -3383,7 +3384,8 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-
+        
+        AddMaterialZero(menu);
         AddLifeChange(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
