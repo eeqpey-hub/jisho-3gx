@@ -3267,8 +3267,7 @@ namespace CTRPluginFramework
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
 
-        AddQualityFix(menu);
-        AddRecommended(menu);
+        AddLifeChange(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
@@ -3280,7 +3279,7 @@ namespace CTRPluginFramework
                                    "変えたい項目を選んでから「決定して適用」で書き込みます。アイテムIDは、範囲を指定して被りなしの連番にするか、1件ずつ選べます。"));
 
         {
-            MenuFolder *gen = new MenuFolder("⚙アイテム生成",
+            MenuFolder *gen = new MenuFolder("アイテム生成",
                                              "かばん・倉庫の空き枠に新しいアイテムを作ります。必ずセーブのバックアップを取ってから使ってください。");
             gen->Append(new MenuEntry("アイテムを1つ生成", nullptr, CreateItemEntry,
                                       "カテゴリを選び、一覧から選んで1つ作ります。(ID入力も可)\n"
@@ -3296,7 +3295,7 @@ namespace CTRPluginFramework
             menu->Append(gen);
         }
         {
-            MenuFolder *del = new MenuFolder("⚙アイテム削除",
+            MenuFolder *del = new MenuFolder("アイテム削除",
                                              "かばん・倉庫のアイテムを削除します。装備中のものは消えません。必ずセーブのバックアップを取ってから使ってください。");
             del->Append(new MenuEntry("カテゴリ・未実装をまとめて削除", nullptr, BulkDeleteEntry,
                                       "かばんまたは倉庫で、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。"));
@@ -3323,6 +3322,9 @@ namespace CTRPluginFramework
                                    "有効にして扉を通ると、here(扉がある側)・dest(扉の向こう)・入口番号を記録します。\n"
                                    "ここに出たい → here/入口番号、扉の先に出たい → dest/入口番号 で数字指定できます。\n"
                                    "記録は SD直下の fll_warp_notes.txt に追記されます。"));
+
+        AddQualityFix(menu);
+        AddRecommended(menu);
         
         menu->Append(new MenuEntry("プレイヤー切り替え 直接版 (実験)", nullptr, PlayerSwitch::EntryDirect,
                                    "タイトルを経由せず、フィールドを片付けてから読み込みだけを行って戻ります。\n"
@@ -3331,8 +3333,7 @@ namespace CTRPluginFramework
         menu->Append(new MenuEntry("プレイヤー切り替え タイトル経由 (実験)", nullptr, PlayerSwitch::EntryTitle,
                                    "タイトル画面を一瞬経由して、自動でスロットを選びます。"));
         menu->Callback(PlayerSwitch::OnFrame);
-
-        AddLifeChange(menu);
+        
         menu->Run();
         delete menu;
         return 0;
