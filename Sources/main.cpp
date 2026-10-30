@@ -78,23 +78,45 @@ extern "C"
     // 座標 (x,y,z) は同じ値が複数の場所にある。GDBで、全部に書くと即座に移動し、
     // +0x7C だけだと、スティック操作のあとに反映されることを確認した。
     // 各コピーには「基準の座標との差」を足して書く (コピーごとに高さのずれがあるため)。
-    #define POS_IDLE_STATE      7        // タスクの状態バイト (task+624): フィールドで操作できるとき
-    #define POS_DELAY_FRAMES    20       // 操作できる状態が、これだけ続いたら書き始める
-    #define POS_FALLBACK_FRAMES 180      // 新しいプレイヤーを見つけてから、状態に関係なく書き始めるまで
+    // 「ゲームが初期位置に置く」ことを検出してから書く。タイミングが分からないので、
+    //  ・新しいプレイヤーのデータが出来て、位置が大きく動いたあと (= 配置された)、
+    //  ・位置が POS_SETTLE_FRAMES フレーム止まったら、書き始める。
+    //  配置が見えなかった場合は、POS_FALLBACK_FRAMES 待ってから書く。
+    //  書き始めたら、POS_HOLD_FRAMES フレームの間、毎フレーム書き続ける (あとからの上書きを直す)。
+    #define POS_JUMP_DIST       2.0f     // 1フレームでこれ以上動いたら「配置された」とみなす
+    #define POS_SETTLE_FRAMES   20
+    #define POS_FALLBACK_FRAMES 240
+    #define POS_LONG_FRAMES     900
     #define POS_REUSE_FRAMES    600      // プレイヤーのアドレスが変わらない場合の待ち
-    #define POS_HOLD_FRAMES     40       // 書き続けるフレーム数 (ゲーム側の初期配置に上書きされても直す)
+    #define POS_HOLD_FRAMES     120
     #define POS_TIMEOUT_FRAMES  (60 * 40)
+    #define POS_REC_MAX         900      // 経過の記録 (「位置ワープの記録を保存」で書き出せる)
 
-    volatile u32 g_posMode   = 0;        // 0 = なし / 1 = エリアの読み込み待ち / 2 = 書き込み中
-    volatile u32 g_posArea   = 0;
-    volatile u32 g_posOldObj = 0;
-    volatile u32 g_posFrames = 0;
-    volatile u32 g_posStable = 0;
-    volatile u32 g_posSince  = 0;
-    volatile u32 g_posSawGap = 0;
-    volatile u32 g_posHold   = 0;
-    volatile float g_posXYZ[3] = { 0.0f, 0.0f, 0.0f };
+    volatile u32 g_posMode     = 0;      // 0 = なし / 1 = エリアの読み込み待ち / 2 = 書き込み中
+    volatile u32 g_posArea     = 0;
+    volatile u32 g_posOldObj   = 0;
+    volatile u32 g_posFrames   = 0;
+    volatile u32 g_posSince    = 0;
+    volatile u32 g_posSettle   = 0;
+    volatile u32 g_posJumps    = 0;
+    volatile u32 g_posSawGap   = 0;
+    volatile u32 g_posHold     = 0;
+    volatile u32 g_posHaveLast = 0;
+    volatile float g_posLast[3] = { 0.0f, 0.0f, 0.0f };
+    volatile float g_posXYZ[3]  = { 0.0f, 0.0f, 0.0f };
 
+    volatile u32 g_recN = 0;
+    static u8    g_recMode[POS_REC_MAX];
+    static u16   g_recArea[POS_REC_MAX];
+    static u8    g_recState[POS_REC_MAX];
+    static u32   g_recObj[POS_REC_MAX];
+    static float g_recPos[POS_REC_MAX][3];
+
+    static float PosAbs(float v) { return v < 0.0f ? -v : v; }
+    static bool  PosSane(float v) { return v > -20000.0f && v < 20000.0f; }
+
+    // プレイヤーのデータを取る。クラスの種類 (vptr) では見分けず、
+    // 座標のコピー同士 (+0x7C と +0x40) が一致していることで確かめる。
     static u32 PosPlayerObj(void)
     {
         const u32 mgr = *(volatile u32 *)0x68BBB8;
@@ -103,7 +125,11 @@ extern "C"
         const u32 obj = *(volatile u32 *)(mgr + 0x7828);
         if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
             return 0;
-        if (*(volatile u32 *)obj != 0x671EB8u)      // cAppUnit の vptr (GDBで確認)
+        const float x = *(volatile float *)(obj + 0x7C), y = *(volatile float *)(obj + 0x80), z = *(volatile float *)(obj + 0x84);
+        const float x2 = *(volatile float *)(obj + 0x40), z2 = *(volatile float *)(obj + 0x60);
+        if (!PosSane(x) || !PosSane(y) || !PosSane(z) || !PosSane(x2) || !PosSane(z2))
+            return 0;
+        if (PosAbs(x - x2) > 1.0f || PosAbs(z - z2) > 1.0f)
             return 0;
         return obj;
     }
@@ -117,7 +143,7 @@ extern "C"
         const float cx = *(volatile float *)(obj + 0x7C);
         const float cy = *(volatile float *)(obj + 0x80);
         const float cz = *(volatile float *)(obj + 0x84);
-        if (!(cx > -20000.0f && cx < 20000.0f && cy > -20000.0f && cy < 20000.0f && cz > -20000.0f && cz < 20000.0f))
+        if (!PosSane(cx) || !PosSane(cy) || !PosSane(cz))
             return;                                  // 変な値 (NaNなど) のときは書かない
 
         const float dx = tx - cx, dy = ty - cy, dz = tz - cz;
@@ -126,6 +152,14 @@ extern "C"
         for (unsigned i = 0; i < sizeof(offX) / sizeof(offX[0]); ++i) *(volatile float *)(obj + offX[i]) += dx;
         for (unsigned i = 0; i < sizeof(offY) / sizeof(offY[0]); ++i) *(volatile float *)(obj + offY[i]) += dy;
         for (unsigned i = 0; i < sizeof(offZ) / sizeof(offZ[0]); ++i) *(volatile float *)(obj + offZ[i]) += dz;
+    }
+
+    static void PosResetDetect(void)
+    {
+        g_posSince    = 0;
+        g_posSettle   = 0;
+        g_posJumps    = 0;
+        g_posHaveLast = 0;
     }
 
     // ゲーム本体のスレッドから、毎フレーム呼ばれる。
@@ -137,8 +171,28 @@ extern "C"
         const u32 obj   = PosPlayerObj();
         const u32 area  = *(volatile u16 *)(task + 0x6B2);
         const u32 state = *(volatile u8 *)(task + 624);
+        float p[3] = { 0.0f, 0.0f, 0.0f };
+        if (obj)
+        {
+            p[0] = *(volatile float *)(obj + 0x7C);
+            p[1] = *(volatile float *)(obj + 0x80);
+            p[2] = *(volatile float *)(obj + 0x84);
+        }
 
         g_posFrames = g_posFrames + 1;
+
+        const u32 n = g_recN;                        // 経過の記録
+        if (n < POS_REC_MAX)
+        {
+            g_recMode[n]   = (u8)g_posMode;
+            g_recArea[n]   = (u16)area;
+            g_recState[n]  = (u8)state;
+            g_recObj[n]    = obj;
+            g_recPos[n][0] = p[0];
+            g_recPos[n][1] = p[1];
+            g_recPos[n][2] = p[2];
+            g_recN         = n + 1;
+        }
 
         if (g_posMode == 1)                          // エリアの読み込み待ち
         {
@@ -150,8 +204,7 @@ extern "C"
             if (!obj)
             {
                 g_posSawGap = 1;                     // 読み込み中は、プレイヤーのデータが一時的になくなる
-                g_posStable = 0;
-                g_posSince  = 0;
+                PosResetDetect();
                 return;
             }
             bool fresh = (obj != g_posOldObj) || g_posSawGap;
@@ -159,16 +212,35 @@ extern "C"
                 fresh = true;
             if (area != g_posArea || !fresh)
             {
-                g_posStable = 0;
-                g_posSince  = 0;
+                PosResetDetect();
                 return;
             }
+
             g_posSince = g_posSince + 1;
-            if (state == POS_IDLE_STATE)
-                g_posStable = g_posStable + 1;
-            else
-                g_posStable = 0;
-            if (g_posStable >= POS_DELAY_FRAMES || g_posSince >= POS_FALLBACK_FRAMES)
+            if (g_posHaveLast)
+            {
+                float m = PosAbs(p[0] - g_posLast[0]);
+                const float my = PosAbs(p[1] - g_posLast[1]);
+                const float mz = PosAbs(p[2] - g_posLast[2]);
+                if (my > m) m = my;
+                if (mz > m) m = mz;
+                if (m > POS_JUMP_DIST)
+                {
+                    g_posJumps  = g_posJumps + 1;    // ゲームが位置を置いた
+                    g_posSettle = 0;
+                }
+                else if (m == 0.0f)
+                    g_posSettle = g_posSettle + 1;
+                else
+                    g_posSettle = 0;
+            }
+            g_posLast[0] = p[0];
+            g_posLast[1] = p[1];
+            g_posLast[2] = p[2];
+            g_posHaveLast = 1;
+
+            const bool settled = g_posSettle >= POS_SETTLE_FRAMES;
+            if ((settled && (g_posJumps >= 1 || g_posSince >= POS_FALLBACK_FRAMES)) || g_posSince >= POS_LONG_FRAMES)
             {
                 g_posHold = 0;
                 g_posMode = 2;
@@ -2460,10 +2532,10 @@ namespace CTRPluginFramework
         g_posArea     = p.area;
         g_posOldObj   = obj;
         g_posFrames   = 0;
-        g_posStable   = 0;
-        g_posSince    = 0;
         g_posSawGap   = 0;
         g_posHold     = 0;
+        PosResetDetect();
+        g_recN        = 0;
 
         if (g_warpTask != 0 && obj && cur == p.area)
         {
@@ -2527,6 +2599,51 @@ namespace CTRPluginFramework
         MessageBox("保存しました",
                    Utils::Format("%s\nエリアID %u\nx %s / y %s / z %s\n\n「エリアワープ」の一覧の末尾に追加しました。",
                                  p.name.c_str(), p.area, Fmt2(p.x).c_str(), Fmt2(p.y).c_str(), Fmt2(p.z).c_str()))();
+    }
+
+    // 保存位置へのワープの経過 (毎フレームの、エリアID・状態・座標) を SD に書き出す。うまくいかないときの調査用。
+    static void PosDumpEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        const u32 n = g_recN;
+        if (n == 0)
+        {
+            MessageBox("記録がありません", "保存位置へのワープを実行したあとで、もう一度実行してください。")();
+            return;
+        }
+    #if WARP_POINTS_TO_FILE
+        File f;
+        if (File::Open(f, "/fll_warp_notes.txt", File::WRITE | File::CREATE | File::APPEND) != 0)
+        {
+            MessageBox("書き出せません", "fll_warp_notes.txt を開けませんでした。")();
+            return;
+        }
+        f.WriteLine(Utils::Format("TL-BEGIN target_area=%u frames=%u", (u32)g_posArea, n));
+        for (u32 i = 0; i < n; ++i)
+        {
+            f.WriteLine(Utils::Format("TL %u m%u a%u s%u o%X  %s %s %s", i, (u32)g_recMode[i], (u32)g_recArea[i], (u32)g_recState[i],
+                                      g_recObj[i], Fmt2(g_recPos[i][0]).c_str(), Fmt2(g_recPos[i][1]).c_str(), Fmt2(g_recPos[i][2]).c_str()));
+        }
+        f.WriteLine("TL-END");
+        f.Close();
+    #endif
+        MessageBox("書き出しました", Utils::Format("%u 行を fll_warp_notes.txt に書き出しました。", n))();
+    }
+
+    // 位置ワープの状態が変わったときに、画面に通知する (プラグイン側のフレームごとの処理)
+    static void PosNotifyFrame(void)
+    {
+        static u32 lastMode = 0;
+        const u32 m = g_posMode;
+        if (m == lastMode)
+            return;
+        if (m == 2)
+            OSD::Notify("Pos: placing...");
+        else if (m == 0 && lastMode == 2)
+            OSD::Notify("Pos: done");
+        else if (m == 0 && lastMode == 1)
+            OSD::Notify("Pos: gave up (timeout)");
+        lastMode = m;
     }
 
     // メニューから選んだときに1回だけ実行される (有効/無効の切り替えではない)
@@ -3322,6 +3439,9 @@ namespace CTRPluginFramework
                                    "有効にして扉を通ると、here(扉がある側)・dest(扉の向こう)・入口番号を記録します。\n"
                                    "ここに出たい → here/入口番号、扉の先に出たい → dest/入口番号 で数字指定できます。\n"
                                    "記録は SD直下の fll_warp_notes.txt に追記されます。"));
+        menu->Append(new MenuEntry("位置ワープの記録を保存 (開発用)", nullptr, PosDumpEntry,
+                                   "保存位置へのワープの経過 (毎フレームの状態と座標) を、fll_warp_notes.txt に書き出します。\n"
+                                   "別のエリアの保存位置へうまく移動できないときの、調査用です。"));
 
         AddQualityFix(menu);
         AddRecommended(menu);
@@ -3333,6 +3453,7 @@ namespace CTRPluginFramework
         menu->Append(new MenuEntry("プレイヤー切り替え タイトル経由 (実験)", nullptr, PlayerSwitch::EntryTitle,
                                    "タイトル画面を一瞬経由して、自動でスロットを選びます。"));
         menu->Callback(PlayerSwitch::OnFrame);
+        menu->Callback(PosNotifyFrame);
         
         menu->Run();
         delete menu;
