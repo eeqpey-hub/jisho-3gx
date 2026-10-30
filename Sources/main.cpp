@@ -182,16 +182,19 @@ namespace CTRPluginFramework
         const char *atkName;
         const char *matkName;
         bool stackable;      // true: 同じ種類を1枠にまとめる (素材・消耗品)
-        int  offName;        // 製作者名 (UTF-16LE 最大6文字=12バイト) の位置 / -1 = なし
     };
+
+    // 素材・消耗品のクオリティの位置。【未検証の仮置き】武器と同じ +0x10 と推測している。
+    // 違っていたら、かばんの素材をHexダンプで見て、ここだけ直す。
+    static constexpr int MAT_QUALITY_OFF = 0x10;
 
     static const Category g_cats[] =
     {
-        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力", false, 0x20 },
-        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力", false, 0x24 },
-        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr, false, 0x10 },
-        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr, false, 0x10 },
-        { "素材・消耗品", 0x05C5, 0x09FE, -1, -1, -1, -1, nullptr, nullptr, true, -1 },
+        { "武器",       0x0000, 0x008F, 0x10, 0x12, 0x1A, 0x1E, "攻撃力", "魔法攻撃力", false },
+        { "防具",       0x0099, 0x0386, 0x12, 0x14, 0x1A, 0x1E, "防御力", "魔法防御力", false },
+        { "ライフ道具", 0x0387, 0x0435, 0x1E, 0x20, 0x26,   -1, "道具力", nullptr, false },
+        { "家具",       0x0436, 0x05C4, 0x20,   -1,   -1,   -1, nullptr,  nullptr, false },
+        { "素材・消耗品", 0x05C5, 0x09FE, MAT_QUALITY_OFF, -1, -1, -1, nullptr, nullptr, true },
     };
 
     static constexpr int K_NORMAL = 0;
@@ -756,7 +759,7 @@ namespace CTRPluginFramework
         }
         const u32 N = (u32)slots.size();
 
-        std::vector<Field> fields = FieldsFor(&cat, cat.stackable);   // [0]=ID、[1]以降=ほかの項目 (個数は素材・消耗品だけ)
+        std::vector<Field> fields = FieldsFor(&cat, false);   // [0]=ID、[1]以降=ほかの項目 (個数は出さない)
         const size_t F = fields.size();
         std::vector<bool> use(F, false);        // その項目を変更するか
         std::vector<u32>  val(F, 0);            // 変更後の値
@@ -895,7 +898,7 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
-    //  アイテム生成 / 一括生成 (かばん・倉庫の連結リストを直接操作)
+    //  アイテム生成 / 一括生成 / 一括削除 (かばんの連結リストを直接操作)
     //
     //  ゲーム本人が1個買ったときのRAM差分(Before/After)から分かったこと:
     //   ・行の本体は 0x38 バイト。行の直前4バイト(= 前の行の +0x38)が (次u16,前u16) のリンク。
@@ -904,88 +907,57 @@ namespace CTRPluginFramework
     //   ・新しい行は 499 番から使われ、行は「ID・個数=1・+0xC=FFFE・+0xE=1・+0x28から 1,2,3,4」
     //     以外は 0 で初期化される。(防具で確認。他の種類は未検証)
     // ------------------------------------------------------------
-    //   ・倉庫も同じ作り(ダンプで確認: 管理領域 0x6DCD70、リンク配列 0x6E5460、1500枠、先頭は1499番から)。
+    static constexpr u32 LIVE_BASE  = 0x006DCD2C;          // かばん管理領域
+    static constexpr u32 LIVE_LINKP = LIVE_BASE + 0x08;    // リンク配列(=BAG_BASE-4)へのポインタ
+    static constexpr u32 LIVE_COUNT = LIVE_BASE + 0x1C;    // 件数 (u16)
+    static constexpr u32 LIVE_HEAD  = LIVE_BASE + 0x1E;    // 先頭の行番号 (u16)
     static constexpr u32 ROW_DATA   = 0x38;
     static constexpr u16 NO_LINK    = 0xFFFF;
+    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行に入っていたID (削除時にこれを書く・推測)
     static constexpr size_t DUP_THRESHOLD = 3;             // 名前がこの件数以上かぶると「未実装」とみなす
 
-    // 連結リストを持つ入れ物。live=管理領域 (+8 リンク配列のアドレス、+0x1C 件数、+0x1E 先頭)
-    // リンク配列のk番目 = linkBase + 0x3C*k、行のk番目 = linkBase + 4 + 0x3C*k
-    struct Container
-    {
-        const char *name;
-        u32 live;
-        u32 linkBase;
-        u32 slots;
-        u32 arr;      // 空き枠の番号表 (u16 が slots 個)。管理領域の +0x10 が指す
-    };
-    static const Container g_bag   = { "かばん", 0x006DCD2C, 0x006DDF28,  500, 0x006DCDF8 };
-    static const Container g_store = { "倉庫",   0x006DCD70, 0x006E5460, 1500, 0x006DD1E0 };
+    static u32 LinkAddr(u32 slot) { return BAG_BASE - 4 + slot * SLOT_SIZE; }
 
     struct BagState
     {
-        const Container  *c = &g_bag;
         std::vector<u16>  order;   // 先頭から末尾までの行番号
         std::vector<bool> used;
-        u16               authorMark = 0x16D7;   // 製作者名つきの行の +0xE の値 (かばん内の実物から取る)
     };
 
-    static u32 RowOf(const BagState &b, u32 slot) { return b.c->linkBase + 4 + slot * SLOT_SIZE; }
-    static u32 LnkOf(const BagState &b, u32 slot) { return b.c->linkBase + slot * SLOT_SIZE; }
-
     // 管理領域と連結リストを読む。想定と違えば false (何も書かない)
-    static bool LoadBag(BagState &b, const Container &c, std::string &err)
+    static bool LoadBag(BagState &b, std::string &err)
     {
-        b.c = &c;
         u32 p = 0;
-        if (!Process::Read32(c.live + 0x08, p) || p != c.linkBase)
+        if (!Process::Read32(LIVE_LINKP, p) || p != BAG_BASE - 4)
         {
-            err = Utils::Format("%sの管理領域が想定と違います。(バージョン違いの可能性。何も書いていません)", c.name);
-            return false;
-        }
-        u32 ap = 0;
-        if (!Process::Read32(c.live + 0x10, ap) || ap != c.arr)
-        {
-            err = Utils::Format("%sの空き枠の表が想定と違います。(何も書いていません)", c.name);
+            err = "かばんの管理領域が想定と違います。(バージョン違いの可能性。何も書いていません)";
             return false;
         }
         u16 head = 0, cnt = 0;
-        if (!Process::Read16(c.live + 0x1E, head) || !Process::Read16(c.live + 0x1C, cnt))
+        if (!Process::Read16(LIVE_HEAD, head) || !Process::Read16(LIVE_COUNT, cnt))
         {
             err = "管理領域を読めません。";
             return false;
         }
         b.order.clear();
-        b.used.assign(c.slots, false);
+        b.used.assign(BAG_SLOTS, false);
         u16 idx = head;
         while (idx != NO_LINK)
         {
-            if (idx >= c.slots || b.used[idx] || b.order.size() >= c.slots)
+            if (idx >= BAG_SLOTS || b.used[idx] || b.order.size() >= BAG_SLOTS)
             {
-                err = Utils::Format("%sの連結リストが想定と違います。(何も書いていません)", c.name);
+                err = "かばんの連結リストが想定と違います。(何も書いていません)";
                 return false;
             }
             b.used[idx] = true;
             b.order.push_back(idx);
             u16 next = 0;
-            if (!Process::Read16(LnkOf(b, idx), next))
+            if (!Process::Read16(LinkAddr(idx), next))
             {
                 err = "リンクを読めません。";
                 return false;
             }
             idx = next;
-        }
-        // 製作者名つきの行は +0xE が 0x16D7 (名前なしの行は 0x0001)。かばんに実物があればその値を使う
-        b.authorMark = 0x16D7;
-        for (u16 s : b.order)
-        {
-            u16 c0 = 0, e = 0;
-            if (Process::Read16(RowOf(b, s) + 0x0C, c0) && Process::Read16(RowOf(b, s) + 0x0E, e) &&
-                c0 == 0xFFFE && e != 0 && e != 1)
-            {
-                b.authorMark = e;
-                break;
-            }
         }
         if (cnt != (u16)b.order.size())
         {
@@ -998,7 +970,7 @@ namespace CTRPluginFramework
 
     static int PickFreeRow(const BagState &b)
     {
-        for (int k = (int)b.c->slots - 1; k >= 0; --k)
+        for (int k = (int)BAG_SLOTS - 1; k >= 0; --k)
             if (!b.used[k])
                 return k;
         return -1;
@@ -1007,27 +979,15 @@ namespace CTRPluginFramework
     static u32 FreeRows(const BagState &b)
     {
         u32 n = 0;
-        for (u32 k = 0; k < b.c->slots; ++k)
+        for (u32 k = 0; k < BAG_SLOTS; ++k)
             if (!b.used[k])
                 ++n;
         return n;
     }
 
-    // 空き枠の表を作り直す。ゲームは「表の arr[件数] を次に使う枠」として取り出し、
-    // 削除では arr[件数-1] に外した枠を入れる。arr[件数 以降] = 今あいている枠すべて、が成り立つ必要がある。
-    // (これが崩れると、次にゲームがアイテムを入手したときに使用中の枠を取り出してフリーズする)
-    static void SyncFreeArray(const BagState &b)
-    {
-        u32 w = (u32)b.order.size();
-        for (int k = (int)b.c->slots - 1; k >= 0; --k)
-            if (!b.used[k])
-                Process::Write16(b.c->arr + (w++) * 2, (u16)k);
-    }
-
     static void CommitCount(const BagState &b)
     {
-        Process::Write16(b.c->live + 0x1C, (u16)b.order.size());
-        SyncFreeArray(b);
+        Process::Write16(LIVE_COUNT, (u16)b.order.size());
     }
 
     // ------------------------------------------------------------
@@ -1039,198 +999,7 @@ namespace CTRPluginFramework
         std::vector<Field> fields;
         std::vector<bool>  use;
         std::vector<u32>   val;
-        // 製作者名 (武器・防具・ライフ道具・家具だけ)
-        bool               hasName = false;
-        bool               useName = false;
-        u32                nameOff = 0;
-        std::vector<u16>   name;       // 最大6文字 (UTF-16)
     };
-
-    // ---- 製作者名の入力 ----
-    static constexpr size_t NAME_CHARS = 6;
-
-    static std::vector<u16> Utf8ToUtf16(const std::string &s)
-    {
-        std::vector<u16> o;
-        size_t i = 0;
-        while (i < s.size())
-        {
-            const u8 c = (u8)s[i];
-            u32 cp = 0;
-            size_t n = 0;
-            if (c < 0x80)              { cp = c;        n = 1; }
-            else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; n = 2; }
-            else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; n = 3; }
-            else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; n = 4; }
-            else { ++i; continue; }
-            if (i + n > s.size())
-                break;
-            for (size_t k = 1; k < n; ++k)
-                cp = (cp << 6) | ((u8)s[i + k] & 0x3F);
-            i += n;
-            if (cp != 0 && cp <= 0xFFFF)
-                o.push_back((u16)cp);
-        }
-        return o;
-    }
-
-    static std::string Utf16ToUtf8(const std::vector<u16> &v)
-    {
-        std::string o;
-        for (u16 c : v)
-        {
-            if (c == 0)
-                break;
-            if (c < 0x80)
-                o += (char)c;
-            else if (c < 0x800)
-            {
-                o += (char)(0xC0 | (c >> 6));
-                o += (char)(0x80 | (c & 0x3F));
-            }
-            else
-            {
-                o += (char)(0xE0 | (c >> 12));
-                o += (char)(0x80 | ((c >> 6) & 0x3F));
-                o += (char)(0x80 | (c & 0x3F));
-            }
-        }
-        return o;
-    }
-
-    static const char *const KANA_ROWS[] =
-    {
-        "あいうえお", "かきくけこ", "さしすせそ", "たちつてと", "なにぬねの",
-        "はひふへほ", "まみむめも", "やゆよ", "らりるれろ", "わをん",
-        "がぎぐげご", "ざじずぜぞ", "だぢづでど", "ばびぶべぼ", "ぱぴぷぺぽ", "ぁぃぅぇぉっゃゅょ",
-        "アイウエオ", "カキクケコ", "サシスセソ", "タチツテト", "ナニヌネノ",
-        "ハヒフヘホ", "マミムメモ", "ヤユヨ", "ラリルレロ", "ワヲン",
-        "ガギグゲゴ", "ザジズゼゾ", "ダヂヅデド", "バビブベボ", "パピプペポ", "ヴァィゥェォッャュョ",
-        "０１２３４５６７８９", "ＡＢＣＤＥＦＧＨＩＪ", "ＫＬＭＮＯＰＱＲＳＴ", "ＵＶＷＸＹＺ", "ー・！？"
-    };
-
-    // かばん・倉庫の中にある、製作者名つきのアイテムから名前をコピーする
-    static bool CopyNameFromBag(std::vector<u16> &out)
-    {
-        std::vector<std::string> labels;
-        std::vector<std::vector<u16> > names;
-        const Container *conts[2] = { &g_bag, &g_store };
-        for (const Container *ct : conts)
-        {
-            BagState b;
-            std::string err;
-            if (!LoadBag(b, *ct, err))
-                continue;
-            for (u16 s : b.order)
-            {
-                u32 id = 0;
-                Process::Read32(RowOf(b, s) + OFF_ID, id);
-                const Category *cg = FindCategory((u16)id);
-                if (!cg || cg->offName < 0)
-                    continue;
-                std::vector<u16> nm;
-                for (size_t i = 0; i < NAME_CHARS; ++i)
-                {
-                    u16 ch = 0;
-                    Process::Read16(RowOf(b, s) + (u32)cg->offName + (u32)i * 2, ch);
-                    if (ch == 0)
-                        break;
-                    nm.push_back(ch);
-                }
-                if (nm.empty())
-                    continue;
-                labels.push_back(Utils::Format("%s%u枠目 %s: ", ct->name, s + 1, IdName(id).c_str()) + Utf16ToUtf8(nm));
-                names.push_back(nm);
-                if (labels.size() >= 60)
-                    break;
-            }
-        }
-        if (labels.empty())
-        {
-            MessageBox("コピーできません", "かばん・倉庫に、製作者名つきのアイテムがありません。")();
-            return false;
-        }
-        Keyboard kb("名前をコピーするアイテム", labels);
-        const int sel = kb.Open();
-        if (sel < 0)
-            return false;
-        out = names[sel];
-        return true;
-    }
-
-    // 製作者名を決める。決定したら true (name に入る)、キャンセルなら false
-    static bool AskMakerName(std::vector<u16> &name)
-    {
-        std::vector<u16> cur = name;
-        for (;;)
-        {
-            std::vector<std::string> rows;
-            rows.push_back("[かな・記号を1文字追加]");
-            rows.push_back("[キーボードで英数字を入力]");
-            rows.push_back("[かばんのアイテムから名前をコピー]");
-            rows.push_back("[1文字消す]");
-            rows.push_back("[全部消す]");
-            rows.push_back("[決定]");
-            Keyboard kb(Utils::Format("製作者名: 「%s」 (%u/%u文字)", Utf16ToUtf8(cur).c_str(),
-                                      (u32)cur.size(), (u32)NAME_CHARS), rows);
-            const int sel = kb.Open();
-            if (sel < 0)
-                return false;
-            if (sel == 5)
-            {
-                name = cur;
-                return true;
-            }
-            if (sel == 0)
-            {
-                if (cur.size() >= NAME_CHARS)
-                {
-                    MessageBox("文字数", "6文字までです。")();
-                    continue;
-                }
-                std::vector<std::string> groups;
-                for (const char *g : KANA_ROWS)
-                    groups.push_back(g);
-                Keyboard kg("文字の行を選ぶ", groups);
-                const int gi = kg.Open();
-                if (gi < 0)
-                    continue;
-                const std::vector<u16> chars = Utf8ToUtf16(KANA_ROWS[gi]);
-                std::vector<std::string> cs;
-                for (u16 c : chars)
-                    cs.push_back(Utf16ToUtf8(std::vector<u16>(1, c)));
-                Keyboard kk("文字を選ぶ", cs);
-                const int ki = kk.Open();
-                if (ki >= 0)
-                    cur.push_back(chars[ki]);
-            }
-            else if (sel == 1)
-            {
-                std::string in;
-                Keyboard ka("英数字を入力 (最大6文字)");
-                if (ka.Open(in) == 0)
-                {
-                    std::vector<u16> v = Utf8ToUtf16(in);
-                    if (v.size() > NAME_CHARS)
-                        v.resize(NAME_CHARS);
-                    cur = v;
-                }
-            }
-            else if (sel == 2)
-            {
-                std::vector<u16> v;
-                if (CopyNameFromBag(v))
-                    cur = v;
-            }
-            else if (sel == 3)
-            {
-                if (!cur.empty())
-                    cur.pop_back();
-            }
-            else if (sel == 4)
-                cur.clear();
-        }
-    }
 
     static u32 SpecValue(const GenSpec *sp, u32 off, u32 def)
     {
@@ -1250,25 +1019,16 @@ namespace CTRPluginFramework
         const size_t F = sp.fields.size();
         sp.use.assign(F, false);
         sp.val.assign(F, 0);
-        sp.hasName = (cat && cat->offName >= 0);
-        sp.useName = false;
-        sp.nameOff = sp.hasName ? (u32)cat->offName : 0;
-        sp.name.clear();
         count = 1;
-        if (F == 0 && !sp.hasName)
+        if (F == 0)
             return true;
 
-        const size_t N    = sp.hasName ? 1 : 0;
-        const size_t iGen = F + N;
         for (;;)
         {
             std::vector<std::string> rows;
             for (size_t i = 0; i < F; ++i)
                 rows.push_back(sp.fields[i].label + ": " +
                                (sp.use[i] ? FmtValue(sp.fields[i], sp.val[i]) : std::string("指定しない")));
-            if (sp.hasName)
-                rows.push_back(std::string("製作者名: ") +
-                               (sp.useName ? "「" + Utf16ToUtf8(sp.name) + "」" : std::string("指定しない")));
             rows.push_back("[この内容で生成]");
             rows.push_back("[すべて指定しないに戻す]");
 
@@ -1276,23 +1036,11 @@ namespace CTRPluginFramework
             const int sel = kb.Open();
             if (sel < 0)
                 return false;
-            if ((size_t)sel == iGen)
+            if ((size_t)sel == F)
                 break;
-            if ((size_t)sel == iGen + 1)
+            if ((size_t)sel == F + 1)
             {
                 for (size_t i = 0; i < F; ++i) { sp.use[i] = false; sp.val[i] = 0; }
-                sp.useName = false;
-                sp.name.clear();
-                continue;
-            }
-            if (sp.hasName && (size_t)sel == F)
-            {
-                std::vector<u16> nm = sp.name;
-                if (AskMakerName(nm))
-                {
-                    sp.name    = nm;
-                    sp.useName = !nm.empty();
-                }
                 continue;
             }
             u32 cur = sp.use[sel] ? sp.val[sel] : 0, v = 0;
@@ -1314,8 +1062,6 @@ namespace CTRPluginFramework
         for (size_t i = 0; i < sp.fields.size(); ++i)
             if (sp.use[i])
                 s += "・" + sp.fields[i].label + ": " + FmtValue(sp.fields[i], sp.val[i]) + "\n";
-        if (sp.useName)
-            s += "・製作者名: " + Utf16ToUtf8(sp.name) + "\n";
         return s;
     }
 
@@ -1374,7 +1120,7 @@ namespace CTRPluginFramework
     // 空き行 row に新しいアイテムを作り、リストの末尾につなぐ (件数はここでは更新しない)
     static void AppendRow(BagState &b, u32 row, u32 id, u32 count, const GenSpec *sp)
     {
-        const u32 base = RowOf(b, row);
+        const u32 base = SlotAddr(row);
         for (u32 o = 0; o < ROW_DATA; o += 4)
             Process::Write32(base + o, 0);
         Process::Write32(base + OFF_ID, id);
@@ -1391,24 +1137,13 @@ namespace CTRPluginFramework
                 if (sp->use[i] && sp->fields[i].off != OFF_COUNT)
                     WriteField(base, sp->fields[i], sp->val[i]);
 
-        // 製作者名: UTF-16LE で最大6文字(12バイト)。余りは0。名前つきの行は +0xE に印が付き、
-        // 末尾の 1,2,3,4 の目印は無い (実物の行に合わせる)
-        if (sp && sp->useName)
-        {
-            for (u32 o = 0x28; o < ROW_DATA; o += 4)
-                Process::Write32(base + o, 0);
-            for (u32 i = 0; i < NAME_CHARS; ++i)
-                Process::Write16(base + sp->nameOff + i * 2, i < sp->name.size() ? sp->name[i] : (u16)0);
-            Process::Write16(base + 0x0E, b.authorMark);
-        }
-
         const u16 tail = b.order.empty() ? NO_LINK : b.order.back();
-        Process::Write16(LnkOf(b, row),     NO_LINK);
-        Process::Write16(LnkOf(b, row) + 2, tail);
+        Process::Write16(LinkAddr(row),     NO_LINK);
+        Process::Write16(LinkAddr(row) + 2, tail);
         if (tail != NO_LINK)
-            Process::Write16(LnkOf(b, tail), (u16)row);
+            Process::Write16(LinkAddr(tail), (u16)row);
         else
-            Process::Write16(b.c->live + 0x1E, (u16)row);
+            Process::Write16(LIVE_HEAD, (u16)row);
 
         b.order.push_back((u16)row);
         b.used[row] = true;
@@ -1425,21 +1160,21 @@ namespace CTRPluginFramework
             for (u16 s : b.order)
             {
                 u32 cur = 0;
-                if (!Process::Read32(RowOf(b, s) + OFF_ID, cur) || cur != id)
+                if (!Process::Read32(SlotAddr(s) + OFF_ID, cur) || cur != id)
                     continue;
                 if (cat && cat->offQuality >= 0)
                 {
                     u8 q = 0;
-                    Process::Read8(RowOf(b, s) + (u32)cat->offQuality, q);
+                    Process::Read8(SlotAddr(s) + (u32)cat->offQuality, q);
                     if (q != wantQ)
                         continue;
                 }
                 u16 c = 0;
-                Process::Read16(RowOf(b, s) + OFF_COUNT, c);
+                Process::Read16(SlotAddr(s) + OFF_COUNT, c);
                 u32 n = c + count;
                 if (n > MAX_COUNT)
                     n = MAX_COUNT;
-                Process::Write16(RowOf(b, s) + OFF_COUNT, (u16)n);
+                Process::Write16(SlotAddr(s) + OFF_COUNT, (u16)n);
                 return (int)s;
             }
         }
@@ -1450,50 +1185,13 @@ namespace CTRPluginFramework
         return f;
     }
 
-    // ------------------------------------------------------------
-    //  アイテム生成の画面 (かばん/倉庫を選ぶ → カテゴリを選ぶ → その中から選ぶ)
-    // ------------------------------------------------------------
-    static bool AskTarget(const std::string &title, const Container *&c)
+    static void CreateItemEntry(MenuEntry *entry)
     {
-        std::vector<std::string> v;
-        v.push_back(g_bag.name);
-        v.push_back(g_store.name);
-        Keyboard k(title, v);
-        const int s = k.Open();
-        if (s < 0)
-            return false;
-        c = (s == 0) ? &g_bag : &g_store;
-        return true;
-    }
+        (void)entry;
 
-    // カテゴリを選ぶ。キャンセルなら false。cat=nullptr は「カテゴリ外 / IDを直接入力」
-    static bool PickCategory(const std::string &title, bool allowFree, const Category *&cat)
-    {
-        std::vector<std::string> names;
-        for (const Category &c : g_cats)
-            names.push_back(Utils::Format("%s (ID 0x%04X-0x%04X)", c.name, c.idMin, c.idMax));
-        if (allowFree)
-            names.push_back("カテゴリ外 / IDを直接入力");
-        Keyboard kc(title, names);
-        const int ci = kc.Open();
-        if (ci < 0)
-            return false;
-        cat = ((size_t)ci < sizeof(g_cats) / sizeof(g_cats[0])) ? &g_cats[ci] : nullptr;
-        return true;
-    }
-
-    // カテゴリの中から1つ選ぶ (一覧の先頭に [ID入力] あり)。cat=nullptr のときはID入力だけ
-    static bool PickOne(const Category *cat, const std::string &title, u32 &id)
-    {
-        if (cat)
-            return PickFromNames(Utils::Format("%s [%s]", title.c_str(), cat->name), g_itemNames,
-                                 true, cat->idMin, cat->idMax, cat->idMin, id);
-        return AskHexId(title + " (16進)", 0, false, 0, MAX_ID, id);
-    }
-
-    // 1つ生成する流れ (追加項目 → 確認 → 生成 → 続けて編集)
-    static void CreateOneFlow(const Container &ct, u32 id)
-    {
+        u32 id = 0;
+        if (!PickFromNames("生成するアイテムID", g_itemNames, false, 0, MAX_ID, 0, id))
+            return;
         if (id > MAX_ID)
         {
             MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
@@ -1519,7 +1217,7 @@ namespace CTRPluginFramework
                 return;
         }
 
-        std::string msg = Utils::Format("「%s」を%sに追加します。\n", IdName(id).c_str(), ct.name);
+        std::string msg = Utils::Format("「%s」をかばんに追加します。\n", IdName(id).c_str());
         msg += SpecSummary(sp);
         msg += "セーブのバックアップは取りましたか?";
         if (!(MessageBox("確認", msg, DialogType::DialogYesNo))())
@@ -1527,7 +1225,7 @@ namespace CTRPluginFramework
 
         BagState b;
         std::string err;
-        if (!LoadBag(b, ct, err))
+        if (!LoadBag(b, err))
         {
             MessageBox("追加できませんでした", err)();
             return;
@@ -1535,32 +1233,16 @@ namespace CTRPluginFramework
         const int slot = AddOne(b, id, count, cat ? &sp : nullptr);
         if (slot < 0)
         {
-            MessageBox("追加できませんでした", "空き枠がありません。")();
+            MessageBox("追加できませんでした", "かばんに空き枠がありません。")();
             return;
         }
         CommitCount(b);
 
         MessageBox("完了", Utils::Format("%d枠目に追加しました。\n"
-                                         "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", slot + 1))();
+                                         "かばん画面は、一度閉じて開き直すと反映されます。", slot + 1))();
 
-        if (MessageBox("続けて編集", "個数や追加効果などを編集しますか?", DialogType::DialogYesNo)())
-            EditAt(RowOf(b, (u32)slot), "生成したアイテムの編集", true);
-    }
-
-    // アイテムを1つ生成: カテゴリを選ぶ → 一覧から選ぶ (ID入力も可)
-    static void CreateItemEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        const Container *ct = nullptr;
-        if (!AskTarget("アイテムを1つ生成: 生成先", ct))
-            return;
-        const Category *cat = nullptr;
-        if (!PickCategory(Utils::Format("アイテムを1つ生成 (%s): カテゴリを選ぶ", ct->name), true, cat))
-            return;
-        u32 id = 0;
-        if (!PickOne(cat, "生成するアイテム", id))
-            return;
-        CreateOneFlow(*ct, id);
+        if (MessageBox("続けて編集", "クオリティや追加効果などを編集しますか?", DialogType::DialogYesNo)())
+            EditAt(SlotAddr((u32)slot), "生成したアイテムの編集", true);
     }
 
     // 範囲内の実在するID (名前の表が無いときは番号をそのまま) を小さい順に集める
@@ -1596,159 +1278,66 @@ namespace CTRPluginFramework
         return c0;
     }
 
-    // ------------------------------------------------------------
-    //  IDを指定して1つずつ生成 (連続)
-    //  カテゴリを選び、追加項目を1回決めたら、一覧から選ぶたびにその場で生成する。
-    //  一覧はページ分けで、生成しても同じページに戻る。Bで終了。
-    // ------------------------------------------------------------
-    static void BuildPool(const Category &cat, bool hideUnimpl, std::vector<u32> &pool)
-    {
-        std::vector<u32> all;
-        PoolIds(cat.idMin, cat.idMax, all);
-        pool.clear();
-        for (u32 id : all)
-            if (!(hideUnimpl && IsUnimplemented(id)))
-                pool.push_back(id);
-    }
-
-    static void ContinuousCreateEntry(MenuEntry *entry)
+    static void BulkCreateEntry(MenuEntry *entry)
     {
         (void)entry;
-        const Container *ct = nullptr;
-        if (!AskTarget("1つずつ生成: 生成先", ct))
-            return;
-        const Category *cat = nullptr;
-        if (!PickCategory(Utils::Format("1つずつ生成 (%s): カテゴリを選ぶ", ct->name), true, cat))
+
+        std::vector<std::string> modes;
+        modes.push_back("カテゴリの全アイテムを1つずつ");
+        modes.push_back("ID範囲を指定して1つずつ");
+        modes.push_back("同じアイテムをN個 (別枠)");
+        Keyboard km("一括生成", modes);
+        const int mode = km.Open();
+        if (mode < 0)
             return;
 
-        GenSpec sp;
-        u32 count = 1;
-        if (cat)
+        std::vector<u32> ids;
+        std::string what;
+
+        if (mode == 0)
         {
-            if (!AskGenSpec(cat, Utils::Format("追加項目 [%s] (このあと選ぶ全部に適用)", cat->name), sp, count))
+            std::vector<std::string> names;
+            for (const Category &c : g_cats)
+                names.push_back(Utils::Format("%s (ID 0x%04X-0x%04X)", c.name, c.idMin, c.idMax));
+            Keyboard kc("生成するカテゴリ", names);
+            const int ci = kc.Open();
+            if (ci < 0)
                 return;
+            PoolIds(g_cats[ci].idMin, g_cats[ci].idMax, ids);
+            what = Utils::Format("%s の全アイテム", g_cats[ci].name);
         }
-        else if (!AskValue("個数 (このあと選ぶ全部に適用)", false, MAX_COUNT, 1, count) || count == 0)
-            return;
-
-        std::string msg = Utils::Format("[%s / %s] 一覧から選ぶたびに、追加します。(Bで終了)\n",
-                                        ct->name, cat ? cat->name : "ID入力");
-        msg += SpecSummary(sp);
-        msg += "セーブのバックアップは取りましたか?";
-        if (!(MessageBox("確認", msg, DialogType::DialogYesNo))())
-            return;
-
-        BagState b;
-        std::string err;
-        if (!LoadBag(b, *ct, err))
+        else if (mode == 1)
         {
-            MessageBox("追加できませんでした", err)();
-            return;
+            u32 from = 0, to = MAX_ID;
+            if (!PickFromNames("開始ID", g_itemNames, false, 0, MAX_ID, 0, from))
+                return;
+            if (!PickFromNames("終了ID", g_itemNames, false, 0, MAX_ID, MAX_ID, to))
+                return;
+            if (from > to)
+                std::swap(from, to);
+            if (to > MAX_ID)
+                to = MAX_ID;
+            PoolIds(from, to, ids);
+            what = Utils::Format("ID 0x%04X-0x%04X", from, to);
         }
-
-        static constexpr u32 PAGE = 20;
-        static constexpr size_t HEAD = 5;     // 一覧の先頭の操作行の数
-        std::vector<u32> pool;
-        bool hide = false;
-        u32 page = 0, made = 0;
-        if (cat)
-            BuildPool(*cat, hide, pool);
-
-        for (;;)
+        else
         {
-            u32 id = 0;
-            bool have = false;
-
-            if (!cat)
+            u32 id = 0, n = 1;
+            if (!PickFromNames("生成するアイテムID", g_itemNames, false, 0, MAX_ID, 0, id))
+                return;
+            if (id > MAX_ID)
             {
-                if (!AskHexId(Utils::Format("生成するID (16進) 生成済み %u個", made), 0, false, 0, MAX_ID, id))
-                    break;
-                have = true;
+                MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
+                return;
             }
-            else
-            {
-                const u32 total = (u32)pool.size();
-                const u32 pages = total ? (total + PAGE - 1) / PAGE : 1;
-                if (page >= pages)
-                    page = pages - 1;
-
-                std::vector<std::string> rows;
-                rows.push_back("[ID入力]");
-                rows.push_back(Utils::Format("← 前のページ (%u/%u)", page + 1, pages));
-                rows.push_back(Utils::Format("→ 次のページ (%u/%u)", page + 1, pages));
-                rows.push_back("[ページ番号を指定]");
-                rows.push_back(!NameTableLoaded() ? std::string("(名前の表がないので未実装の判定なし)")
-                               : hide ? std::string("[未実装を隠している → 表示する]")
-                                      : std::string("[未実装を隠す]"));
-                for (u32 i = page * PAGE; i < total && i < (page + 1) * PAGE; ++i)
-                    rows.push_back(Utils::Format("%s (%X)", IdName(pool[i]).c_str(), pool[i]));
-
-                Keyboard kb(Utils::Format("[%s] 生成済み %u個 / 空き枠 %u  (Bで終了)", cat->name, made, FreeRows(b)),
-                            rows);
-                const int sel = kb.Open();
-                if (sel < 0)
-                    break;
-
-                if (sel == 0)
-                {
-                    have = AskHexId(Utils::Format("生成するID (0x%04X-0x%04X)", cat->idMin, cat->idMax),
-                                    cat->idMin, true, cat->idMin, cat->idMax, id);
-                }
-                else if (sel == 1)
-                    page = page ? page - 1 : pages - 1;
-                else if (sel == 2)
-                    page = (page + 1 < pages) ? page + 1 : 0;
-                else if (sel == 3)
-                {
-                    u32 v = 0;
-                    if (AskValue(Utils::Format("ページ番号 (1-%u)", pages), false, pages, page + 1, v) && v >= 1)
-                        page = v - 1;
-                }
-                else if (sel == 4)
-                {
-                    if (NameTableLoaded())
-                    {
-                        hide = !hide;
-                        BuildPool(*cat, hide, pool);
-                        page = 0;
-                    }
-                }
-                else
-                {
-                    const size_t k = (size_t)page * PAGE + (size_t)(sel - (int)HEAD);
-                    if (k < pool.size())
-                    {
-                        id = pool[k];
-                        have = true;
-                    }
-                }
-            }
-
-            if (!have)
-                continue;
-
-            const int slot = AddOne(b, id, count, cat ? &sp : nullptr);
-            if (slot < 0)
-            {
-                MessageBox("かばんがいっぱい", "空き枠がありません。")();
-                break;
-            }
-            CommitCount(b);
-            ++made;
-            OSD::Notify(Utils::Format("生成: %s → %d枠目", IdName(id).c_str(), slot + 1));
+            if (!AskValue("個数(枠の数)", false, BAG_SLOTS, 1, n) || n == 0)
+                return;
+            ids.assign(n, id);
+            what = Utils::Format("%s を %u 個", IdName(id).c_str(), n);
         }
 
-        MessageBox("完了", Utils::Format("%u 個を生成しました。\n"
-                                         "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", made))();
-    }
-
-    // ------------------------------------------------------------
-    //  まとめて作る共通処理 (未実装の除外 → 追加項目 → 確認 → 生成)
-    // ------------------------------------------------------------
-    static void RunBulk(const Container &ct, std::vector<u32> ids, std::string what, bool askUnimpl)
-    {
         // 未実装アイテムの除外 (カテゴリ・ID範囲のとき)
-        if (askUnimpl && NameTableLoaded() && !ids.empty())
+        if (mode != 2 && NameTableLoaded() && !ids.empty())
         {
             u32 unimpl = 0;
             for (u32 id : ids)
@@ -1797,14 +1386,13 @@ namespace CTRPluginFramework
 
         BagState b;
         std::string err;
-        if (!LoadBag(b, ct, err))
+        if (!LoadBag(b, err))
         {
             MessageBox("追加できませんでした", err)();
             return;
         }
         const u32 freeN = FreeRows(b);
-        std::string msg = Utils::Format("%s (%s)\n対象 %u 件 / %sの空き枠 %u\n", what.c_str(), ct.name,
-                                        (u32)ids.size(), ct.name, freeN);
+        std::string msg = Utils::Format("%s\n対象 %u 件 / かばんの空き枠 %u\n", what.c_str(), (u32)ids.size(), freeN);
         if (useSpec)
             msg += SpecSummary(sp);
         if (ids.size() > freeN)
@@ -1826,102 +1414,22 @@ namespace CTRPluginFramework
         CommitCount(b);
 
         MessageBox("完了", Utils::Format("%u 件を処理しました。(入りきらず未処理: %u)\n"
-                                         "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", made, skipped))();
-    }
-
-    static void BulkCreateAllEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        const Container *ct = nullptr;
-        if (!AskTarget("一括生成: 生成先", ct))
-            return;
-        const Category *cat = nullptr;
-        if (!PickCategory(Utils::Format("カテゴリの全アイテムを一括生成 (%s)", ct->name), false, cat) || !cat)
-            return;
-        std::vector<u32> ids;
-        PoolIds(cat->idMin, cat->idMax, ids);
-        RunBulk(*ct, ids, Utils::Format("%s の全アイテム", cat->name), true);
-    }
-
-    static void CreateNEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        const Container *ct = nullptr;
-        if (!AskTarget("同じアイテムをN個: 生成先", ct))
-            return;
-        const Category *cat = nullptr;
-        if (!PickCategory(Utils::Format("同じアイテムをN個 (%s): カテゴリを選ぶ", ct->name), true, cat))
-            return;
-        u32 id = 0, n = 1;
-        if (!PickOne(cat, "生成するアイテム", id))
-            return;
-        if (id > MAX_ID)
-        {
-            MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
-            return;
-        }
-        if (!AskValue("個数(枠の数)", false, ct->slots, 1, n) || n == 0)
-            return;
-        std::vector<u32> ids(n, id);
-        RunBulk(*ct, ids, Utils::Format("%s を %u 個", IdName(id).c_str(), n), false);
+                                         "かばん画面は、一度閉じて開き直すと反映されます。", made, skipped))();
     }
 
     // ------------------------------------------------------------
-    //  アイテム削除 (かばん / 倉庫)
-    //  連結リストから外し、件数を減らし、空き枠の表を整える。
-    //  (通常の「捨てる」と前後ダンプを比べて、行のデータ自体は消さないこと、
-    //   リンクを FFFF/FFFF にすること、空き枠の表に外した枠を入れることを確認した)
-    //  装備中の印: かばんの行の +8 の bit0 (装備を付け替えたときの前後ダンプで確認。
-    //  武器1・防具6・ライフ道具8 が印つきだった)。装備中の行は、どの削除でも消さない。
+    //  アイテム一括削除
+    //  連結リストから外し、件数を減らし、行のIDを空き行の値(0x666)にする。
+    //  ※ゲーム本人の削除処理は未確認。かばんから消すだけで、装備中のものは対象にしないこと。
     // ------------------------------------------------------------
-    static bool IsEquipped(const BagState &b, u32 slot)
-    {
-        u8 f = 0;
-        Process::Read8(RowOf(b, slot) + 8, f);
-        return (f & 1) != 0;
-    }
-
-    // del の行を消して、残りのリンク・先頭・件数を作り直す
-    static void DeleteRows(BagState &b, const std::vector<u16> &del)
-    {
-        std::vector<char> isDel(b.c->slots, 0);
-        for (u16 s : del)
-            isDel[s] = 1;
-        std::vector<u16> keep;
-        for (u16 s : b.order)
-            if (!isDel[s])
-                keep.push_back(s);
-
-        for (u16 s : del)
-        {
-            Process::Write16(LnkOf(b, s),     NO_LINK);
-            Process::Write16(LnkOf(b, s) + 2, NO_LINK);
-            b.used[s] = false;
-        }
-        for (size_t i = 0; i < keep.size(); ++i)
-        {
-            Process::Write16(LnkOf(b, keep[i]),     i + 1 < keep.size() ? keep[i + 1] : NO_LINK);
-            Process::Write16(LnkOf(b, keep[i]) + 2, i > 0 ? keep[i - 1] : NO_LINK);
-        }
-        Process::Write16(b.c->live + 0x1E, keep.empty() ? NO_LINK : keep[0]);
-        Process::Write16(b.c->live + 0x1C, (u16)keep.size());
-        b.order = keep;
-        SyncFreeArray(b);
-    }
-
-    // カテゴリ単位 / 未実装だけ、まとめて削除
     static void BulkDeleteEntry(MenuEntry *entry)
     {
         (void)entry;
 
-        const Container *c = nullptr;
-        if (!AskTarget("一括削除: 対象", c))
-            return;
-
         std::vector<std::string> names;
-        for (const Category &cg : g_cats)
-            names.push_back(Utils::Format("%s (ID 0x%04X-0x%04X)", cg.name, cg.idMin, cg.idMax));
-        names.push_back(Utils::Format("%s内のすべて", c->name));
+        for (const Category &c : g_cats)
+            names.push_back(Utils::Format("%s (ID 0x%04X-0x%04X)", c.name, c.idMin, c.idMax));
+        names.push_back("かばん内のすべて");
         Keyboard kc("一括削除するカテゴリ", names);
         const int ci = kc.Open();
         if (ci < 0)
@@ -1943,29 +1451,21 @@ namespace CTRPluginFramework
 
         BagState b;
         std::string err;
-        if (!LoadBag(b, *c, err))
+        if (!LoadBag(b, err))
         {
             MessageBox("削除できませんでした", err)();
             return;
         }
 
-        std::vector<u16> del;
-        u32 protectedN = 0;
+        std::vector<u16> keep, del;
         for (u16 s : b.order)
         {
             u32 id = 0;
-            Process::Read32(RowOf(b, s) + OFF_ID, id);
+            Process::Read32(SlotAddr(s) + OFF_ID, id);
             bool hit = all || (id >= g_cats[ci].idMin && id <= g_cats[ci].idMax);
             if (hit && mo == 1 && !IsUnimplemented(id))
                 hit = false;
-            if (!hit)
-                continue;
-            if (IsEquipped(b, s))
-            {
-                ++protectedN;
-                continue;
-            }
-            del.push_back(s);
+            (hit ? del : keep).push_back(s);
         }
         if (del.empty())
         {
@@ -1973,213 +1473,32 @@ namespace CTRPluginFramework
             return;
         }
 
-        std::string msg = Utils::Format("%s / %s\n%s\n%u 件を削除します。(残り %u 件)\n",
-                                        c->name, all ? "すべて" : g_cats[ci].name,
+        std::string msg = Utils::Format("%s\n%s\nかばんから %u 件を削除します。(残り %u 件)\n"
+                                        "装備中のアイテムは、先に外してから実行してください。\n"
+                                        "セーブのバックアップは取りましたか?\n実行しますか?",
+                                        all ? "かばん内のすべて" : g_cats[ci].name,
                                         mo == 1 ? "未実装アイテムのみ" : "すべて",
-                                        (u32)del.size(), (u32)(b.order.size() - del.size()));
-        if (protectedN)
-            msg += Utils::Format("装備中の %u 件は残します。\n", protectedN);
-        msg += "セーブのバックアップは取りましたか?\n実行しますか?";
+                                        (u32)del.size(), (u32)keep.size());
         if (!(MessageBox("一括削除の確認", msg, DialogType::DialogYesNo))())
             return;
 
-        DeleteRows(b, del);
-        MessageBox("完了", Utils::Format("%u 件を削除しました。\n"
-                                         "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
-    }
-
-    // 空き枠の表の修復 (以前のチート生成・削除で崩れた分を直す)
-    static void RepairFreeEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        if (!(MessageBox("空き枠情報の修復",
-                         "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。\n"
-                         "チートで生成・削除したあと、通常のプレイで入手してフリーズする場合に使います。\n"
-                         "セーブのバックアップは取りましたか?", DialogType::DialogYesNo))())
-            return;
-        std::string res;
-        const Container *conts[2] = { &g_bag, &g_store };
-        for (const Container *ct : conts)
+        for (u16 s : del)
         {
-            BagState b;
-            std::string err;
-            if (!LoadBag(b, *ct, err))
-            {
-                res += Utils::Format("%s: 修復できません (%s)\n", ct->name, err.c_str());
-                continue;
-            }
-            SyncFreeArray(b);
-            res += Utils::Format("%s: %u 件 / 空き %u 枠を整えました\n", ct->name, (u32)b.order.size(), FreeRows(b));
+            Process::Write32(SlotAddr(s) + OFF_ID, EMPTY_ID);
+            Process::Write16(LinkAddr(s),     NO_LINK);
+            Process::Write16(LinkAddr(s) + 2, NO_LINK);
         }
-        MessageBox("完了", res)();
-    }
-
-    // 装備中の武器・防具・ライフ道具以外を、かばんからすべて削除
-    static void DeleteExceptEquippedEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        BagState b;
-        std::string err;
-        if (!LoadBag(b, g_bag, err))
+        for (size_t i = 0; i < keep.size(); ++i)
         {
-            MessageBox("削除できませんでした", err)();
-            return;
+            Process::Write16(LinkAddr(keep[i]),     i + 1 < keep.size() ? keep[i + 1] : NO_LINK);
+            Process::Write16(LinkAddr(keep[i]) + 2, i > 0 ? keep[i - 1] : NO_LINK);
         }
+        Process::Write16(LIVE_HEAD,  keep.empty() ? NO_LINK : keep[0]);
+        Process::Write16(LIVE_COUNT, (u16)keep.size());
 
-        std::vector<u16> del;
-        u32 eqW = 0, eqA = 0, eqT = 0, eqOther = 0;
-        for (u16 s : b.order)
-        {
-            u32 id = 0;
-            Process::Read32(RowOf(b, s) + OFF_ID, id);
-            if (IsEquipped(b, s))
-            {
-                const Category *cg = FindCategory((u16)id);
-                if (cg == &g_cats[0])      ++eqW;
-                else if (cg == &g_cats[1]) ++eqA;
-                else if (cg == &g_cats[2]) ++eqT;
-                else                       ++eqOther;
-            }
-            else
-                del.push_back(s);
-        }
-        const u32 eq = eqW + eqA + eqT + eqOther;
-        if (eq == 0)
-        {
-            MessageBox("中止", "装備中の印がついたアイテムが1つも見つかりません。\n"
-                               "全部消してしまう恐れがあるので、何も削除せずに止めました。")();
-            return;
-        }
-        if (del.empty())
-        {
-            MessageBox("対象なし", "削除するアイテムがありません。")();
-            return;
-        }
-
-        std::string msg = Utils::Format("残すもの(装備中): 武器 %u / 防具 %u / ライフ道具 %u", eqW, eqA, eqT);
-        if (eqOther)
-            msg += Utils::Format(" / その他 %u", eqOther);
-        msg += Utils::Format("\n削除するもの: それ以外のかばん内すべて %u 件\n"
-                             "(家具・素材なども含みます)\n"
-                             "セーブのバックアップは取りましたか?\n実行しますか?", (u32)del.size());
-        if (!(MessageBox("装備中以外をすべて削除", msg, DialogType::DialogYesNo))())
-            return;
-
-        DeleteRows(b, del);
         MessageBox("完了", Utils::Format("%u 件を削除しました。\n"
                                          "かばん画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
     }
-
-    // 1つずつ削除 (連続)。カテゴリを選び、一覧から選ぶたびにその場で削除する。Bで終了。
-    static void DeleteOneByOneEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        const Container *c = nullptr;
-        if (!AskTarget("1つずつ削除: 対象", c))
-            return;
-        const Category *cat = nullptr;
-        if (!PickCategory(Utils::Format("1つずつ削除 (%s): カテゴリを選ぶ", c->name), false, cat) || !cat)
-            return;
-
-        BagState b;
-        std::string err;
-        if (!LoadBag(b, *c, err))
-        {
-            MessageBox("削除できませんでした", err)();
-            return;
-        }
-        if (!(MessageBox("確認",
-                         Utils::Format("[%s / %s] 一覧から選ぶたびに、そのアイテムを削除します。(Bで終了)\n"
-                                       "装備中のものは削除されません。\n"
-                                       "セーブのバックアップは取りましたか?", c->name, cat->name),
-                         DialogType::DialogYesNo))())
-            return;
-
-        static constexpr u32 PAGE = 20;
-        static constexpr int HEAD = 3;
-        u32 page = 0, deleted = 0;
-
-        for (;;)
-        {
-            std::vector<u16> slots;
-            for (u16 s : b.order)
-            {
-                u32 id = 0;
-                Process::Read32(RowOf(b, s) + OFF_ID, id);
-                if (id >= cat->idMin && id <= cat->idMax)
-                    slots.push_back(s);
-            }
-            const u32 total = (u32)slots.size();
-            if (total == 0)
-            {
-                MessageBox("なし", Utils::Format("%s の「%s」は、もうありません。", c->name, cat->name))();
-                break;
-            }
-            const u32 pages = (total + PAGE - 1) / PAGE;
-            if (page >= pages)
-                page = pages - 1;
-
-            std::vector<std::string> rows;
-            rows.push_back(Utils::Format("← 前のページ (%u/%u)", page + 1, pages));
-            rows.push_back(Utils::Format("→ 次のページ (%u/%u)", page + 1, pages));
-            rows.push_back("[ページ番号を指定]");
-            for (u32 i = page * PAGE; i < total && i < (page + 1) * PAGE; ++i)
-            {
-                u32 id = 0;
-                u16 cnt = 0;
-                Process::Read32(RowOf(b, slots[i]) + OFF_ID, id);
-                Process::Read16(RowOf(b, slots[i]) + OFF_COUNT, cnt);
-                std::string label = Utils::Format("%s", IdName(id).c_str());
-                if (cat->stackable)
-                    label += Utils::Format(" x%u", (u32)cnt);
-                label += Utils::Format(" (%u枠)", slots[i] + 1);
-                if (IsEquipped(b, slots[i]))
-                    label += " [装備中]";
-                rows.push_back(label);
-            }
-
-            Keyboard kb(Utils::Format("[%s/%s] 削除済み %u個 / 残り %u個 (Bで終了)", c->name, cat->name, deleted, total),
-                        rows);
-            const int sel = kb.Open();
-            if (sel < 0)
-                break;
-
-            if (sel == 0)
-                page = page ? page - 1 : pages - 1;
-            else if (sel == 1)
-                page = (page + 1 < pages) ? page + 1 : 0;
-            else if (sel == 2)
-            {
-                u32 v = 0;
-                if (AskValue(Utils::Format("ページ番号 (1-%u)", pages), false, pages, page + 1, v) && v >= 1)
-                    page = v - 1;
-            }
-            else
-            {
-                const size_t k = (size_t)page * PAGE + (size_t)(sel - HEAD);
-                if (k >= slots.size())
-                    continue;
-                const u16 s = slots[k];
-                if (IsEquipped(b, s))
-                {
-                    OSD::Notify("装備中のアイテムは削除できません");
-                    continue;
-                }
-                u32 id = 0;
-                Process::Read32(RowOf(b, s) + OFF_ID, id);
-                std::vector<u16> one(1, s);
-                DeleteRows(b, one);
-                ++deleted;
-                OSD::Notify(Utils::Format("削除: %s (%u枠)", IdName(id).c_str(), s + 1));
-            }
-        }
-
-        MessageBox("完了", Utils::Format("%u 個を削除しました。\n"
-                                         "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", deleted))();
-    }
-
 
     // ------------------------------------------------------------
     //  エリアワープ (実機未検証)
@@ -2458,6 +1777,9 @@ namespace CTRPluginFramework
     //    0x71BA40 : スロット管理 (+0 byte=現在スロット, +4..+24=スロットごとのフラグ) / 起動時に0で初期化される
     //    0x719374 : セーブ関連の管理オブジェクト。init=0x28299C / 毎フレーム更新=0x28238C / 終了=0x257D88
     //               通常はタイトルのタスクがこれを行う。直接版では ExSaveSelect の更新を差し替えて代行する
+    //    0x6B977C : UI管理(cAppUIMgr)。0x46FFE0(親,子)で子として登録しないと更新されず、読み込みが完了しない
+    //    直接版の流れ(実機GDBで通し確認済み): フィールドを片付け → ExSaveSelectを作る → UI管理を登録
+    //      → 状態0x0A/0x0Bで決定 → 状態0x0Cの直前にスロット番号を書く → 状態0x0Eを0x22へ飛ばす → 読み込み完了
     //    FLOW+12  : シーンフローのリスナー枠 (状態変更直後にゲームのスレッドから呼ばれる)
     //  ルートA: タイトル経由  (「ゲームを始める」を押す操作とスロット決定を自動化)
     //  ルートB: 直接          (フィールドを片付け -> スロット選択タスクだけ作る -> 読み込み -> フィールド再開)
@@ -2481,18 +1803,21 @@ namespace CTRPluginFramework
         static constexpr u32 FN_MGR_TERM  = 0x257D88;
         static constexpr u32 FN_EXSEL_UPDATE = 0x411E98;   // ExSaveSelect の更新 (vtable[5])
         static constexpr u32 VTBL_EXSEL_UPDATE = 0x66D8AC; // = VPTR_EXSEL + 5*4
+        static constexpr u32 UIMGR_OBJ    = 0x6B977C;   // cAppUIMgr (UI管理)。各シーンが自分の子として登録している
+        static constexpr u32 FN_ATTACH    = 0x46FFE0;   // Attach(親タスク, 子タスク)
         static constexpr u32 SLOT_VAR     = 0x71BA40;   // +0 byte=現在スロット, +4..+24 word=スロットごとの読み込み済みフラグ
         static constexpr u32 MAX_FRAMES   = 60 * 90;
         static constexpr u32 UI_WAIT      = 5;
 
         typedef s32 (*SendFn)(u32 receiver, u32 message);
         typedef void (*FnU32)(u32);
+        typedef void (*FnU32x2)(u32, u32);
 
         enum Phase { IDLE,
                      T_SELECT, T_RESULT, T_FIELD,                  // ルートA
                      D_BLANK, D_SEL, D_DONE, D_RESTART };           // ルートB
 
-        static int   g_slot  = -1;
+        static volatile int g_slot = -1;
         static Phase g_phase = IDLE;
         static u32   g_timer = 0;
         static u32   g_wait  = 0;
@@ -2500,6 +1825,7 @@ namespace CTRPluginFramework
         static volatile bool g_sent = false;
         static bool g_mgrInit = false;
         static bool g_vtblPatched = false;
+        static bool g_uiAttached = false;
         static volatile s32  g_sendResult = 0;
         static int   g_lastSt = -1;
         static int   g_lastTitleSt = -1;
@@ -2537,12 +1863,31 @@ namespace CTRPluginFramework
 
         static void RestoreIdleMsg(void) { Process::Write16(IDLE_MSG_ADDR, 0); }
 
-        // ExSaveSelect の更新の差し替え: 管理オブジェクトを更新してから、本来の更新を呼ぶ
-        // (通常はタイトルのタスクが毎フレーム管理オブジェクトを更新している)
+        // ExSaveSelect の更新の差し替え (ゲーム本来のスレッドで毎フレーム実行される)
+        //  1. UI管理を、このタスクの子として登録する (タイトルが初期化でやっていること。
+        //     これがないと UI管理が更新されず、読み込みが完了しない)
+        //  2. 状態0x0C(読み込み開始)の直前に、読み込むスロット番号を入れる
+        //     (通常は決定の瞬間の SetSlot が入れている)
+        //  3. 管理オブジェクトを更新してから、本来の更新を呼ぶ (通常はタイトルのタスクが行う)
+        //  4. 状態0x0E(リンク確認の子タスク作成)に進もうとしたら、0x22へ飛ばす
+        //     (リンク確認は、この環境では完了せず、プレイヤーの読み込みにも不要)
         static void ExSelUpdateWrapper(u32 self)
         {
+            if (!g_uiAttached)
+            {
+                ((FnU32x2)FN_ATTACH)(self, UIMGR_OBJ);
+                g_uiAttached = true;
+            }
+
+            volatile u8 *nextSt = (volatile u8 *)(self + 0x91B8);
+            if (*nextSt == 0x0C && g_slot >= 0)
+                *(volatile u8 *)SLOT_VAR = (u8)g_slot;
+
             ((FnU32)FN_MGR_UPDATE)(MGR_OBJ);
             ((FnU32)FN_EXSEL_UPDATE)(self);
+
+            if (*nextSt == 0x0E)
+                *nextSt = 0x22;
         }
 
         // 後片付け: 差し替えの復元と、管理オブジェクトの終了処理
@@ -2576,6 +1921,7 @@ namespace CTRPluginFramework
                 return;
             Process::Write32(FLOW_OBJ + 12, 0);   // 1回だけ実行
             ResetSlotState();
+            g_uiAttached = false;
             ((FnU32)FN_MGR_INIT)(MGR_OBJ);        // タイトルの初期化と同じ
             g_mgrInit = true;
             g_vtblPatched = Process::Write32(VTBL_EXSEL_UPDATE, (u32)&ExSelUpdateWrapper);
@@ -2897,37 +2243,16 @@ namespace CTRPluginFramework
                                    "武器・防具・ライフ道具・家具ごとに、かばん内の該当アイテムをまとめて変更します。\n"
                                    "変えたい項目を選んでから「決定して適用」で書き込みます。アイテムIDは、範囲を指定して被りなしの連番にするか、1件ずつ選べます。"));
 
-        {
-            MenuFolder *gen = new MenuFolder("⚙アイテム生成",
-                                             "かばん・倉庫の空き枠に新しいアイテムを作ります。必ずセーブのバックアップを取ってから使ってください。");
-            gen->Append(new MenuEntry("アイテムを1つ生成", nullptr, CreateItemEntry,
-                                      "カテゴリを選び、一覧から選んで1つ作ります。(ID入力も可)\n"
-                                      "武器・防具・ライフ道具・家具は、クオリティ・追加効果・追加数値・製作者名を指定して作れます。"));
-            gen->Append(new MenuEntry("カテゴリの全アイテムを一括生成", nullptr, BulkCreateAllEntry,
-                                      "選んだカテゴリの全アイテムを1つずつ、まとめて作ります。\n"
-                                      "未実装らしいアイテムを除外するか選べます。"));
-            gen->Append(new MenuEntry("IDを指定して1つずつ生成", nullptr, ContinuousCreateEntry,
-                                      "カテゴリを選び、追加項目を決めたら、一覧から選ぶたびにその場で作ります。\n"
-                                      "一覧は同じページに戻るので、続けて選べます。Bで終了します。"));
-            gen->Append(new MenuEntry("空き枠情報を修復 (フリーズ対策)", nullptr, RepairFreeEntry,
-                                      "チートで生成・削除したあと、通常プレイでの入手時にフリーズする場合に使います。\n"
-                                      "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。"));
-            gen->Append(new MenuEntry("同じアイテムをN個(別枠)", nullptr, CreateNEntry,
-                                      "同じアイテムを、別々の枠にN個作ります。(素材・消耗品は1枠にまとまります)"));
-            menu->Append(gen);
-        }
-        {
-            MenuFolder *del = new MenuFolder("⚙アイテム削除",
-                                             "かばん・倉庫のアイテムを削除します。装備中のものは消えません。必ずセーブのバックアップを取ってから使ってください。");
-            del->Append(new MenuEntry("カテゴリ・未実装をまとめて削除", nullptr, BulkDeleteEntry,
-                                      "かばんまたは倉庫で、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。"));
-            del->Append(new MenuEntry("装備中の武器・防具・ライフ道具以外を削除", nullptr, DeleteExceptEquippedEntry,
-                                      "かばんの中の、装備中の武器・防具・ライフ道具以外をすべて削除します。(家具・素材も含む)\n"
-                                      "装備中の印が見つからないときは、何も消さずに止まります。"));
-            del->Append(new MenuEntry("1つずつ削除", nullptr, DeleteOneByOneEntry,
-                                      "かばんまたは倉庫で、カテゴリを選び、一覧から選ぶたびにその場で削除します。Bで終了します。"));
-            menu->Append(del);
-        }
+        menu->Append(new MenuEntry("アイテムを生成 (かばんに追加)", nullptr, CreateItemEntry,
+                                   "IDを選ぶと、かばんの空き枠に新しいアイテムを作ります。\n"
+                                   "作成後、クオリティ・追加効果なども続けて編集できます。\n"
+                                   "必ずセーブのバックアップを取ってから使ってください。"));
+        menu->Append(new MenuEntry("アイテム一括削除", nullptr, BulkDeleteEntry,
+                                   "かばんのアイテムを、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。\n"
+                                   "装備中のものは先に外してください。必ずセーブのバックアップを取ってから使ってください。"));
+        menu->Append(new MenuEntry("アイテム一括生成", nullptr, BulkCreateEntry,
+                                   "カテゴリの全アイテム / ID範囲 / 同じアイテムN個 を、かばんの空き枠にまとめて作ります。\n"
+                                   "必ずセーブのバックアップを取ってから使ってください。"));
         menu->Append(new MenuEntry("エリアワープ (実験)", nullptr, WarpEntry,
                                    "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
                                    "出る場所は、選んだ行き先へ向かう扉の前です(扉がある側のエリア)。\n使う前に必ずバックアップを取ってください。★のついた2つだけ動作確認済みです。"));
