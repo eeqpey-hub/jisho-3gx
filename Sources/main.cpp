@@ -17,7 +17,6 @@
 #include "csvc.h"
 #include <CTRPluginFramework.hpp>
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -45,7 +44,6 @@ static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
 #include "Life.hpp"
 #include "QualityFix.hpp"
-#include "MaterialZero.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -69,211 +67,23 @@ extern "C"
     volatile u32 g_warpPending = 0;
     volatile u32 g_warpArea    = 0;
     volatile u32 g_warpLink    = 0;
-    volatile u32 g_warpUseLink = 1;   // 1 = 入口番号を渡す (0 も指定できる) / 0 = 渡さない (標準の入口)
     volatile u32 g_warpTask    = 0;   // 毎フレーム更新される。エリアID = g_warpTask + 0x6B2
 
-
-    // ---- 保存した位置へ置く (到着後) ----
-    // プレイヤーのデータ: [[0x68BBB8] + 0x7828] (クラス cAppUnit, vptr 0x671EB8)。
-    // エリアを移るたびにアドレスが変わるので、毎回この経路で取り直す。
-    // 座標 (x,y,z) は同じ値が複数の場所にある。GDBで、全部に書くと即座に移動し、
-    // +0x7C だけだと、スティック操作のあとに反映されることを確認した。
-    // 各コピーには「基準の座標との差」を足して書く (コピーごとに高さのずれがあるため)。
-    // 「ゲームが初期位置に置く」ことを検出してから書く。タイミングが分からないので、
-    //  ・新しいプレイヤーのデータが出来て、位置が大きく動いたあと (= 配置された)、
-    //  ・位置が POS_SETTLE_FRAMES フレーム止まったら、書き始める。
-    //  配置が見えなかった場合は、POS_FALLBACK_FRAMES 待ってから書く。
-    //  書き始めたら、POS_HOLD_FRAMES フレームの間、毎フレーム書き続ける (あとからの上書きを直す)。
-    #define POS_JUMP_DIST       2.0f     // 1フレームでこれ以上動いたら「配置された」とみなす
-    #define POS_SETTLE_FRAMES   20
-    #define POS_FALLBACK_FRAMES 240
-    #define POS_LONG_FRAMES     900
-    #define POS_REUSE_FRAMES    600      // プレイヤーのアドレスが変わらない場合の待ち
-    #define POS_HOLD_FRAMES     120
-    #define POS_TIMEOUT_FRAMES  (60 * 40)
-    #define POS_REC_MAX         900      // 経過の記録 (「位置ワープの記録を保存」で書き出せる)
-
-    volatile u32 g_posMode     = 0;      // 0 = なし / 1 = エリアの読み込み待ち / 2 = 書き込み中
-    volatile u32 g_posArea     = 0;
-    volatile u32 g_posOldObj   = 0;
-    volatile u32 g_posFrames   = 0;
-    volatile u32 g_posSince    = 0;
-    volatile u32 g_posSettle   = 0;
-    volatile u32 g_posJumps    = 0;
-    volatile u32 g_posSawGap   = 0;
-    volatile u32 g_posHold     = 0;
-    volatile u32 g_posHaveLast = 0;
-    volatile float g_posLast[3] = { 0.0f, 0.0f, 0.0f };
-    volatile float g_posXYZ[3]  = { 0.0f, 0.0f, 0.0f };
-
-    volatile u32 g_recN = 0;
-    static u8    g_recMode[POS_REC_MAX];
-    static u16   g_recArea[POS_REC_MAX];
-    static u8    g_recState[POS_REC_MAX];
-    static u32   g_recObj[POS_REC_MAX];
-    static float g_recPos[POS_REC_MAX][3];
-
-    static float PosAbs(float v) { return v < 0.0f ? -v : v; }
-    static bool  PosSane(float v) { return v > -20000.0f && v < 20000.0f; }
-
-    // プレイヤーのデータを取る。クラスの種類 (vptr) では見分けず、
-    // 座標のコピー同士 (+0x7C と +0x40) が一致していることで確かめる。
-    static u32 PosPlayerObj(void)
-    {
-        const u32 mgr = *(volatile u32 *)0x68BBB8;
-        if (mgr < 0x08000000u || mgr >= 0x1F000000u || (mgr & 3))
-            return 0;
-        const u32 obj = *(volatile u32 *)(mgr + 0x7828);
-        if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
-            return 0;
-        const float x = *(volatile float *)(obj + 0x7C), y = *(volatile float *)(obj + 0x80), z = *(volatile float *)(obj + 0x84);
-        const float x2 = *(volatile float *)(obj + 0x40), z2 = *(volatile float *)(obj + 0x60);
-        if (!PosSane(x) || !PosSane(y) || !PosSane(z) || !PosSane(x2) || !PosSane(z2))
-            return 0;
-        if (PosAbs(x - x2) > 1.0f || PosAbs(z - z2) > 1.0f)
-            return 0;
-        return obj;
-    }
-
-    static void PosApply(u32 obj, float tx, float ty, float tz)
-    {
-        static const u16 offX[] = { 0x7C, 0x40, 0x10, 0x20C, 0x218 };
-        static const u16 offY[] = { 0x80, 0x50, 0x20, 0x210, 0x21C };
-        static const u16 offZ[] = { 0x84, 0x60, 0x30, 0x214, 0x220 };
-
-        const float cx = *(volatile float *)(obj + 0x7C);
-        const float cy = *(volatile float *)(obj + 0x80);
-        const float cz = *(volatile float *)(obj + 0x84);
-        if (!PosSane(cx) || !PosSane(cy) || !PosSane(cz))
-            return;                                  // 変な値 (NaNなど) のときは書かない
-
-        const float dx = tx - cx, dy = ty - cy, dz = tz - cz;
-        if (dx == 0.0f && dy == 0.0f && dz == 0.0f)
-            return;
-        for (unsigned i = 0; i < sizeof(offX) / sizeof(offX[0]); ++i) *(volatile float *)(obj + offX[i]) += dx;
-        for (unsigned i = 0; i < sizeof(offY) / sizeof(offY[0]); ++i) *(volatile float *)(obj + offY[i]) += dy;
-        for (unsigned i = 0; i < sizeof(offZ) / sizeof(offZ[0]); ++i) *(volatile float *)(obj + offZ[i]) += dz;
-    }
-
-    static void PosResetDetect(void)
-    {
-        g_posSince    = 0;
-        g_posSettle   = 0;
-        g_posJumps    = 0;
-        g_posHaveLast = 0;
-    }
-
-    // ゲーム本体のスレッドから、毎フレーム呼ばれる。
-    static void PosTick(u32 task)
-    {
-        if (!g_posMode)
-            return;
-
-        const u32 obj   = PosPlayerObj();
-        const u32 area  = *(volatile u16 *)(task + 0x6B2);
-        const u32 state = *(volatile u8 *)(task + 624);
-        float p[3] = { 0.0f, 0.0f, 0.0f };
-        if (obj)
-        {
-            p[0] = *(volatile float *)(obj + 0x7C);
-            p[1] = *(volatile float *)(obj + 0x80);
-            p[2] = *(volatile float *)(obj + 0x84);
-        }
-
-        g_posFrames = g_posFrames + 1;
-
-        const u32 n = g_recN;                        // 経過の記録
-        if (n < POS_REC_MAX)
-        {
-            g_recMode[n]   = (u8)g_posMode;
-            g_recArea[n]   = (u16)area;
-            g_recState[n]  = (u8)state;
-            g_recObj[n]    = obj;
-            g_recPos[n][0] = p[0];
-            g_recPos[n][1] = p[1];
-            g_recPos[n][2] = p[2];
-            g_recN         = n + 1;
-        }
-
-        if (g_posMode == 1)                          // エリアの読み込み待ち
-        {
-            if (g_posFrames > POS_TIMEOUT_FRAMES)
-            {
-                g_posMode = 0;                       // 間に合わなかったので、あきらめる
-                return;
-            }
-            if (!obj)
-            {
-                g_posSawGap = 1;                     // 読み込み中は、プレイヤーのデータが一時的になくなる
-                PosResetDetect();
-                return;
-            }
-            bool fresh = (obj != g_posOldObj) || g_posSawGap;
-            if (!fresh && g_posFrames > POS_REUSE_FRAMES)
-                fresh = true;
-            if (area != g_posArea || !fresh)
-            {
-                PosResetDetect();
-                return;
-            }
-
-            g_posSince = g_posSince + 1;
-            if (g_posHaveLast)
-            {
-                float m = PosAbs(p[0] - g_posLast[0]);
-                const float my = PosAbs(p[1] - g_posLast[1]);
-                const float mz = PosAbs(p[2] - g_posLast[2]);
-                if (my > m) m = my;
-                if (mz > m) m = mz;
-                if (m > POS_JUMP_DIST)
-                {
-                    g_posJumps  = g_posJumps + 1;    // ゲームが位置を置いた
-                    g_posSettle = 0;
-                }
-                else if (m == 0.0f)
-                    g_posSettle = g_posSettle + 1;
-                else
-                    g_posSettle = 0;
-            }
-            g_posLast[0] = p[0];
-            g_posLast[1] = p[1];
-            g_posLast[2] = p[2];
-            g_posHaveLast = 1;
-
-            const bool settled = g_posSettle >= POS_SETTLE_FRAMES;
-            if ((settled && (g_posJumps >= 1 || g_posSince >= POS_FALLBACK_FRAMES)) || g_posSince >= POS_LONG_FRAMES)
-            {
-                g_posHold = 0;
-                g_posMode = 2;
-            }
-            return;
-        }
-
-        // g_posMode == 2: 書き込み中
-        if (obj)
-            PosApply(obj, g_posXYZ[0], g_posXYZ[1], g_posXYZ[2]);
-        g_posHold = g_posHold + 1;
-        if (g_posHold >= POS_HOLD_FRAMES)
-            g_posMode = 0;
-    }
-
     // ゲーム本体のスレッドから、毎フレーム呼ばれる (task = フィールドタスク)。
-    // 予約があれば 0x21EDCC(入口番号) を呼び、「エリアID+1」を返す(0 = 何もしない)。
-    // g_warpUseLink が 0 のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
-    // 入口番号 0 も、エリアID 0 も、普通の値として扱う。
+    // 予約があれば 0x21EDCC(接続番号) を呼び、エリアIDを返す(0 = 何もしない)。
+    // 接続番号が0のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
     u32 WarpPrepare(u32 task)
     {
         g_warpTask = task;
-        PosTick(task);
         if (!g_warpPending)
             return 0;
         g_warpPending = 0;
-        if (g_warpUseLink)
+        if (g_warpLink != 0)
         {
             typedef void (*SetArrivalLinkFn)(u32);
             ((SetArrivalLinkFn)0x21EDCC)(g_warpLink);
         }
-        return g_warpArea + 1;   // エリアID+1 (0 = ワープなし と区別するため)
+        return g_warpArea;
     }
 }
 
@@ -327,13 +137,12 @@ jp_hookB2:
 jp_hookWarp:
     push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
     vpush {d0-d7}                @ 元の関数は s0 (float引数) を使うので退避
-    bl    WarpPrepare            @ r0 = エリアID+1 (0 = ワープなし)
+    bl    WarpPrepare            @ r0 = エリアID (0 = ワープなし)
     vpop  {d0-d7}                @ s0〜s15 を元に戻す
     str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
     pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
     cmp   r12, #0
     beq   1f
-    sub   r12, r12, #1           @ エリアID+1 → エリアID (0 も有効)
     mov   r1, r12                @ GDBで成功したのと同じ設定
     mov   r2, #0
     mov   r3, r12
@@ -1098,7 +907,6 @@ namespace CTRPluginFramework
     //   ・倉庫も同じ作り(ダンプで確認: 管理領域 0x6DCD70、リンク配列 0x6E5460、1500枠、先頭は1499番から)。
     static constexpr u32 ROW_DATA   = 0x38;
     static constexpr u16 NO_LINK    = 0xFFFF;
-    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行に入っていたID (削除時にこれを書く・推測)
     static constexpr size_t DUP_THRESHOLD = 3;             // 名前がこの件数以上かぶると「未実装」とみなす
 
     // 連結リストを持つ入れ物。live=管理領域 (+8 リンク配列のアドレス、+0x1C 件数、+0x1E 先頭)
@@ -1109,9 +917,10 @@ namespace CTRPluginFramework
         u32 live;
         u32 linkBase;
         u32 slots;
+        u32 arr;      // 空き枠の番号表 (u16 が slots 個)。管理領域の +0x10 が指す
     };
-    static const Container g_bag   = { "かばん", 0x006DCD2C, 0x006DDF28,  500 };
-    static const Container g_store = { "倉庫",   0x006DCD70, 0x006E5460, 1500 };
+    static const Container g_bag   = { "かばん", 0x006DCD2C, 0x006DDF28,  500, 0x006DCDF8 };
+    static const Container g_store = { "倉庫",   0x006DCD70, 0x006E5460, 1500, 0x006DD1E0 };
 
     struct BagState
     {
@@ -1132,6 +941,12 @@ namespace CTRPluginFramework
         if (!Process::Read32(c.live + 0x08, p) || p != c.linkBase)
         {
             err = Utils::Format("%sの管理領域が想定と違います。(バージョン違いの可能性。何も書いていません)", c.name);
+            return false;
+        }
+        u32 ap = 0;
+        if (!Process::Read32(c.live + 0x10, ap) || ap != c.arr)
+        {
+            err = Utils::Format("%sの空き枠の表が想定と違います。(何も書いていません)", c.name);
             return false;
         }
         u16 head = 0, cnt = 0;
@@ -1198,9 +1013,21 @@ namespace CTRPluginFramework
         return n;
     }
 
+    // 空き枠の表を作り直す。ゲームは「表の arr[件数] を次に使う枠」として取り出し、
+    // 削除では arr[件数-1] に外した枠を入れる。arr[件数 以降] = 今あいている枠すべて、が成り立つ必要がある。
+    // (これが崩れると、次にゲームがアイテムを入手したときに使用中の枠を取り出してフリーズする)
+    static void SyncFreeArray(const BagState &b)
+    {
+        u32 w = (u32)b.order.size();
+        for (int k = (int)b.c->slots - 1; k >= 0; --k)
+            if (!b.used[k])
+                Process::Write16(b.c->arr + (w++) * 2, (u16)k);
+    }
+
     static void CommitCount(const BagState &b)
     {
         Process::Write16(b.c->live + 0x1C, (u16)b.order.size());
+        SyncFreeArray(b);
     }
 
     // ------------------------------------------------------------
@@ -2041,8 +1868,9 @@ namespace CTRPluginFramework
 
     // ------------------------------------------------------------
     //  アイテム削除 (かばん / 倉庫)
-    //  連結リストから外し、件数を減らし、行のIDを空き行の値(0x666)にする。
-    //  ※ゲーム本人の削除処理は未確認。
+    //  連結リストから外し、件数を減らし、空き枠の表を整える。
+    //  (通常の「捨てる」と前後ダンプを比べて、行のデータ自体は消さないこと、
+    //   リンクを FFFF/FFFF にすること、空き枠の表に外した枠を入れることを確認した)
     //  装備中の印: かばんの行の +8 の bit0 (装備を付け替えたときの前後ダンプで確認。
     //  武器1・防具6・ライフ道具8 が印つきだった)。装備中の行は、どの削除でも消さない。
     // ------------------------------------------------------------
@@ -2066,7 +1894,6 @@ namespace CTRPluginFramework
 
         for (u16 s : del)
         {
-            Process::Write32(RowOf(b, s) + OFF_ID, EMPTY_ID);
             Process::Write16(LnkOf(b, s),     NO_LINK);
             Process::Write16(LnkOf(b, s) + 2, NO_LINK);
             b.used[s] = false;
@@ -2079,6 +1906,7 @@ namespace CTRPluginFramework
         Process::Write16(b.c->live + 0x1E, keep.empty() ? NO_LINK : keep[0]);
         Process::Write16(b.c->live + 0x1C, (u16)keep.size());
         b.order = keep;
+        SyncFreeArray(b);
     }
 
     // カテゴリ単位 / 未実装だけ、まとめて削除
@@ -2158,6 +1986,32 @@ namespace CTRPluginFramework
         DeleteRows(b, del);
         MessageBox("完了", Utils::Format("%u 件を削除しました。\n"
                                          "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
+    }
+
+    // 空き枠の表の修復 (以前のチート生成・削除で崩れた分を直す)
+    static void RepairFreeEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        if (!(MessageBox("空き枠情報の修復",
+                         "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。\n"
+                         "チートで生成・削除したあと、通常のプレイで入手してフリーズする場合に使います。\n"
+                         "セーブのバックアップは取りましたか?", DialogType::DialogYesNo))())
+            return;
+        std::string res;
+        const Container *conts[2] = { &g_bag, &g_store };
+        for (const Container *ct : conts)
+        {
+            BagState b;
+            std::string err;
+            if (!LoadBag(b, *ct, err))
+            {
+                res += Utils::Format("%s: 修復できません (%s)\n", ct->name, err.c_str());
+                continue;
+            }
+            SyncFreeArray(b);
+            res += Utils::Format("%s: %u 件 / 空き %u 枠を整えました\n", ct->name, (u32)b.order.size(), FreeRows(b));
+        }
+        MessageBox("完了", res)();
     }
 
     // 装備中の武器・防具・ライフ道具以外を、かばんからすべて削除
@@ -2418,235 +2272,6 @@ namespace CTRPluginFramework
         return true;
     }
 
-    // ------------------------------------------------------------
-    //  保存した位置 (名前つき) をワープの一覧に足す (実機未検証)
-    //   ・「現在位置を保存」: いまのエリアIDと座標 (x,y,z) に、名前をつけて保存する
-    //   ・保存した位置は、「エリアワープ」の一覧の末尾に [保存] として並ぶ
-    //   ・選ぶと、同じエリアならそのまま移動、別のエリアなら、そのエリアへ
-    //     「標準の入口」で入ってから、読み込みが終わるのを待って、座標を書き込む
-    //  保存先: SD 直下の fll_warp_points.txt (1行 = エリアID / x / y / z / 名前)
-    //  ※ x,y,z は float のビット列 (16進) で保存する。ファイルを直接編集するときは注意。
-    // ------------------------------------------------------------
-    #ifndef WARP_POINTS_TO_FILE
-    #define WARP_POINTS_TO_FILE 1   // ビルドが通らないときは 0 にするとファイルの読み書きを外せる (再起動で消える)
-    #endif
-    #define WARP_POINTS_FILE "/fll_warp_points.txt"
-
-    struct SavedPos { std::string name; u32 area; float x, y, z; };
-    static std::vector<SavedPos> g_savedPos;
-    static bool g_savedLoaded = false;
-
-    static u32 FloatBits(float v) { u32 b = 0; memcpy(&b, &v, 4); return b; }
-    static float BitsFloat(u32 b) { float v = 0.0f; memcpy(&v, &b, 4); return v; }
-
-    // 小数2桁の文字にする (printf の %f が使えない環境でも動く)
-    static std::string Fmt2(float v)
-    {
-        const bool neg = v < 0.0f;
-        long n = (long)((neg ? -v : v) * 100.0f + 0.5f);
-        return Utils::Format("%s%ld.%02ld", neg ? "-" : "", n / 100, n % 100);
-    }
-
-    static void LoadSavedPos(void)
-    {
-        if (g_savedLoaded)
-            return;
-        g_savedLoaded = true;
-    #if WARP_POINTS_TO_FILE
-        File f;
-        if (File::Open(f, WARP_POINTS_FILE, File::READ) != 0)
-            return;
-        const u32 size = (u32)f.GetSize();
-        if (size == 0 || size > 0x20000)
-        {
-            f.Close();
-            return;
-        }
-        std::string text(size, '\0');
-        f.Read(&text[0], size);
-        f.Close();
-
-        size_t pos = 0;
-        while (pos < text.size())
-        {
-            size_t end = text.find('\n', pos);
-            if (end == std::string::npos)
-                end = text.size();
-            std::string line = text.substr(pos, end - pos);
-            pos = end + 1;
-            if (!line.empty() && line[line.size() - 1] == '\r')
-                line.erase(line.size() - 1);
-
-            std::string col[4];
-            size_t s0 = 0;
-            int n = 0;
-            while (n < 4)
-            {
-                const size_t t = line.find('\t', s0);
-                if (t == std::string::npos)
-                    break;
-                col[n++] = line.substr(s0, t - s0);
-                s0 = t + 1;
-            }
-            if (n != 4)
-                continue;
-
-            SavedPos p;
-            p.area = (u32)strtoul(col[0].c_str(), nullptr, 10);
-            p.x    = BitsFloat((u32)strtoul(col[1].c_str(), nullptr, 16));
-            p.y    = BitsFloat((u32)strtoul(col[2].c_str(), nullptr, 16));
-            p.z    = BitsFloat((u32)strtoul(col[3].c_str(), nullptr, 16));
-            p.name = line.substr(s0);
-            g_savedPos.push_back(p);
-        }
-    #endif
-    }
-
-    static void AppendSavedPos(const SavedPos &p)
-    {
-    #if WARP_POINTS_TO_FILE
-        File f;
-        if (File::Open(f, WARP_POINTS_FILE, File::WRITE | File::CREATE | File::APPEND) == 0)
-        {
-            f.WriteLine(Utils::Format("%u\t%08X\t%08X\t%08X\t", p.area, FloatBits(p.x), FloatBits(p.y), FloatBits(p.z)) + p.name);
-            f.Close();
-        }
-        else
-            OSD::Notify("points: file open failed (memory only)");
-    #else
-        (void)p;
-    #endif
-    }
-
-    // 保存した位置へ移動する (同じエリアならそのまま、別のエリアなら入ってから)
-    static void RequestSavedPos(const SavedPos &p)
-    {
-        u16 cur = 0;
-        if (g_warpTask != 0)
-            Process::Read16(g_warpTask + 0x6B2, cur);
-        const u32 obj = PosPlayerObj();
-
-        g_posMode     = 0;
-        g_posXYZ[0]   = p.x;
-        g_posXYZ[1]   = p.y;
-        g_posXYZ[2]   = p.z;
-        g_posArea     = p.area;
-        g_posOldObj   = obj;
-        g_posFrames   = 0;
-        g_posSawGap   = 0;
-        g_posHold     = 0;
-        PosResetDetect();
-        g_recN        = 0;
-
-        if (g_warpTask != 0 && obj && cur == p.area)
-        {
-            g_posMode = 2;                 // 同じエリア: そのまま移動
-            OSD::Notify("Teleport requested.");
-        }
-        else
-        {
-            g_warpArea    = p.area;        // 別のエリア: 標準の入口で入ってから、位置を書く
-            g_warpLink    = 0;
-            g_warpUseLink = 0;
-            g_posMode     = 1;
-            g_warpPending = 1;
-            OSD::Notify("Warp + teleport requested.");
-        }
-    }
-
-    static void SavePosEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        if (!InstallWarpHook())
-            return;
-        LoadSavedPos();
-
-        u16 area16 = 0;
-        if (g_warpTask == 0 || !Process::Read16(g_warpTask + 0x6B2, area16))
-        {
-            MessageBox("準備中です",
-                       "位置を読む準備をしています。\nメニューを閉じて、ゲームを1秒ほど動かしてから、もう一度実行してください。")();
-            return;
-        }
-        const u32 obj = PosPlayerObj();
-        if (!obj)
-        {
-            MessageBox("保存できません",
-                       "プレイヤーのデータを取得できません。\n操作できる状態で、もう一度実行してください。")();
-            return;
-        }
-
-        SavedPos p;
-        p.area = area16;
-        p.x = *(volatile float *)(obj + 0x7C);
-        p.y = *(volatile float *)(obj + 0x80);
-        p.z = *(volatile float *)(obj + 0x84);
-
-        std::string name;
-        Keyboard kb("ワープ名を入力");
-        if (kb.Open(name) != 0)
-            return;
-        for (size_t i = 0; i < name.size(); ++i)
-            if (name[i] == '\t' || name[i] == '\n' || name[i] == '\r')
-                name[i] = ' ';
-        if (name.empty())
-            name = Utils::Format("保存位置 %u", (u32)g_savedPos.size() + 1);
-        p.name = name;
-
-        g_savedPos.push_back(p);
-        AppendSavedPos(p);
-
-        MessageBox("保存しました",
-                   Utils::Format("%s\nエリアID %u\nx %s / y %s / z %s\n\n「エリアワープ」の一覧の末尾に追加しました。",
-                                 p.name.c_str(), p.area, Fmt2(p.x).c_str(), Fmt2(p.y).c_str(), Fmt2(p.z).c_str()))();
-    }
-
-    // 保存位置へのワープの経過 (毎フレームの、エリアID・状態・座標) を SD に書き出す。うまくいかないときの調査用。
-    static void PosDumpEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        const u32 n = g_recN;
-        if (n == 0)
-        {
-            MessageBox("記録がありません", "保存位置へのワープを実行したあとで、もう一度実行してください。")();
-            return;
-        }
-    #if WARP_POINTS_TO_FILE
-        File f;
-        if (File::Open(f, "/fll_warp_notes.txt", File::WRITE | File::CREATE | File::APPEND) != 0)
-        {
-            MessageBox("書き出せません", "fll_warp_notes.txt を開けませんでした。")();
-            return;
-        }
-        f.WriteLine(Utils::Format("TL-BEGIN target_area=%u frames=%u", (u32)g_posArea, n));
-        for (u32 i = 0; i < n; ++i)
-        {
-            f.WriteLine(Utils::Format("TL %u m%u a%u s%u o%X  %s %s %s", i, (u32)g_recMode[i], (u32)g_recArea[i], (u32)g_recState[i],
-                                      g_recObj[i], Fmt2(g_recPos[i][0]).c_str(), Fmt2(g_recPos[i][1]).c_str(), Fmt2(g_recPos[i][2]).c_str()));
-        }
-        f.WriteLine("TL-END");
-        f.Close();
-    #endif
-        MessageBox("書き出しました", Utils::Format("%u 行を fll_warp_notes.txt に書き出しました。", n))();
-    }
-
-    // 位置ワープの状態が変わったときに、画面に通知する (プラグイン側のフレームごとの処理)
-    static void PosNotifyFrame(void)
-    {
-        static u32 lastMode = 0;
-        const u32 m = g_posMode;
-        if (m == lastMode)
-            return;
-        if (m == 2)
-            OSD::Notify("Pos: placing...");
-        else if (m == 0 && lastMode == 2)
-            OSD::Notify("Pos: done");
-        else if (m == 0 && lastMode == 1)
-            OSD::Notify("Pos: gave up (timeout)");
-        lastMode = m;
-    }
-
     // メニューから選んだときに1回だけ実行される (有効/無効の切り替えではない)
     static void WarpEntry(MenuEntry *entry)
     {
@@ -2654,47 +2279,29 @@ namespace CTRPluginFramework
 
         if (!InstallWarpHook())
             return;
-        LoadSavedPos();
 
         std::vector<std::string> names;
         for (int i = 0; i < WARP_COUNT; ++i)
             names.push_back(g_warpDests[i].label);
-        for (size_t i = 0; i < g_savedPos.size(); ++i)
-            names.push_back(Utils::Format("[保存] %s (エリア%u)", g_savedPos[i].name.c_str(), g_savedPos[i].area));
 
-        Keyboard kb("移動先を選択 ([保存]は、保存した位置 / ほかは、行き先へ向かう扉の前)", names);
+        Keyboard kb("移動先を選択 (その行き先へ向かう扉の前に出ます)", names);
         int sel = kb.Open();
-        if (sel < 0 || sel >= (int)names.size())
+        if (sel < 0 || sel >= WARP_COUNT)
             return;
 
-        if (sel >= WARP_COUNT)
-        {
-            RequestSavedPos(g_savedPos[sel - WARP_COUNT]);
-            return;
-        }
-
-        g_posMode     = 0;
         g_warpArea    = g_warpDests[sel].area;
         g_warpLink    = g_warpDests[sel].link;
-        g_warpUseLink = 1;
         g_warpPending = 1;     // メニューを閉じた後、ゲームが次にタスクを更新したときに実行される
         OSD::Notify("Warp requested.");
     }
 
     // ------------------------------------------------------------
-    //  探索ワープ / 扉の記録 (開発用)
-    //  ・探索ワープ: 「出たいエリア」と「入口番号」を数字で指定して移動する
-    //  ・扉の自動記録: 有効にして扉を通ると、here / dest / 入口番号 を記録する
+    //  探索ワープ / 場所の記録 (開発用・実機未検証)
+    //  GDBなしで、移動先のデータ (エリアID・入口番号・場所名) を集めるための機能。
+    //   ・探索ワープ: エリアIDを +1 / -1 / 直接入力 で移動し、着いた場所の名前を記録する
+    //   ・扉の自動記録: 有効にして扉を通ると、行き先エリアIDと入口番号を記録する
     //  記録は SD カード直下の fll_warp_notes.txt に追記される (書けない場合は画面の一覧のみ)。
     //  存在しないエリアIDへ移動すると、落ちる可能性がある。必ずバックアップを取ること。
-    //
-    //  here = 扉を通る前に居たエリア (扉がある側) / dest = 扉の向こう側のエリア
-    //  入口番号 L の扉は、here 側と dest 側の2か所にある (両側で同じ番号)。
-    //   ・ここ(here)に出たいとき      → (here, L) を指定
-    //   ・扉の先(dest)に出たいとき    → (dest, L) を指定
-    //  ゲーム本体は (行き先エリア, L) を渡すと「その行き先へ向かう扉の前」に出る
-    //  (= 反対側のエリアに出る) ので、数字指定ワープは入口番号 L の反対側のエリアを
-    //  調べて、本体に渡す値へ変換している。反対側が未登録の入口番号は、変換できない。
     // ------------------------------------------------------------
     #ifndef WARP_LOG_TO_FILE
     #define WARP_LOG_TO_FILE 1      // ビルドが通らないときは 0 にするとファイル出力を外せる
@@ -2703,7 +2310,6 @@ namespace CTRPluginFramework
     static std::vector<std::string> g_notes;
     static u32 g_expArea = 2;
     static u32 g_expLink = 0;
-    static int g_expMode = 0;       // 0 = 入口番号を指定 / 1 = エリアだけ指定 (標準の入口)
 
     static void AppendNote(const std::string &line)
     {
@@ -2720,100 +2326,16 @@ namespace CTRPluginFramework
     #endif
     }
 
-    // 入口番号 → その入口が結ぶ2つのエリア。扉の自動記録のログ末尾の
-    // 「{ 番号, here, dest },」をそのまま足せる。(扉を通ると、実行中も自動で覚える)
-    struct LinkEnd { u16 link; u16 a; u16 b; };
-    static const LinkEnd g_linkEnds[] =
+    static void RequestWarp(u32 area, u32 link)
     {
-        {  39,   3,  25 },   // 郊外南 <-> パーテル大平原東
-        { 125,  24,  25 },   // パーテル西 <-> パーテル大平原東
-        { 128,  25, 210 },   // パーテル大平原東 <-> ハニワの洞窟
-        { 133,  82,  83 },
-        { 142,  83,  86 },
-        { 132,  82,  85 },
-        { 136,  97,  98 },
-        {  88,  16,  19 },
-        {  83,  11,  31 },
-        {  81,  13,  30 },
-    };
-    static std::vector<LinkEnd> g_linkLearned;
-
-    static void LearnLink(u32 link, u32 a, u32 b)
-    {
-        for (size_t i = 0; i < g_linkLearned.size(); ++i)
-        {
-            const LinkEnd &e = g_linkLearned[i];
-            if (e.link == link && ((e.a == a && e.b == b) || (e.a == b && e.b == a)))
-                return;
-        }
-        LinkEnd e;
-        e.link = (u16)link;
-        e.a    = (u16)a;
-        e.b    = (u16)b;
-        g_linkLearned.push_back(e);
-    }
-
-    // 戻り値: 0 = 反対側が見つかった / 1 = 入口番号が未登録 / 2 = そのエリアは、この入口の端ではない
-    static int FindOtherEnd(u32 area, u32 link, u32 &other, u32 &ea, u32 &eb)
-    {
-        bool known = false;
-        for (int pass = 0; pass < 2; ++pass)
-        {
-            const size_t n = (pass == 0) ? g_linkLearned.size() : (sizeof(g_linkEnds) / sizeof(g_linkEnds[0]));
-            for (size_t i = 0; i < n; ++i)
-            {
-                const LinkEnd &e = (pass == 0) ? g_linkLearned[i] : g_linkEnds[i];
-                if (e.link != link)
-                    continue;
-                known = true;
-                ea = e.a;
-                eb = e.b;
-                if (e.a == area) { other = e.b; return 0; }
-                if (e.b == area) { other = e.a; return 0; }
-            }
-        }
-        return known ? 2 : 1;
-    }
-
-    // ゲーム本体へ予約する。area は本体に渡す値 (= その入口が向かう側のエリア)。
-    static void RequestWarpRaw(u32 area, u32 link, bool useLink)
-    {
-        if (area > 999) area = 999;   // 0 も指定できる (存在しないIDだと落ちる可能性あり)
+        if (area < 1)   area = 1;
+        if (area > 999) area = 999;
+        g_expArea = area;
+        g_expLink = link;
         g_warpArea    = area;
         g_warpLink    = link;
-        g_warpUseLink = useLink ? 1 : 0;
-        g_posMode     = 0;            // 保存位置の予約が残っていたら、取り消す
         g_warpPending = 1;
-        OSD::Notify(Utils::Format("Warp: engine area %u link %u%s", area, link, useLink ? "" : " (default)"));
-    }
-
-    // 「area の、番号 link の入口の前」に出る。
-    static void WarpToEntrance(u32 area, u32 link)
-    {
-        u32 other = 0, ea = 0, eb = 0;
-        const int r = FindOtherEnd(area, link, other, ea, eb);
-
-        if (r == 2)
-        {
-            MessageBox("移動できません",
-                       Utils::Format("入口番号 %u は、エリア %u とエリア %u をつなぐ入口です。\n"
-                                     "エリア %u には、この入口はありません。", link, ea, eb, area))();
-            return;
-        }
-        if (r == 1)
-        {
-            if (!(MessageBox("入口番号が未登録",
-                             Utils::Format("入口番号 %u の両側のエリアが、まだ登録されていません。\n\n"
-                                           "このまま続けると、エリア %u へ向かう扉の前 (隣のエリア側) に出ます。\n"
-                                           "続けますか?\n\n"
-                                           "(「扉の自動記録」を有効にして、その入口の扉を通ると登録されます)",
-                                           link, area),
-                             DialogType::DialogYesNo))())
-                return;
-            RequestWarpRaw(area, link, true);
-            return;
-        }
-        RequestWarpRaw(other, link, true);
+        OSD::Notify(Utils::Format("Warp: area %u link %u", area, link));
     }
 
     static u32 CurrentAreaId(void)
@@ -2838,6 +2360,16 @@ namespace CTRPluginFramework
         MessageBox("記録 (新しい順 最大12件)", text)();
     }
 
+    static void RecordHere(void)
+    {
+        std::string name;
+        Keyboard kb("この場所の名前を入力 (記録します)");
+        if (kb.Open(name) != 0)
+            return;
+        AppendNote(Utils::Format("area=%u link=%u name=%s", CurrentAreaId(), g_expLink, name.c_str()));
+        OSD::Notify("Recorded.");
+    }
+
     static void ExploreEntry(MenuEntry *entry)
     {
         (void)entry;
@@ -2847,64 +2379,41 @@ namespace CTRPluginFramework
 
         const u32 cur = CurrentAreaId();
 
-        // 項目の「表示」と「動作」は、必ずペアで追加する (opts と acts を同時に push_back する)。
-        // 表示順を変えたいときは、下の並びの行を入れ替えるだけでよい (switch は動作名で分岐する)。
-        enum Act { ACT_INPUT, ACT_AREA_ONLY, ACT_AGAIN, ACT_SHOW };
         std::vector<std::string> opts;
-        std::vector<int> acts;
-
-        opts.push_back("エリアIDと入口番号を数字で指定");
-        acts.push_back(ACT_INPUT);
-        opts.push_back("エリアIDだけ数字で指定 (標準の入口)");
-        acts.push_back(ACT_AREA_ONLY);
+        opts.push_back("エリアIDと入口番号を数字で指定して移動");
+        opts.push_back(Utils::Format("次のIDへ移動 (%u)", g_expArea + 1));
+        opts.push_back(Utils::Format("前のIDへ移動 (%u)", g_expArea > 1 ? g_expArea - 1 : 1));
+        opts.push_back(Utils::Format("+10 へ移動 (%u)", g_expArea + 10));
+        opts.push_back(Utils::Format("-10 へ移動 (%u)", g_expArea > 10 ? g_expArea - 10 : 1));
         opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
-        acts.push_back(ACT_AGAIN);
+        opts.push_back("この場所を記録 (名前を入力)");
         opts.push_back("記録を表示");
-        acts.push_back(ACT_SHOW);
 
         u32 sel = 0;
-        if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の指定=ID %u 入口 %u", cur, g_expArea, g_expLink),
+        if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の移動=ID %u 入口 %u", cur, g_expArea, g_expLink),
                        opts, sel))
             return;
-        if (sel >= acts.size())
-            return;
 
-        switch (acts[sel])
+        switch (sel)
         {
-        case ACT_INPUT:
+        case 0: RequestWarp(g_expArea + 1, g_expLink); break;
+        case 1: RequestWarp(g_expArea > 1 ? g_expArea - 1 : 1, g_expLink); break;
+        case 2: RequestWarp(g_expArea + 10, g_expLink); break;
+        case 3: RequestWarp(g_expArea > 10 ? g_expArea - 10 : 1, g_expLink); break;
+        case 4:
         {
             u32 area = g_expArea, link = g_expLink;
-            if (!AskValue("出たいエリアID (0〜999)", false, 999, g_expArea, area))
+            if (!AskValue("エリアID (1〜999)", false, 999, g_expArea, area))
                 return;
-            if (!AskValue("その入口番号 (0〜999)", false, 999, g_expLink, link))
+            if (!AskValue("入口番号 (0 = 標準の入口)", false, 999, g_expLink, link))
                 return;
-            g_expArea = area;
-            g_expLink = link;
-            g_expMode = 0;
-            WarpToEntrance(area, link);
+            RequestWarp(area, link);
             break;
         }
-        case ACT_AREA_ONLY:
-        {
-            u32 area = g_expArea;
-            if (!AskValue("エリアID (0〜999)", false, 999, g_expArea, area))
-                return;
-            g_expArea = area;
-            g_expMode = 1;
-            RequestWarpRaw(area, 0, false);
-            break;
-        }
-        case ACT_AGAIN:
-            if (g_expMode == 0)
-                WarpToEntrance(g_expArea, g_expLink);
-            else
-                RequestWarpRaw(g_expArea, 0, false);
-            break;
-        case ACT_SHOW:
-            ShowNotes();
-            break;
-        default:
-            break;
+        case 5: RequestWarp(g_expArea, g_expLink); break;
+        case 6: RecordHere(); break;
+        case 7: ShowNotes(); break;
+        default: break;
         }
     }
 
@@ -2915,13 +2424,6 @@ namespace CTRPluginFramework
         (void)entry;
         static u32 lastWord = 0xFFFFFFFF;
 
-        // here (いま居るエリア) を読むには、ワープ用のフックが必要 (タスクの場所を毎フレーム受け取る)
-        if (g_warpTask == 0)
-        {
-            InstallWarpHook();
-            return;
-        }
-
         u32 w = 0;
         if (!Process::Read32(0x16D5D4A8, w))   // ChangeMapオブジェクトの +12 (エリアID16bit) と +14 (入口番号16bit)
             return;
@@ -2929,17 +2431,16 @@ namespace CTRPluginFramework
             return;
         lastWord = w;
 
-        const u32 dest = w & 0xFFFF;
+        const u32 area = w & 0xFFFF;
         const u32 link = w >> 16;
-        if (dest == 0)
+        if (area == 0)
             return;
 
-        // here = 扉を通る前に居たエリア / dest = 扉の向こう
+        // here = いま居るエリア (扉を通る前)。この扉の前に出るワープの組は (dest, link)。
+        //   → ワープすると「here のエリアの、この扉の前」に出る。
         const u32 here = CurrentAreaId();
-        LearnLink(link, here, dest);
-        AppendNote(Utils::Format("DOOR here=%u dest=%u link=%u | ここに出る: %u/%u  扉の先に出る: %u/%u | { %u, %u, %u },",
-                                 here, dest, link, here, link, dest, link, link, here, dest));
-        OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, dest, link));
+        AppendNote(Utils::Format("DOOR here=%u dest=%u link=%u  (warp %u/%u lands in area %u)", here, area, link, area, link, here));
+        OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, area, link));
     }
 
     // ------------------------------------------------------------
@@ -3380,13 +2881,12 @@ namespace CTRPluginFramework
         if (Process::GetTitleID() != 0x00040000000E9C00ULL)
             OSD::Notify("Warning: unexpected title.");
 
-        // タイトルとバージョン表示。バージョン番号 (数字3つ) の版は使わず、名前に含める。
-        PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
+        PluginMenu *menu = new PluginMenu("ファンタジーライフ アイテムエディタ", 0, 2, 0,
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-        
-        AddMaterialZero(menu);
-        AddLifeChange(menu);
+
+        AddQualityFix(menu);
+        AddRecommended(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
                                    "有効にして、編集したい装備を着けます(着けている場合は外して着け直し)。\n"
@@ -3398,7 +2898,7 @@ namespace CTRPluginFramework
                                    "変えたい項目を選んでから「決定して適用」で書き込みます。アイテムIDは、範囲を指定して被りなしの連番にするか、1件ずつ選べます。"));
 
         {
-            MenuFolder *gen = new MenuFolder("アイテム生成",
+            MenuFolder *gen = new MenuFolder("⚙アイテム生成",
                                              "かばん・倉庫の空き枠に新しいアイテムを作ります。必ずセーブのバックアップを取ってから使ってください。");
             gen->Append(new MenuEntry("アイテムを1つ生成", nullptr, CreateItemEntry,
                                       "カテゴリを選び、一覧から選んで1つ作ります。(ID入力も可)\n"
@@ -3409,12 +2909,15 @@ namespace CTRPluginFramework
             gen->Append(new MenuEntry("IDを指定して1つずつ生成", nullptr, ContinuousCreateEntry,
                                       "カテゴリを選び、追加項目を決めたら、一覧から選ぶたびにその場で作ります。\n"
                                       "一覧は同じページに戻るので、続けて選べます。Bで終了します。"));
+            gen->Append(new MenuEntry("空き枠情報を修復 (フリーズ対策)", nullptr, RepairFreeEntry,
+                                      "チートで生成・削除したあと、通常プレイでの入手時にフリーズする場合に使います。\n"
+                                      "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。"));
             gen->Append(new MenuEntry("同じアイテムをN個(別枠)", nullptr, CreateNEntry,
                                       "同じアイテムを、別々の枠にN個作ります。(素材・消耗品は1枠にまとまります)"));
             menu->Append(gen);
         }
         {
-            MenuFolder *del = new MenuFolder("アイテム削除",
+            MenuFolder *del = new MenuFolder("⚙アイテム削除",
                                              "かばん・倉庫のアイテムを削除します。装備中のものは消えません。必ずセーブのバックアップを取ってから使ってください。");
             del->Append(new MenuEntry("カテゴリ・未実装をまとめて削除", nullptr, BulkDeleteEntry,
                                       "かばんまたは倉庫で、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。"));
@@ -3425,28 +2928,16 @@ namespace CTRPluginFramework
                                       "かばんまたは倉庫で、カテゴリを選び、一覧から選ぶたびにその場で削除します。Bで終了します。"));
             menu->Append(del);
         }
-        menu->Append(new MenuEntry("エリアワープ", nullptr, WarpEntry,
+        menu->Append(new MenuEntry("エリアワープ (実験)", nullptr, WarpEntry,
                                    "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
-                                   "出る場所は、選んだ行き先へ向かう扉の前です(扉がある側のエリア)。\n"
-                                   "一覧の末尾の[保存]は、「現在位置を保存」で保存した位置です。\n使う前に必ずバックアップを取ってください。"));
-        menu->Append(new MenuEntry("現在位置を保存 (ワープ一覧に追加)", nullptr, SavePosEntry,
-                                   "いま立っている位置に名前をつけて保存します。保存した位置は「エリアワープ」の一覧の末尾に並びます。\n"
-                                   "別のエリアの位置を選ぶと、そのエリアへ入ってから、保存した位置へ移動します。\n"
-                                   "保存先は SD直下の fll_warp_points.txt です。"));
+                                   "出る場所は、選んだ行き先へ向かう扉の前です(扉がある側のエリア)。\n使う前に必ずバックアップを取ってください。★のついた2つだけ動作確認済みです。"));
         menu->Append(new MenuEntry("探索ワープ (開発用)", nullptr, ExploreEntry,
-                                   "出たいエリアIDと入口番号を数字で指定して移動します(そのエリアの、その入口の前に出ます)。\n"
-                                   "入口番号の反対側のエリアが未登録のときは、確認が出ます。「扉の自動記録」で扉を通ると登録されます。\n"
+                                   "エリアIDを +1/-1/数字入力で移動し、着いた場所に名前をつけて記録します。\n"
+                                   "記録は SD直下の fll_warp_notes.txt にも追記されます。\n"
                                    "存在しないIDだと落ちる可能性があります。必ずバックアップを取ってください。"));
         menu->Append(new MenuEntry("扉の自動記録 (開発用)", DoorLogEntry, nullptr,
-                                   "有効にして扉を通ると、here(扉がある側)・dest(扉の向こう)・入口番号を記録します。\n"
-                                   "ここに出たい → here/入口番号、扉の先に出たい → dest/入口番号 で数字指定できます。\n"
+                                   "有効にして扉を通ると、行き先のエリアIDと入口番号を記録します。\n"
                                    "記録は SD直下の fll_warp_notes.txt に追記されます。"));
-        menu->Append(new MenuEntry("位置ワープの記録を保存 (開発用)", nullptr, PosDumpEntry,
-                                   "保存位置へのワープの経過 (毎フレームの状態と座標) を、fll_warp_notes.txt に書き出します。\n"
-                                   "別のエリアの保存位置へうまく移動できないときの、調査用です。"));
-
-        AddQualityFix(menu);
-        AddRecommended(menu);
         
         menu->Append(new MenuEntry("プレイヤー切り替え 直接版 (実験)", nullptr, PlayerSwitch::EntryDirect,
                                    "タイトルを経由せず、フィールドを片付けてから読み込みだけを行って戻ります。\n"
@@ -3455,8 +2946,8 @@ namespace CTRPluginFramework
         menu->Append(new MenuEntry("プレイヤー切り替え タイトル経由 (実験)", nullptr, PlayerSwitch::EntryTitle,
                                    "タイトル画面を一瞬経由して、自動でスロットを選びます。"));
         menu->Callback(PlayerSwitch::OnFrame);
-        menu->Callback(PosNotifyFrame);
-        
+
+        AddLifeChange(menu);
         menu->Run();
         delete menu;
         return 0;
