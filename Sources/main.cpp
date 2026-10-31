@@ -293,14 +293,21 @@ extern "C"
 
     volatile u32 g_mageWatch    = 0;      // 毎フレームプラグイン側が補充。0なら機能オフ
     volatile u32 g_mageAlive    = 0;      // MageTickが補充。0なら (フックが動いていない) A を消費しない
-    volatile u32 g_mageTmax     = 120;    // 判定を作る最大フレーム
-    volatile u32 g_mageCool     = 6;      // 連続発動の最短間隔 (フレーム)
+    volatile u32 g_mageTmax     = 120;    // 判定を作る最大フレーム (10〜600)
+    volatile u32 g_mageCool     = 0;      // 連続発動の最短間隔 (フレーム)。0 = 押した瞬間の1回だけ (長押しで連射しない)
+    volatile u32 g_mageStep     = 1;      // ゴーストが1フレームに進める時間 (1 = 等速。大きいほど魔法が早く出る)
+    volatile u32 g_mageMask     = 0xFFFF; // 出す技 (ビット0〜15 = g_mageIds の順)
+    volatile u32 g_mageKey      = 0;      // 発動ボタン: 0 = A (ゲームのAを横取り) / 1 = B / 2 = Y / 3 = L / 4 = R
+    volatile u32 g_mageReq      = 0;      // プラグイン側が押下を知らせる回数 (A以外のボタン用)
+    volatile u32 g_mageReqSeen  = 0;
+    volatile u32 g_mageHeld     = 0;      // A以外のボタンを押している間 1
+    volatile u32 g_magePressTick = 0;
     volatile u32 g_mageCoolLeft = 0;
     volatile u32 g_mageCasts    = 0;
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
-    volatile u32 g_mageSince    = 1000;   // 最後にAを押してからのフレーム数
-    volatile u32 g_mageCancelWin = 40;    // 押してから何フレームの間、通常攻撃などを消すか (0でオフ)
+    volatile u32 g_mageSince    = 1000;   // 最後に発動してからのフレーム数
+    volatile u32 g_mageCancelWin = 40;    // 発動してから何フレームの間、通常攻撃を消すか (0でオフ)
     volatile u32 g_mageActLog   = 0;      // 消した動きの回数 (診断用)
     volatile u32 g_mageLastAct  = 0;      // 最後に消した動きのID (診断用)
     #define MAGE_MAXG 6
@@ -332,18 +339,9 @@ extern "C"
         return false;
     }
 
-    // Aのスキル枠の状態0 (押された瞬間) で呼ばれる。1を返すと、状態機械は何もせず終わる。
-    u32 MageS0Check(u32 slot, u32 pressed)
+    // ゴーストを1つ作る (全部使用中なら、いちばん進んだものを作り直す)
+    static void MageStart(void)
     {
-        if (!g_mageWatch || !g_mageAlive || !pressed)
-            return 0;
-        const u32 C = MageObj();
-        if (!C || slot != C + 0x888)                       // Aのスキル枠だけ
-            return 0;
-        if (!MageIsId(*(volatile u32 *)(slot + 0x48)))     // 魔法使いのスキルIDのときだけ
-            return 0;
-        if (g_mageCoolLeft)
-            return 1;                                      // 間隔の間は、押下を消費して何もしない
         g_mageCoolLeft = g_mageCool;
         g_mageSince = 0;
 
@@ -356,6 +354,35 @@ extern "C"
         if (k < 0) k = oldest;
         g_mageT[k] = 0;
         g_mageCasts = g_mageCasts + 1;
+    }
+
+    // Aのスキル枠の状態0 (押された瞬間) で呼ばれる。1を返すと、状態機械は何もせず終わる。
+    u32 MageS0Check(u32 slot, u32 pressed)
+    {
+        if (!g_mageWatch || !g_mageAlive || !pressed)
+            return 0;
+        if (g_mageKey)                                     // Aを発動に使わない設定
+            return 0;
+        const u32 C = MageObj();
+        if (!C || slot != C + 0x888)                       // Aのスキル枠だけ
+            return 0;
+        if (!MageIsId(*(volatile u32 *)(slot + 0x48)))     // 魔法使いのスキルIDのときだけ
+            return 0;
+
+        // 「押している間」ずっと呼ばれるので、前のフレームも押していたかを見て、押した瞬間を判定する
+        const bool edge = (g_mageTicks - g_magePressTick) > 1;
+        g_magePressTick = g_mageTicks;
+
+        if (g_mageCool == 0)
+        {
+            if (!edge)
+                return 1;                                  // 長押し中は、押下を消費して何もしない
+        }
+        else if (g_mageCoolLeft)
+        {
+            return 1;                                      // 間隔の間は、押下を消費して何もしない
+        }
+        MageStart();
         return 1;
     }
 
@@ -378,40 +405,57 @@ extern "C"
         {
             for (int i = 0; i < MAGE_MAXG; ++i) g_mageT[i] = -1;
             g_mageCtrl = K;
+            g_mageReqSeen = g_mageReq;
             return;
         }
 
+        // A以外のボタンで発動する設定 (プラグイン側が押下を数えている)
+        if (g_mageKey)
+        {
+            while (g_mageReqSeen != g_mageReq)
+            {
+                g_mageReqSeen = g_mageReqSeen + 1;
+                if (g_mageCool == 0 || !g_mageCoolLeft)
+                    MageStart();
+            }
+            if (g_mageHeld && g_mageCool && !g_mageCoolLeft)
+                MageStart();
+        }
+
+        const u32 mask = g_mageMask;
+        const u32 step = g_mageStep < 1 ? 1 : g_mageStep;
         for (int i = 0; i < MAGE_MAXG; ++i)
         {
-            const s32 t = g_mageT[i];
+            s32 t = g_mageT[i];
             if (t < 0)
                 continue;
-            if ((u32)t > g_mageTmax)
-            {
-                g_mageT[i] = -1;
-                continue;
-            }
             const u32 savedId   = *(volatile u32 *)(K + 8);
             const u32 savedTime = *(volatile u32 *)(K + 0xC4);
-            for (int n = 0; n < 16; ++n)
+            for (u32 sp = 0; sp < step; ++sp)              // 1フレームに step だけ時間を進める (飛ばさず全部呼ぶ)
             {
-                *(volatile u32 *)(K + 8)        = g_mageIds[n];
-                *(volatile float *)(K + 0xC4)   = (float)t;
-                jp_callBody(K);
+                if ((u32)t > g_mageTmax)
+                    break;
+                for (int n = 0; n < 16; ++n)
+                {
+                    if (!((mask >> n) & 1))
+                        continue;
+                    *(volatile u32 *)(K + 8)      = g_mageIds[n];
+                    *(volatile float *)(K + 0xC4) = (float)t;
+                    jp_callBody(K);
+                }
+                ++t;
             }
             *(volatile u32 *)(K + 8)    = savedId;
             *(volatile u32 *)(K + 0xC4) = savedTime;
-            g_mageT[i] = t + 1;
+            g_mageT[i] = ((u32)t > g_mageTmax) ? -1 : t;
         }
 
-        // Aを押した直後に、ゲーム側が別経路で始める通常攻撃などの動きを、待機の強制予約で消す。
-        // (動きの最初の1〜2フレームだけ見える。魔法の判定は、上のゴーストが作るので影響しない)
+        // 発動した直後に、ゲーム側が別経路で始める通常攻撃を、待機の強制予約で消す。
+        // 通常攻撃は ID 0x01000005 だけ (歩きなどは消さない)。動きの最初の1〜2フレームだけ見える。
         if (g_mageCancelWin && g_mageSince <= g_mageCancelWin)
         {
             const u32 cur = *(volatile u32 *)(K + 8);
-            const u32 cat = cur >> 24;
-            const u32 idx = cur & 0xFFFFFF;
-            if (cat == 1 && idx >= 2 && idx <= 0x16)
+            if (cur == 0x01000005)
             {
                 g_mageLastAct = cur;
                 g_mageActLog  = g_mageActLog + 1;
@@ -3555,6 +3599,7 @@ namespace CTRPluginFramework
     {
         static u32 shownTick = 0;
         static u32 lastCasts = 0;
+        static u32 lastAct = 0;
 
         if (!InstallMageHooks())
         {
@@ -3564,12 +3609,27 @@ namespace CTRPluginFramework
         g_mageWatch = 6;
         if (g_mageAlive) g_mageAlive = g_mageAlive - 1;
 
+        // A以外のボタンで発動する設定: 押した瞬間と押している間を、ここ(プラグイン側)で見る
+        if (g_mageKey)
+        {
+            Key k = Key::B;
+            if (g_mageKey == 2) k = Key::Y;
+            else if (g_mageKey == 3) k = Key::L;
+            else if (g_mageKey == 4) k = Key::R;
+            if (Controller::IsKeyPressed(k))
+                g_mageReq = g_mageReq + 1;
+            g_mageHeld = Controller::IsKeyDown(k) ? 1 : 0;
+        }
+        else
+        {
+            g_mageHeld = 0;
+        }
+
         if (!shownTick && g_mageTicks)
         {
             shownTick = 1;
             OSD::Notify("Mage: hook OK");
         }
-        static u32 lastAct = 0;
         if (g_mageActLog != lastAct)
         {
             lastAct = g_mageActLog;
@@ -3584,55 +3644,103 @@ namespace CTRPluginFramework
         }
     }
 
-    static void MageSettingsEntry(MenuEntry *entry)
+    static bool MageAskNumber(const std::string &title, u32 &value, u32 lo, u32 hi)
+    {
+        Keyboard kb(title + "\n今の値は " + std::to_string((unsigned)value) + " です。");
+        kb.IsHexadecimal(false);
+        u32 v = value;
+        if (kb.Open(v, v) != 0)
+            return false;
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        value = v;
+        return true;
+    }
+
+    // タイミングの設定 (数値)
+    static void MageTimingEntry(MenuEntry *entry)
     {
         (void)entry;
+        u32 v;
+        v = g_mageCool;
+        if (MageAskNumber("連続発動の間隔 (0〜600フレーム)\n0 = 1回押すと1回だけ (長押しで連射しない)\n1以上 = 長押しで、その間隔で連射する", v, 0, 600))
+            g_mageCool = v;
+        v = g_mageTmax;
+        if (MageAskNumber("判定を作る最大フレーム (10〜600)\n魔法が途中で消えるなら増やす。", v, 10, 600))
+            g_mageTmax = v;
+        v = g_mageStep;
+        if (MageAskNumber("魔法が出る速さ (1〜10)\n1 = 本来の速さ。大きいほど早く出る(遅延が減る)。", v, 1, 10))
+            g_mageStep = v;
+        v = g_mageCancelWin;
+        if (MageAskNumber("通常攻撃を消す期間 (0〜120フレーム)\n0 = 消さない。発動してからこの間に始まる通常攻撃を消す。", v, 0, 120))
+            g_mageCancelWin = v;
+    }
+
+    // 発動するボタン
+    static void MageKeyEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        std::vector<std::string> opts;
+        opts.push_back("A (ゲームのAを使う。通常攻撃は出ない)");
+        opts.push_back("B (Aの通常攻撃はそのまま使える)");
+        opts.push_back("Y");
+        opts.push_back("L");
+        opts.push_back("R");
+        Keyboard kb("発動するボタンを選ぶ\n今は: " + opts[g_mageKey < 5 ? g_mageKey : 0], opts);
+        const int r = kb.Open();
+        if (r >= 0 && r < 5)
+            g_mageKey = (u32)r;
+    }
+
+    // 出す技の選択 (押すと ON/OFF が切り替わる)
+    static void MageSkillEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        static const char *attr[4]  = { "火", "水", "風", "大地" };
+        static const char *kind[4]  = { "Aチャージ 2段階目", "Aチャージ 1段階目", "Xチャージ 1段階目", "Xチャージ 2段階目" };
+        while (true)
         {
-            Keyboard kb("判定を作る最大フレーム (10〜300)\n魔法が途中で消えるなら増やす。\n今の値は " + std::to_string((unsigned)g_mageTmax) + " です。");
-            kb.IsHexadecimal(false);
-            u32 v = g_mageTmax;
-            if (kb.Open(v, v) == 0)
-            {
-                if (v < 10) v = 10;
-                if (v > 300) v = 300;
-                g_mageTmax = v;
-            }
-        }
-        {
-            Keyboard kb("連続発動の最短間隔 (1〜30フレーム)\n小さいほど速く連射する。\n今の値は " + std::to_string((unsigned)g_mageCool) + " です。");
-            kb.IsHexadecimal(false);
-            u32 v = g_mageCool;
-            if (kb.Open(v, v) == 0)
-            {
-                if (v < 1) v = 1;
-                if (v > 30) v = 30;
-                g_mageCool = v;
-            }
-        }
-        {
-            Keyboard kb("通常攻撃などを消す期間 (0〜120フレーム、0で消さない)\nAを押してからこの間に始まる動きを消す。\n今の値は " + std::to_string((unsigned)g_mageCancelWin) + " です。");
-            kb.IsHexadecimal(false);
-            u32 v = g_mageCancelWin;
-            if (kb.Open(v, v) == 0)
-            {
-                if (v > 120) v = 120;
-                g_mageCancelWin = v;
-            }
+            std::vector<std::string> opts;
+            for (int i = 0; i < 16; ++i)
+                opts.push_back(std::string(((g_mageMask >> i) & 1) ? "[ON]  " : "[OFF] ") + attr[i % 4] + " " + kind[i / 4]);
+            opts.push_back("全部 ON");
+            opts.push_back("全部 OFF");
+            opts.push_back("A系だけ ON");
+            opts.push_back("X系だけ ON");
+            opts.push_back("1段階目だけ ON");
+            opts.push_back("2段階目だけ ON");
+            opts.push_back("戻る");
+            Keyboard kb("出す技を選ぶ (押すと切り替わる)", opts);
+            const int r = kb.Open();
+            if (r < 0 || r == 22)
+                break;
+            if (r < 16)
+                g_mageMask = g_mageMask ^ (1u << r);
+            else if (r == 16) g_mageMask = 0xFFFF;
+            else if (r == 17) g_mageMask = 0;
+            else if (r == 18) g_mageMask = 0x00FF;                     // A系: ビット0-7 (A2段階目 + A1段階目)
+            else if (r == 19) g_mageMask = 0xFF00;                     // X系: ビット8-15
+            else if (r == 20) g_mageMask = 0x0FF0;                     // 1段階目: ビット4-7 (A1) + 8-11 (X1)
+            else if (r == 21) g_mageMask = 0xF00F;                     // 2段階目: ビット0-3 (A2) + 12-15 (X2)
         }
     }
 
     static void AddMageRapid(PluginMenu *menu)
     {
         MenuFolder *f = new MenuFolder("魔法使い連射 (実験)",
-                                       "魔法使いで、Aボタンを押すと、全属性のチャージ技(A/X・1段階/2段階)を、"
+                                       "魔法使いで、ボタンを押すと、チャージ技(A/X・1段階/2段階・各属性)を、"
                                        "プレイヤーのモーションなしで出します。");
-        f->Append(new MenuEntry("Aボタンで全属性チャージ技 (モーションなし)", MageRapidEntry, nullptr,
-                                "魔法使いで有効にして、フィールドでAボタンを押します。\n"
-                                "押している間は、設定した間隔で出続けます。\n"
-                                "以前の魔法使い連射のARコードとは同時に使えません。ARをOFFにして、ゲームを再起動してから使ってください。\n"
+        f->Append(new MenuEntry("魔法使い: モーションなしでチャージ技を出す", MageRapidEntry, nullptr,
+                                "魔法使いで有効にして、フィールドで発動ボタンを押します(初期はAボタン)。\\n"
+                                "以前の魔法使い連射のARコードとは同時に使えません。ARをOFFにして、ゲームを再起動してから使ってください。\\n"
                                 "止める場合は、このメニューをOFFにします(フック自体はゲームを再起動するまで残ります)。"));
-        f->Append(new MenuEntry("設定 (最大フレーム・発動間隔・通常攻撃を消す期間)", nullptr, MageSettingsEntry,
-                                "魔法の判定を作る最大フレーム数、連続発動の最短間隔、通常攻撃を消す期間を変えます。"));
+        f->Append(new MenuEntry("発動するボタンを選ぶ (A / B / Y / L / R)", nullptr, MageKeyEntry,
+                                "Aのままだと、Aを横取りするので通常攻撃は出ません。\\n"
+                                "B・Y・L・Rを選ぶと、Aの通常攻撃はそのまま使えて、選んだボタンでチャージ技が出ます。"));
+        f->Append(new MenuEntry("出す技を選ぶ (属性・A/X・段階)", nullptr, MageSkillEntry,
+                                "16個の技を1つずつON/OFFできます。全部ON、A系だけ、X系だけ、1段階目だけ、2段階目だけも選べます。"));
+        f->Append(new MenuEntry("タイミングの設定 (間隔・最大フレーム・速さ・通常攻撃消し)", nullptr, MageTimingEntry,
+                                "連続発動の間隔(0で1回押すと1回だけ)、判定を作る最大フレーム、魔法が出る速さ、通常攻撃を消す期間を変えます。"));
         menu->Append(f);
     }
 
