@@ -3618,8 +3618,7 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-        
-        AddMaterialZero(menu);
+    
         AddLifeChange(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
@@ -3683,6 +3682,7 @@ namespace CTRPluginFramework
                                    "別のエリアの保存位置へうまく移動できないときの、調査用です。"));
 
         AddQualityFix(menu);
+        AddMaterialZero(menu);
         AddRecommended(menu);
         AddMageRapid(menu);
         
