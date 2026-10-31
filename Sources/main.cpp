@@ -45,7 +45,6 @@ static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
 #include "Life.hpp"
 #include "QualityFix.hpp"
-#include "MaterialZero.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -79,39 +78,40 @@ extern "C"
     // 座標 (x,y,z) は同じ値が複数の場所にある。GDBで、全部に書くと即座に移動し、
     // +0x7C だけだと、スティック操作のあとに反映されることを確認した。
     // 各コピーには「基準の座標との差」を足して書く (コピーごとに高さのずれがあるため)。
-    // 「ゲームが初期位置に置く」ことを検出してから書く。タイミングが分からないので、
-    //  ・新しいプレイヤーのデータが出来て、位置が大きく動いたあと (= 配置された)、
-    //  ・位置が POS_SETTLE_FRAMES フレーム止まったら、書き始める。
-    //  配置が見えなかった場合は、POS_FALLBACK_FRAMES 待ってから書く。
-    //  書き始めたら、POS_HOLD_FRAMES フレームの間、毎フレーム書き続ける (あとからの上書きを直す)。
-    #define POS_JUMP_DIST       2.0f     // 1フレームでこれ以上動いたら「配置された」とみなす
-    #define POS_SETTLE_FRAMES   20
-    #define POS_FALLBACK_FRAMES 240
-    #define POS_LONG_FRAMES     900
+    // 別のエリアへ入ったあと、ゲームは自分で初期位置にプレイヤーを置く (その時期は不明)。
+    // そこで、新しいプレイヤーのデータが出来たらすぐ、保存位置を毎フレーム書き込んで固定する。
+    //  ・ゲームが置き直して、固定が崩れている間は、書き続ける。
+    //  ・位置が POS_QUIET_FRAMES フレーム続けて保存位置のままなら、ゲームの配置は終わったとみなして離す。
+    //  ・いったん落ち着いたあと、位置がずれたら (= 操作が始まった) すぐ離す。
+    //  プレイヤーのデータが出来る前や、読み込み中は、書かない。
+    #define POS_START_FRAMES    5        // 新しいプレイヤーを見つけて、このフレーム数のあとに書き始める
+    #define POS_QUIET_FRAMES    45       // 保存位置のまま、これだけ続いたら離す
+    #define POS_MIN_HOLD        30       // 最低でも、これだけは書く
+    #define POS_MAX_HOLD        600      // これ以上は書き続けない (約10秒)
     #define POS_REUSE_FRAMES    600      // プレイヤーのアドレスが変わらない場合の待ち
-    #define POS_HOLD_FRAMES     120
     #define POS_TIMEOUT_FRAMES  (60 * 40)
-    #define POS_REC_MAX         900      // 経過の記録 (「位置ワープの記録を保存」で書き出せる)
+    #define POS_REC_MAX         400      // 経過の記録 (変化があったときだけ)
 
     volatile u32 g_posMode     = 0;      // 0 = なし / 1 = エリアの読み込み待ち / 2 = 書き込み中
     volatile u32 g_posArea     = 0;
     volatile u32 g_posOldObj   = 0;
     volatile u32 g_posFrames   = 0;
     volatile u32 g_posSince    = 0;
-    volatile u32 g_posSettle   = 0;
-    volatile u32 g_posJumps    = 0;
+    volatile u32 g_posQuiet    = 0;
+    volatile u32 g_posWasQuiet = 0;
     volatile u32 g_posSawGap   = 0;
     volatile u32 g_posHold     = 0;
-    volatile u32 g_posHaveLast = 0;
-    volatile float g_posLast[3] = { 0.0f, 0.0f, 0.0f };
     volatile float g_posXYZ[3]  = { 0.0f, 0.0f, 0.0f };
+    volatile u32   g_posYawOn   = 0;                       // 1 = 向きも書く
+    volatile float g_posYaw[2]  = { 1.0f, 0.0f };          // 向き = { cos, sin } (Y軸まわりの回転)
 
+    // 経過の記録: 1件 = 6語 { フレーム, モード<<24|状態<<16|エリア, プレイヤーのアドレス, x, y, z (floatのビット) }
     volatile u32 g_recN = 0;
-    static u8    g_recMode[POS_REC_MAX];
-    static u16   g_recArea[POS_REC_MAX];
-    static u8    g_recState[POS_REC_MAX];
-    static u32   g_recObj[POS_REC_MAX];
-    static float g_recPos[POS_REC_MAX][3];
+    static u32 g_recW[POS_REC_MAX * 6];
+    static u32 g_recLastKey = 0xFFFFFFFFu;
+    static u32 g_recLastObj = 0;
+    static u32 g_recLastFrame = 0;
+    static float g_recLastPos[3] = { 0.0f, 0.0f, 0.0f };
 
     static float PosAbs(float v) { return v < 0.0f ? -v : v; }
     static bool  PosSane(float v) { return v > -20000.0f && v < 20000.0f; }
@@ -135,6 +135,29 @@ extern "C"
         return obj;
     }
 
+    // 向き: プレイヤーのデータには、回転の行列が2つある (GDBで確認: 向きを変えると、これらが変わる)。
+    //   行列A (+0x04 から3行): [ c 0 s tx ] [ 0 1 0 ty ] [ -s 0 c tz ]   (c = cos, s = sin)
+    //   行列B (+0x34 から3行): Aを拡大率 k (+0x48, 0.11) 倍したもの
+    // 向きが変わるのは、行列の回転部分だけ。座標はそのままにする。
+    static void PosApplyYaw(u32 obj, float c, float s)
+    {
+        float k = *(volatile float *)(obj + 0x48);
+        if (!(k > 0.001f && k < 100.0f))
+            k = 0.11f;
+        *(volatile float *)(obj + 0x04) = c;
+        *(volatile float *)(obj + 0x08) = 0.0f;
+        *(volatile float *)(obj + 0x0C) = s;
+        *(volatile float *)(obj + 0x24) = -s;
+        *(volatile float *)(obj + 0x28) = 0.0f;
+        *(volatile float *)(obj + 0x2C) = c;
+        *(volatile float *)(obj + 0x34) = k * c;
+        *(volatile float *)(obj + 0x38) = 0.0f;
+        *(volatile float *)(obj + 0x3C) = k * s;
+        *(volatile float *)(obj + 0x54) = -k * s;
+        *(volatile float *)(obj + 0x58) = 0.0f;
+        *(volatile float *)(obj + 0x5C) = k * c;
+    }
+
     static void PosApply(u32 obj, float tx, float ty, float tz)
     {
         static const u16 offX[] = { 0x7C, 0x40, 0x10, 0x20C, 0x218 };
@@ -148,19 +171,58 @@ extern "C"
             return;                                  // 変な値 (NaNなど) のときは書かない
 
         const float dx = tx - cx, dy = ty - cy, dz = tz - cz;
-        if (dx == 0.0f && dy == 0.0f && dz == 0.0f)
-            return;
-        for (unsigned i = 0; i < sizeof(offX) / sizeof(offX[0]); ++i) *(volatile float *)(obj + offX[i]) += dx;
-        for (unsigned i = 0; i < sizeof(offY) / sizeof(offY[0]); ++i) *(volatile float *)(obj + offY[i]) += dy;
-        for (unsigned i = 0; i < sizeof(offZ) / sizeof(offZ[0]); ++i) *(volatile float *)(obj + offZ[i]) += dz;
+        if (dx != 0.0f || dy != 0.0f || dz != 0.0f)
+        {
+            for (unsigned i = 0; i < sizeof(offX) / sizeof(offX[0]); ++i) *(volatile float *)(obj + offX[i]) += dx;
+            for (unsigned i = 0; i < sizeof(offY) / sizeof(offY[0]); ++i) *(volatile float *)(obj + offY[i]) += dy;
+            for (unsigned i = 0; i < sizeof(offZ) / sizeof(offZ[0]); ++i) *(volatile float *)(obj + offZ[i]) += dz;
+        }
+        if (g_posYawOn)
+            PosApplyYaw(obj, g_posYaw[0], g_posYaw[1]);
     }
 
     static void PosResetDetect(void)
     {
         g_posSince    = 0;
-        g_posSettle   = 0;
-        g_posJumps    = 0;
-        g_posHaveLast = 0;
+        g_posQuiet    = 0;
+        g_posWasQuiet = 0;
+        g_recLastKey  = 0xFFFFFFFFu;
+        g_recLastObj  = 0;
+        g_recLastFrame = 0;
+    }
+
+    static void PosRecord(u32 area, u32 state, u32 obj, const float *p)
+    {
+        const u32 n = g_recN;
+        if (n >= POS_REC_MAX)
+            return;
+        const u32 key = (g_posMode << 24) | (state << 16) | (area & 0xFFFFu);
+        bool ch = (key != g_recLastKey) || (obj != g_recLastObj);
+        if (!ch)
+        {
+            float m = PosAbs(p[0] - g_recLastPos[0]);
+            const float my = PosAbs(p[1] - g_recLastPos[1]);
+            const float mz = PosAbs(p[2] - g_recLastPos[2]);
+            if (my > m) m = my;
+            if (mz > m) m = mz;
+            ch = (m > 0.5f) || (g_posFrames - g_recLastFrame >= 60);
+        }
+        if (!ch)
+            return;
+        u32 *w = &g_recW[n * 6];
+        w[0] = g_posFrames;
+        w[1] = key;
+        w[2] = obj;
+        memcpy(&w[3], &p[0], 4);
+        memcpy(&w[4], &p[1], 4);
+        memcpy(&w[5], &p[2], 4);
+        g_recN         = n + 1;
+        g_recLastKey   = key;
+        g_recLastObj   = obj;
+        g_recLastFrame = g_posFrames;
+        g_recLastPos[0] = p[0];
+        g_recLastPos[1] = p[1];
+        g_recLastPos[2] = p[2];
     }
 
     // ゲーム本体のスレッドから、毎フレーム呼ばれる。
@@ -181,19 +243,7 @@ extern "C"
         }
 
         g_posFrames = g_posFrames + 1;
-
-        const u32 n = g_recN;                        // 経過の記録
-        if (n < POS_REC_MAX)
-        {
-            g_recMode[n]   = (u8)g_posMode;
-            g_recArea[n]   = (u16)area;
-            g_recState[n]  = (u8)state;
-            g_recObj[n]    = obj;
-            g_recPos[n][0] = p[0];
-            g_recPos[n][1] = p[1];
-            g_recPos[n][2] = p[2];
-            g_recN         = n + 1;
-        }
+        PosRecord(area, state, obj, p);
 
         if (g_posMode == 1)                          // エリアの読み込み待ち
         {
@@ -205,7 +255,7 @@ extern "C"
             if (!obj)
             {
                 g_posSawGap = 1;                     // 読み込み中は、プレイヤーのデータが一時的になくなる
-                PosResetDetect();
+                g_posSince  = 0;
                 return;
             }
             bool fresh = (obj != g_posOldObj) || g_posSawGap;
@@ -213,47 +263,43 @@ extern "C"
                 fresh = true;
             if (area != g_posArea || !fresh)
             {
-                PosResetDetect();
+                g_posSince = 0;
                 return;
             }
-
             g_posSince = g_posSince + 1;
-            if (g_posHaveLast)
+            if (g_posSince >= POS_START_FRAMES)
             {
-                float m = PosAbs(p[0] - g_posLast[0]);
-                const float my = PosAbs(p[1] - g_posLast[1]);
-                const float mz = PosAbs(p[2] - g_posLast[2]);
-                if (my > m) m = my;
-                if (mz > m) m = mz;
-                if (m > POS_JUMP_DIST)
-                {
-                    g_posJumps  = g_posJumps + 1;    // ゲームが位置を置いた
-                    g_posSettle = 0;
-                }
-                else if (m == 0.0f)
-                    g_posSettle = g_posSettle + 1;
-                else
-                    g_posSettle = 0;
-            }
-            g_posLast[0] = p[0];
-            g_posLast[1] = p[1];
-            g_posLast[2] = p[2];
-            g_posHaveLast = 1;
-
-            const bool settled = g_posSettle >= POS_SETTLE_FRAMES;
-            if ((settled && (g_posJumps >= 1 || g_posSince >= POS_FALLBACK_FRAMES)) || g_posSince >= POS_LONG_FRAMES)
-            {
-                g_posHold = 0;
-                g_posMode = 2;
+                g_posHold     = 0;
+                g_posQuiet    = 0;
+                g_posWasQuiet = 0;
+                g_posMode     = 2;
             }
             return;
         }
 
         // g_posMode == 2: 書き込み中
         if (obj)
+        {
+            const bool near = PosAbs(p[0] - g_posXYZ[0]) < 0.05f && PosAbs(p[1] - g_posXYZ[1]) < 0.05f && PosAbs(p[2] - g_posXYZ[2]) < 0.05f;
+            if (near)
+            {
+                g_posQuiet = g_posQuiet + 1;
+                if (g_posQuiet >= 20)
+                    g_posWasQuiet = 1;
+            }
+            else
+            {
+                if (g_posWasQuiet)
+                {
+                    g_posMode = 0;                   // 落ち着いたあとに動いた = 操作が始まったので、離す
+                    return;
+                }
+                g_posQuiet = 0;
+            }
             PosApply(obj, g_posXYZ[0], g_posXYZ[1], g_posXYZ[2]);
+        }
         g_posHold = g_posHold + 1;
-        if (g_posHold >= POS_HOLD_FRAMES)
+        if ((g_posQuiet >= POS_QUIET_FRAMES && g_posHold >= POS_MIN_HOLD) || g_posHold >= POS_MAX_HOLD)
             g_posMode = 0;
     }
 
@@ -826,43 +872,11 @@ namespace CTRPluginFramework
         return n ? std::string(n) : Utils::Format("0x%04X", id);
     }
 
-    // かばんの連結リスト(管理領域 0x6DCD2C)をたどって、使用中の枠番号を集める。想定と違えば false。
-    // 捨てた・削除した枠には、古いIDが残ることがあるので、IDだけでは使用中かどうか判断できない。
-    static bool WalkLiveBagSlots(std::vector<bool> &inUse)
-    {
-        static const u32 LIVE = 0x006DCD2C;
-        u32 p = 0;
-        u16 head = 0, cnt = 0;
-        if (!Process::Read32(LIVE + 0x08, p) || p != BAG_BASE - 4)
-            return false;
-        if (!Process::Read16(LIVE + 0x1E, head) || !Process::Read16(LIVE + 0x1C, cnt))
-            return false;
-        inUse.assign(BAG_SLOTS, false);
-        u32 n = 0;
-        u16 idx = head;
-        while (idx != 0xFFFF)
-        {
-            if (idx >= BAG_SLOTS || inUse[idx])
-                return false;
-            inUse[idx] = true;
-            ++n;
-            u16 next = 0;
-            if (!Process::Read16(BAG_BASE - 4 + (u32)idx * SLOT_SIZE, next))
-                return false;
-            idx = next;
-        }
-        return n == cnt;
-    }
-
     // かばんの中で、このカテゴリのアイテムがある枠と、その現在のIDを集める
     static void CollectBagSlots(const Category &cat, std::vector<u32> &slots, std::vector<u32> &ids)
     {
-        std::vector<bool> inUse;
-        const bool useList = WalkLiveBagSlots(inUse);   // 失敗したときは、IDだけで判断する
         for (u32 slot = 0; slot < BAG_SLOTS; ++slot)
         {
-            if (useList && !inUse[slot])
-                continue;
             u16 id = 0;
             if (!Process::Read16(SlotAddr(slot) + OFF_ID, id))
                 continue;
@@ -1130,7 +1144,7 @@ namespace CTRPluginFramework
     //   ・倉庫も同じ作り(ダンプで確認: 管理領域 0x6DCD70、リンク配列 0x6E5460、1500枠、先頭は1499番から)。
     static constexpr u32 ROW_DATA   = 0x38;
     static constexpr u16 NO_LINK    = 0xFFFF;
-    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行の初期値(ゲームが最初に全行へ入れているID)。削除した行に書く
+    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行に入っていたID (削除時にこれを書く・推測)
     static constexpr size_t DUP_THRESHOLD = 3;             // 名前がこの件数以上かぶると「未実装」とみなす
 
     // 連結リストを持つ入れ物。live=管理領域 (+8 リンク配列のアドレス、+0x1C 件数、+0x1E 先頭)
@@ -1141,10 +1155,9 @@ namespace CTRPluginFramework
         u32 live;
         u32 linkBase;
         u32 slots;
-        u32 arr;      // 空き枠の番号表 (u16 が slots 個)。管理領域の +0x10 が指す
     };
-    static const Container g_bag   = { "かばん", 0x006DCD2C, 0x006DDF28,  500, 0x006DCDF8 };
-    static const Container g_store = { "倉庫",   0x006DCD70, 0x006E5460, 1500, 0x006DD1E0 };
+    static const Container g_bag   = { "かばん", 0x006DCD2C, 0x006DDF28,  500 };
+    static const Container g_store = { "倉庫",   0x006DCD70, 0x006E5460, 1500 };
 
     struct BagState
     {
@@ -1165,12 +1178,6 @@ namespace CTRPluginFramework
         if (!Process::Read32(c.live + 0x08, p) || p != c.linkBase)
         {
             err = Utils::Format("%sの管理領域が想定と違います。(バージョン違いの可能性。何も書いていません)", c.name);
-            return false;
-        }
-        u32 ap = 0;
-        if (!Process::Read32(c.live + 0x10, ap) || ap != c.arr)
-        {
-            err = Utils::Format("%sの空き枠の表が想定と違います。(何も書いていません)", c.name);
             return false;
         }
         u16 head = 0, cnt = 0;
@@ -1237,21 +1244,9 @@ namespace CTRPluginFramework
         return n;
     }
 
-    // 空き枠の表を作り直す。ゲームは「表の arr[件数] を次に使う枠」として取り出し、
-    // 削除では arr[件数-1] に外した枠を入れる。arr[件数 以降] = 今あいている枠すべて、が成り立つ必要がある。
-    // (これが崩れると、次にゲームがアイテムを入手したときに使用中の枠を取り出してフリーズする)
-    static void SyncFreeArray(const BagState &b)
-    {
-        u32 w = (u32)b.order.size();
-        for (int k = (int)b.c->slots - 1; k >= 0; --k)
-            if (!b.used[k])
-                Process::Write16(b.c->arr + (w++) * 2, (u16)k);
-    }
-
     static void CommitCount(const BagState &b)
     {
         Process::Write16(b.c->live + 0x1C, (u16)b.order.size());
-        SyncFreeArray(b);
     }
 
     // ------------------------------------------------------------
@@ -2092,10 +2087,8 @@ namespace CTRPluginFramework
 
     // ------------------------------------------------------------
     //  アイテム削除 (かばん / 倉庫)
-    //  連結リストから外し、件数を減らし、空き枠の表を整え、行のIDを空き行の値(0x666)にする。
-    //  (通常の「捨てる」と前後ダンプを比べて、リンクを FFFF/FFFF にすること、
-    //   空き枠の表に外した枠を入れることを確認した。行のIDを消すのはチート独自の処理で、
-    //   空き枠の表を整えたうえで消しても入手時にフリーズしないかは、実機で未確認)
+    //  連結リストから外し、件数を減らし、行のIDを空き行の値(0x666)にする。
+    //  ※ゲーム本人の削除処理は未確認。
     //  装備中の印: かばんの行の +8 の bit0 (装備を付け替えたときの前後ダンプで確認。
     //  武器1・防具6・ライフ道具8 が印つきだった)。装備中の行は、どの削除でも消さない。
     // ------------------------------------------------------------
@@ -2119,11 +2112,7 @@ namespace CTRPluginFramework
 
         for (u16 s : del)
         {
-            u8 flag = 0;
-            Process::Read8(RowOf(b, s) + 8, flag);
-            if (flag & 1)
-                Process::Write32(RowOf(b, s) + 8, 0);          // 装備中の印も消す
-            Process::Write32(RowOf(b, s) + OFF_ID, EMPTY_ID);  // アイテムデータを消す
+            Process::Write32(RowOf(b, s) + OFF_ID, EMPTY_ID);
             Process::Write16(LnkOf(b, s),     NO_LINK);
             Process::Write16(LnkOf(b, s) + 2, NO_LINK);
             b.used[s] = false;
@@ -2136,7 +2125,6 @@ namespace CTRPluginFramework
         Process::Write16(b.c->live + 0x1E, keep.empty() ? NO_LINK : keep[0]);
         Process::Write16(b.c->live + 0x1C, (u16)keep.size());
         b.order = keep;
-        SyncFreeArray(b);
     }
 
     // カテゴリ単位 / 未実装だけ、まとめて削除
@@ -2159,8 +2147,7 @@ namespace CTRPluginFramework
         const bool all = ((size_t)ci == sizeof(g_cats) / sizeof(g_cats[0]));
 
         std::vector<std::string> modes;
-        modes.push_back(all ? std::string("全てのアイテムを削除")
-                            : Utils::Format("%sを全て削除", g_cats[ci].name));
+        modes.push_back("そのカテゴリのアイテムをすべて削除");
         modes.push_back("未実装アイテムだけ削除");
         Keyboard kmo("削除する対象", modes);
         const int mo = kmo.Open();
@@ -2219,34 +2206,8 @@ namespace CTRPluginFramework
                                          "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
     }
 
-    // 空き枠の表の修復 (以前のチート生成・削除で崩れた分を直す)
-    static void RepairFreeEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        if (!(MessageBox("空き枠情報の修復",
-                         "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。\n"
-                         "チートで生成・削除したあと、通常のプレイで入手してフリーズする場合に使います。\n"
-                         "セーブのバックアップは取りましたか?", DialogType::DialogYesNo))())
-            return;
-        std::string res;
-        const Container *conts[2] = { &g_bag, &g_store };
-        for (const Container *ct : conts)
-        {
-            BagState b;
-            std::string err;
-            if (!LoadBag(b, *ct, err))
-            {
-                res += Utils::Format("%s: 修復できません (%s)\n", ct->name, err.c_str());
-                continue;
-            }
-            SyncFreeArray(b);
-            res += Utils::Format("%s: %u 件 / 空き %u 枠を整えました\n", ct->name, (u32)b.order.size(), FreeRows(b));
-        }
-        MessageBox("完了", res)();
-    }
-
-    // 装備中の武器・防具・ライフ道具も含めて、かばんのすべてを削除
-    static void DeleteAllIncludingEquippedEntry(MenuEntry *entry)
+    // 装備中の武器・防具・ライフ道具以外を、かばんからすべて削除
+    static void DeleteExceptEquippedEntry(MenuEntry *entry)
     {
         (void)entry;
 
@@ -2257,42 +2218,49 @@ namespace CTRPluginFramework
             MessageBox("削除できませんでした", err)();
             return;
         }
-        if (b.order.empty())
-        {
-            MessageBox("対象なし", "かばんにアイテムがありません。")();
-            return;
-        }
 
+        std::vector<u16> del;
         u32 eqW = 0, eqA = 0, eqT = 0, eqOther = 0;
         for (u16 s : b.order)
         {
-            if (!IsEquipped(b, s))
-                continue;
             u32 id = 0;
             Process::Read32(RowOf(b, s) + OFF_ID, id);
-            const Category *cg = FindCategory((u16)id);
-            if (cg == &g_cats[0])      ++eqW;
-            else if (cg == &g_cats[1]) ++eqA;
-            else if (cg == &g_cats[2]) ++eqT;
-            else                       ++eqOther;
+            if (IsEquipped(b, s))
+            {
+                const Category *cg = FindCategory((u16)id);
+                if (cg == &g_cats[0])      ++eqW;
+                else if (cg == &g_cats[1]) ++eqA;
+                else if (cg == &g_cats[2]) ++eqT;
+                else                       ++eqOther;
+            }
+            else
+                del.push_back(s);
+        }
+        const u32 eq = eqW + eqA + eqT + eqOther;
+        if (eq == 0)
+        {
+            MessageBox("中止", "装備中の印がついたアイテムが1つも見つかりません。\n"
+                               "全部消してしまう恐れがあるので、何も削除せずに止めました。")();
+            return;
+        }
+        if (del.empty())
+        {
+            MessageBox("対象なし", "削除するアイテムがありません。")();
+            return;
         }
 
-        std::string msg = Utils::Format("かばんの全 %u 件を削除します。(家具・素材も含む)\n", (u32)b.order.size());
-        msg += Utils::Format("装備中の 武器 %u / 防具 %u / ライフ道具 %u", eqW, eqA, eqT);
+        std::string msg = Utils::Format("残すもの(装備中): 武器 %u / 防具 %u / ライフ道具 %u", eqW, eqA, eqT);
         if (eqOther)
             msg += Utils::Format(" / その他 %u", eqOther);
-        msg += " も消えます。\n装備は外れた状態になります。(実機未検証)\n"
-               "セーブのバックアップは取りましたか?\n実行しますか?";
-        if (!(MessageBox("装備中も含めて全て削除", msg, DialogType::DialogYesNo))())
-            return;
-        if (!(MessageBox("最終確認", "本当に、かばんのすべてを削除しますか?", DialogType::DialogYesNo))())
+        msg += Utils::Format("\n削除するもの: それ以外のかばん内すべて %u 件\n"
+                             "(家具・素材なども含みます)\n"
+                             "セーブのバックアップは取りましたか?\n実行しますか?", (u32)del.size());
+        if (!(MessageBox("装備中以外をすべて削除", msg, DialogType::DialogYesNo))())
             return;
 
-        std::vector<u16> del = b.order;
         DeleteRows(b, del);
         MessageBox("完了", Utils::Format("%u 件を削除しました。\n"
-                                         "かばん画面は、一度閉じて開き直すと反映されます。\n"
-                                         "装備は、装備画面で付け直してください。", (u32)del.size()))();
+                                         "かばん画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
     }
 
     // 1つずつ削除 (連続)。カテゴリを選び、一覧から選ぶたびにその場で削除する。Bで終了。
@@ -2510,7 +2478,7 @@ namespace CTRPluginFramework
     #endif
     #define WARP_POINTS_FILE "/fll_warp_points.txt"
 
-    struct SavedPos { std::string name; u32 area; float x, y, z; };
+    struct SavedPos { std::string name; u32 area; float x, y, z; float yc, ys; bool hasYaw; };
     static std::vector<SavedPos> g_savedPos;
     static bool g_savedLoaded = false;
 
@@ -2555,10 +2523,12 @@ namespace CTRPluginFramework
             if (!line.empty() && line[line.size() - 1] == '\r')
                 line.erase(line.size() - 1);
 
-            std::string col[4];
+            // 1行 = エリア / x / y / z / (向きの cos / sin) / 名前 (タブ区切り)。
+            // 向きがない古い行 (4列 + 名前) も読める。
+            std::string col[6];
             size_t s0 = 0;
             int n = 0;
-            while (n < 4)
+            while (n < 6)
             {
                 const size_t t = line.find('\t', s0);
                 if (t == std::string::npos)
@@ -2566,7 +2536,7 @@ namespace CTRPluginFramework
                 col[n++] = line.substr(s0, t - s0);
                 s0 = t + 1;
             }
-            if (n != 4)
+            if (n != 4 && n != 6)
                 continue;
 
             SavedPos p;
@@ -2574,6 +2544,15 @@ namespace CTRPluginFramework
             p.x    = BitsFloat((u32)strtoul(col[1].c_str(), nullptr, 16));
             p.y    = BitsFloat((u32)strtoul(col[2].c_str(), nullptr, 16));
             p.z    = BitsFloat((u32)strtoul(col[3].c_str(), nullptr, 16));
+            p.yc = 1.0f;
+            p.ys = 0.0f;
+            p.hasYaw = false;
+            if (n == 6)
+            {
+                p.yc = BitsFloat((u32)strtoul(col[4].c_str(), nullptr, 16));
+                p.ys = BitsFloat((u32)strtoul(col[5].c_str(), nullptr, 16));
+                p.hasYaw = !(p.yc == 0.0f && p.ys == 0.0f);
+            }
             p.name = line.substr(s0);
             g_savedPos.push_back(p);
         }
@@ -2586,7 +2565,8 @@ namespace CTRPluginFramework
         File f;
         if (File::Open(f, WARP_POINTS_FILE, File::WRITE | File::CREATE | File::APPEND) == 0)
         {
-            f.WriteLine(Utils::Format("%u\t%08X\t%08X\t%08X\t", p.area, FloatBits(p.x), FloatBits(p.y), FloatBits(p.z)) + p.name);
+            f.WriteLine(Utils::Format("%u\t%08X\t%08X\t%08X\t%08X\t%08X\t", p.area, FloatBits(p.x), FloatBits(p.y), FloatBits(p.z),
+                                      FloatBits(p.hasYaw ? p.yc : 0.0f), FloatBits(p.hasYaw ? p.ys : 0.0f)) + p.name);
             f.Close();
         }
         else
@@ -2608,6 +2588,9 @@ namespace CTRPluginFramework
         g_posXYZ[0]   = p.x;
         g_posXYZ[1]   = p.y;
         g_posXYZ[2]   = p.z;
+        g_posYaw[0]   = p.yc;
+        g_posYaw[1]   = p.ys;
+        g_posYawOn    = p.hasYaw ? 1 : 0;
         g_posArea     = p.area;
         g_posOldObj   = obj;
         g_posFrames   = 0;
@@ -2660,6 +2643,15 @@ namespace CTRPluginFramework
         p.x = *(volatile float *)(obj + 0x7C);
         p.y = *(volatile float *)(obj + 0x80);
         p.z = *(volatile float *)(obj + 0x84);
+        {
+            // 向き (cos, sin)。値が正しい回転になっているときだけ保存する
+            const float c = *(volatile float *)(obj + 0x04);
+            const float sn = *(volatile float *)(obj + 0x0C);
+            const float len = c * c + sn * sn;
+            p.hasYaw = (len > 0.95f && len < 1.05f);
+            p.yc = p.hasYaw ? c : 1.0f;
+            p.ys = p.hasYaw ? sn : 0.0f;
+        }
 
         std::string name;
         Keyboard kb("ワープ名を入力");
@@ -2676,11 +2668,12 @@ namespace CTRPluginFramework
         AppendSavedPos(p);
 
         MessageBox("保存しました",
-                   Utils::Format("%s\nエリアID %u\nx %s / y %s / z %s\n\n「エリアワープ」の一覧の末尾に追加しました。",
-                                 p.name.c_str(), p.area, Fmt2(p.x).c_str(), Fmt2(p.y).c_str(), Fmt2(p.z).c_str()))();
+                   Utils::Format("%s\nエリアID %u\nx %s / y %s / z %s\n向き: %s\n\n「エリアワープ」の一覧の末尾に追加しました。",
+                                 p.name.c_str(), p.area, Fmt2(p.x).c_str(), Fmt2(p.y).c_str(), Fmt2(p.z).c_str(),
+                                 p.hasYaw ? "保存しました" : "取得できませんでした (位置だけ保存)").c_str())();
     }
 
-    // 保存位置へのワープの経過 (毎フレームの、エリアID・状態・座標) を SD に書き出す。うまくいかないときの調査用。
+    // 保存位置へのワープの経過 (変化があったときだけ) を、SD に書き出し、GDBで読むためのアドレスも表示する。
     static void PosDumpEntry(MenuEntry *entry)
     {
         (void)entry;
@@ -2692,21 +2685,26 @@ namespace CTRPluginFramework
         }
     #if WARP_POINTS_TO_FILE
         File f;
-        if (File::Open(f, "/fll_warp_notes.txt", File::WRITE | File::CREATE | File::APPEND) != 0)
+        if (File::Open(f, "/fll_warp_notes.txt", File::WRITE | File::CREATE | File::APPEND) == 0)
         {
-            MessageBox("書き出せません", "fll_warp_notes.txt を開けませんでした。")();
-            return;
+            f.WriteLine(Utils::Format("TL-BEGIN target_area=%u events=%u", (u32)g_posArea, n));
+            for (u32 i = 0; i < n; ++i)
+            {
+                const u32 *w = &g_recW[i * 6];
+                float x, y, z;
+                memcpy(&x, &w[3], 4);
+                memcpy(&y, &w[4], 4);
+                memcpy(&z, &w[5], 4);
+                f.WriteLine(Utils::Format("TL f%u m%u s%u a%u o%X  %s %s %s", w[0], w[1] >> 24, (w[1] >> 16) & 0xFF, w[1] & 0xFFFF, w[2],
+                                          Fmt2(x).c_str(), Fmt2(y).c_str(), Fmt2(z).c_str()));
+            }
+            f.WriteLine("TL-END");
+            f.Close();
         }
-        f.WriteLine(Utils::Format("TL-BEGIN target_area=%u frames=%u", (u32)g_posArea, n));
-        for (u32 i = 0; i < n; ++i)
-        {
-            f.WriteLine(Utils::Format("TL %u m%u a%u s%u o%X  %s %s %s", i, (u32)g_recMode[i], (u32)g_recArea[i], (u32)g_recState[i],
-                                      g_recObj[i], Fmt2(g_recPos[i][0]).c_str(), Fmt2(g_recPos[i][1]).c_str(), Fmt2(g_recPos[i][2]).c_str()));
-        }
-        f.WriteLine("TL-END");
-        f.Close();
     #endif
-        MessageBox("書き出しました", Utils::Format("%u 行を fll_warp_notes.txt に書き出しました。", n))();
+        MessageBox("経過を記録しています",
+                   Utils::Format("%u 件 (1件 = 6語)。\nGDBで読むときは、次を実行してください。\n\nx/%uwx 0x%08X",
+                                 n, n * 6, (u32)(uintptr_t)g_recW))();
     }
 
     // 位置ワープの状態が変わったときに、画面に通知する (プラグイン側のフレームごとの処理)
@@ -3462,8 +3460,7 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-        
-        AddMaterialZero(menu);
+
         AddLifeChange(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
@@ -3487,21 +3484,18 @@ namespace CTRPluginFramework
             gen->Append(new MenuEntry("IDを指定して1つずつ生成", nullptr, ContinuousCreateEntry,
                                       "カテゴリを選び、追加項目を決めたら、一覧から選ぶたびにその場で作ります。\n"
                                       "一覧は同じページに戻るので、続けて選べます。Bで終了します。"));
-            gen->Append(new MenuEntry("空き枠情報を修復 (フリーズ対策)", nullptr, RepairFreeEntry,
-                                      "チートで生成・削除したあと、通常プレイでの入手時にフリーズする場合に使います。\n"
-                                      "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。"));
             gen->Append(new MenuEntry("同じアイテムをN個(別枠)", nullptr, CreateNEntry,
                                       "同じアイテムを、別々の枠にN個作ります。(素材・消耗品は1枠にまとまります)"));
             menu->Append(gen);
         }
         {
             MenuFolder *del = new MenuFolder("アイテム削除",
-                                             "かばん・倉庫のアイテムを削除します。「装備中の…を含む全てを削除」以外は、装備中のものを残します。必ずセーブのバックアップを取ってから使ってください。");
+                                             "かばん・倉庫のアイテムを削除します。装備中のものは消えません。必ずセーブのバックアップを取ってから使ってください。");
             del->Append(new MenuEntry("カテゴリ・未実装をまとめて削除", nullptr, BulkDeleteEntry,
                                       "かばんまたは倉庫で、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。"));
-            del->Append(new MenuEntry("装備中の武器・防具・ライフ道具を含む全てを削除", nullptr, DeleteAllIncludingEquippedEntry,
-                                      "かばんの中のすべてを、装備中の武器・防具・ライフ道具も含めて削除します。(家具・素材も含む)\n"
-                                      "装備は外れた状態になります。必ずバックアップを取ってから使ってください。"));
+            del->Append(new MenuEntry("装備中の武器・防具・ライフ道具以外を削除", nullptr, DeleteExceptEquippedEntry,
+                                      "かばんの中の、装備中の武器・防具・ライフ道具以外をすべて削除します。(家具・素材も含む)\n"
+                                      "装備中の印が見つからないときは、何も消さずに止まります。"));
             del->Append(new MenuEntry("1つずつ削除", nullptr, DeleteOneByOneEntry,
                                       "かばんまたは倉庫で、カテゴリを選び、一覧から選ぶたびにその場で削除します。Bで終了します。"));
             menu->Append(del);
