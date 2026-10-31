@@ -3020,57 +3020,67 @@ namespace CTRPluginFramework
         OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, dest, link));
     }
 
-　　    // ============================================================
-    //  プレイヤー切り替え (直接版) / 日本語版 v1.7L
-    //  実機GDBで通し確認済み
-    // ============================================================
+    // ------------------------------------------------------------
+    //  プレイヤー切り替え (実機GDBで確認済みのアドレス / 日本語版 v1.7L)
+    //    0x7208DC : シーンフロー管理 (+36 byte=切替要求, +44 int=要求状態, +48 int=現在状態)
+    //               状態番号: 1=IDLE, 8=Title, 9=Field
+    //    0x687D14 : 状態1(IDLE)が起動するメッセージ番号 (halfword, 通常0)
+    //    0x6B95EC : ルートタスク (子リスト head=+340, next=+344)
+    //    0x46FEEC : メッセージ送信 Send(受け取り先, メッセージ)
+    //    0x6D9D1C : スロット選択タスク(ExSaveSelect)を作るメッセージ
+    //    ExSaveSelect (vtable 0x66D898):
+    //        +0x91B9 byte=現在状態 / +0x91B8 byte=次の状態 / +0x91BC int=選択スロット
+    //        状態0x0A=UIを開く, 0x0B=決定待ち, 0x0C以降=読み込み(状態0x1Aで本体)
+    //    0x68BAD1 : byte (既存データ決定では 0)
+    //    0x71BA40 : スロット管理 (+0 byte=現在スロット, +4..+24=スロットごとのフラグ) / 起動時に0で初期化される
+    //    0x719374 : セーブ関連の管理オブジェクト。init=0x28299C / 毎フレーム更新=0x28238C / 終了=0x257D88
+    //               通常はタイトルのタスクがこれを行う。直接版では ExSaveSelect の更新を差し替えて代行する
+    //    FLOW+12  : シーンフローのリスナー枠 (状態変更直後にゲームのスレッドから呼ばれる)
+    //  ルートA: タイトル経由  (「ゲームを始める」を押す操作とスロット決定を自動化)
+    //  ルートB: 直接          (フィールドを片付け -> スロット選択タスクだけ作る -> 読み込み -> フィールド再開)
+    // ------------------------------------------------------------
     namespace PlayerSwitch
     {
-        // true にすると、進行状況を画面に出します(不具合調査用)
-        static constexpr bool VERBOSE = false;
-        // true にすると、スロット選択画面(オレンジ色の背景)を開かずに進めます
-        // (必ず先にGDBで動作確認してから true にしてください)
-        static constexpr bool HIDE_SELECT_UI = false;
+        static constexpr u32 FLOW_OBJ     = 0x7208DC;
+        static constexpr u32 ROOT_TASK    = 0x6B95EC;
+        static constexpr u32 VPTR_EXSEL   = 0x66D898;
+        static constexpr u32 VPTR_TITLE   = 0x669154;
+        static constexpr u32 VPTR_FIELD   = 0x669038;
+        static constexpr u32 STATE_IDLE   = 1;
+        static constexpr u32 STATE_TITLE  = 8;
+        static constexpr u32 STATE_FIELD  = 9;
+        static constexpr u32 IDLE_MSG_ADDR = 0x687D14;
+        static constexpr u32 FN_SEND      = 0x46FEEC;
+        static constexpr u32 DESC_EXSEL   = 0x6D9D1C;
+        static constexpr u32 MGR_OBJ      = 0x719374;   // セーブ関連の管理オブジェクト (タイトルが初期化/毎フレーム更新/終了処理を行う)
+        static constexpr u32 FN_MGR_INIT  = 0x28299C;
+        static constexpr u32 FN_MGR_UPDATE = 0x28238C;
+        static constexpr u32 FN_MGR_TERM  = 0x257D88;
+        static constexpr u32 FN_EXSEL_UPDATE = 0x411E98;   // ExSaveSelect の更新 (vtable[5])
+        static constexpr u32 VTBL_EXSEL_UPDATE = 0x66D8AC; // = VPTR_EXSEL + 5*4
+        static constexpr u32 SLOT_VAR     = 0x71BA40;   // +0 byte=現在スロット, +4..+24 word=スロットごとの読み込み済みフラグ
+        static constexpr u32 MAX_FRAMES   = 60 * 90;
+        static constexpr u32 UI_WAIT      = 5;
 
-        static constexpr u32 FLOW_OBJ       = 0x7208DC;   // シーンフロー (+36 切替要求, +44 要求状態, +48 現在状態)
-        static constexpr u32 ROOT_TASK      = 0x6B95EC;   // ルートタスク
-        static constexpr u32 VPTR_EXSEL     = 0x66D898;   // スロット選択タスクの vtable
-        static constexpr u32 VPTR_FIELD     = 0x669038;
-        static constexpr u32 STATE_IDLE     = 1;
-        static constexpr u32 STATE_FIELD    = 9;
-        static constexpr u32 IDLE_MSG_ADDR  = 0x687D14;
-        static constexpr u32 FN_SEND        = 0x46FEEC;
-        static constexpr u32 DESC_EXSEL     = 0x6D9D1C;
-        static constexpr u32 MGR_OBJ        = 0x719374;
-        static constexpr u32 FN_MGR_INIT    = 0x28299C;
-        static constexpr u32 FN_MGR_UPDATE  = 0x28238C;
-        static constexpr u32 FN_MGR_TERM    = 0x257D88;
-        static constexpr u32 FN_EXSEL_UPDATE   = 0x411E98;
-        static constexpr u32 VTBL_EXSEL_UPDATE = 0x66D8AC;
-        static constexpr u32 UIMGR_OBJ      = 0x6B977C;
-        static constexpr u32 FN_ATTACH      = 0x46FFE0;
-        static constexpr u32 SLOT_VAR       = 0x71BA40;
-        static constexpr u32 UI_OPEN_ADDR   = 0x41251C;   // bl 0x308888 (スロット選択UIを開く)
-        static constexpr u32 UI_OPEN_ORIG   = 0xEBFBD8D9;
-        static constexpr u32 ARM_NOP        = 0xE1A00000;
-        static constexpr u32 MAX_FRAMES     = 60 * 90;
-
-        typedef s32  (*SendFn)(u32, u32);
+        typedef s32 (*SendFn)(u32 receiver, u32 message);
         typedef void (*FnU32)(u32);
-        typedef void (*FnU32x2)(u32, u32);
 
-        enum Phase { IDLE, D_BLANK, D_SEL, D_DONE, D_RESTART };
+        enum Phase { IDLE,
+                     T_SELECT, T_RESULT, T_FIELD,                  // ルートA
+                     D_BLANK, D_SEL, D_DONE, D_RESTART };           // ルートB
 
-        static volatile int  g_slot  = -1;
-        static Phase         g_phase = IDLE;
-        static u32           g_wait  = 0;
-        static u32           g_tick  = 0;
-        static volatile bool g_sent  = false;
+        static int   g_slot  = -1;
+        static Phase g_phase = IDLE;
+        static u32   g_timer = 0;
+        static u32   g_wait  = 0;
+        static u32   g_settle = 0;
+        static volatile bool g_sent = false;
+        static bool g_mgrInit = false;
+        static bool g_vtblPatched = false;
         static volatile s32  g_sendResult = 0;
-        static bool g_mgrInit = false, g_vtblPatched = false, g_uiAttached = false, g_uiHidden = false;
-        static int  g_lastSt = -1;
-
-        static void Say(const std::string &m) { if (VERBOSE) OSD::Notify(m); }
+        static int   g_lastSt = -1;
+        static int   g_lastTitleSt = -1;
+        static u32   g_skipWait = 0;
 
         static u32 FindByVptr(u32 node, u32 vptr, int depth)
         {
@@ -3079,6 +3089,7 @@ namespace CTRPluginFramework
                 return 0;
             if (Process::Read32(node, v) && v == vptr)
                 return node;
+
             u32 child = 0;
             if (!Process::Read32(node + 340, child))
                 return 0;
@@ -3093,6 +3104,8 @@ namespace CTRPluginFramework
             return 0;
         }
 
+        static u32 FindExSel(u32 node, int depth) { return FindByVptr(node, VPTR_EXSEL, depth); }
+
         static void RequestState(u32 st)
         {
             Process::Write32(FLOW_OBJ + 44, st);
@@ -3101,29 +3114,15 @@ namespace CTRPluginFramework
 
         static void RestoreIdleMsg(void) { Process::Write16(IDLE_MSG_ADDR, 0); }
 
-        // スロット選択タスクの更新の差し替え (ゲーム本来のスレッドで毎フレーム動く)
-        //  1. UI管理を、このタスクの子として登録 (これがないと読み込みが完了しない)
-        //  2. 状態0x0C(読み込み開始)の直前に、スロット番号を書く
-        //  3. 管理オブジェクトを更新してから、本来の更新を呼ぶ
-        //  4. 状態0x0E(リンク確認)に進もうとしたら 0x22 へ飛ばす
+        // ExSaveSelect の更新の差し替え: 管理オブジェクトを更新してから、本来の更新を呼ぶ
+        // (通常はタイトルのタスクが毎フレーム管理オブジェクトを更新している)
         static void ExSelUpdateWrapper(u32 self)
         {
-            if (!g_uiAttached)
-            {
-                ((FnU32x2)FN_ATTACH)(self, UIMGR_OBJ);
-                g_uiAttached = true;
-            }
-            volatile u8 *nextSt = (volatile u8 *)(self + 0x91B8);
-            if (*nextSt == 0x0C && g_slot >= 0)
-                *(volatile u8 *)SLOT_VAR = (u8)g_slot;
-
             ((FnU32)FN_MGR_UPDATE)(MGR_OBJ);
             ((FnU32)FN_EXSEL_UPDATE)(self);
-
-            if (*nextSt == 0x0E)
-                *nextSt = 0x22;
         }
 
+        // 後片付け: 差し替えの復元と、管理オブジェクトの終了処理
         static void CleanupDirect(void)
         {
             if (g_vtblPatched)
@@ -3131,16 +3130,34 @@ namespace CTRPluginFramework
                 Process::Write32(VTBL_EXSEL_UPDATE, FN_EXSEL_UPDATE);
                 g_vtblPatched = false;
             }
-            if (g_uiHidden)
-            {
-                Process::Write32(UI_OPEN_ADDR, UI_OPEN_ORIG);
-                g_uiHidden = false;
-            }
             if (g_mgrInit)
             {
                 ((FnU32)FN_MGR_TERM)(MGR_OBJ);
                 g_mgrInit = false;
             }
+        }
+
+        // ゲーム起動時の SlotReset (0x21B1B0) と同じ初期化
+        static void ResetSlotState(void)
+        {
+            Process::Write8(SLOT_VAR, 0);
+            for (u32 o = 4; o <= 24; o += 4)
+                Process::Write32(SLOT_VAR + o, 0);
+        }
+
+        // シーンフローのリスナー (FLOW+12)。状態変更の直後に、ゲーム本来のスレッドから呼ばれる
+        static void FlowListener(s32 state, u32 arg)
+        {
+            (void)arg;
+            if (state != (s32)STATE_IDLE)
+                return;
+            Process::Write32(FLOW_OBJ + 12, 0);   // 1回だけ実行
+            ResetSlotState();
+            ((FnU32)FN_MGR_INIT)(MGR_OBJ);        // タイトルの初期化と同じ
+            g_mgrInit = true;
+            g_vtblPatched = Process::Write32(VTBL_EXSEL_UPDATE, (u32)&ExSelUpdateWrapper);
+            g_sendResult = ((SendFn)FN_SEND)(ROOT_TASK, DESC_EXSEL);
+            g_sent = true;
         }
 
         static void Abort(const char *msg)
@@ -3152,56 +3169,108 @@ namespace CTRPluginFramework
             g_phase = IDLE;
         }
 
-        // ゲーム起動時の SlotReset と同じ初期化
-        static void ResetSlotState(void)
+        // ---------------- ルートA: タイトル経由 ----------------
+        static void FrameTitleRoute(u32 cur)
         {
-            Process::Write8(SLOT_VAR, 0);
-            for (u32 o = 4; o <= 24; o += 4)
-                Process::Write32(SLOT_VAR + o, 0);
+            if (g_phase == T_FIELD)
+            {
+                if (cur == STATE_FIELD)
+                {
+                    g_phase = IDLE;
+                    OSD::Notify("PS: done");
+                }
+                return;
+            }
+
+            u32 tobj = FindByVptr(ROOT_TASK, VPTR_TITLE, 0);
+            if (tobj)
+            {
+                u8 ts = 0;
+                Process::Read8(tobj + 364, ts);
+                if ((int)ts != g_lastTitleSt)
+                {
+                    g_lastTitleSt = ts;
+                    OSD::Notify(Utils::Format("PT: title state %02X", ts));
+                }
+                // 「ゲームを始める」待ち(状態04)を飛ばす
+                if (g_phase == T_SELECT && ts == 0x04)
+                {
+                    if (g_skipWait == 0)
+                    {
+                        Process::Write8(tobj + 365, 0x12);
+                        Process::Write8(tobj + 364, 0x10);
+                        OSD::Notify("PS: skip title press");
+                    }
+                    else if (g_skipWait == 30)
+                    {
+                        Process::Write8(tobj + 384, 0);
+                        Process::Write8(tobj + 377, 0);
+                        OSD::Notify("PS: title poke B");
+                    }
+                    g_skipWait++;
+                }
+            }
+
+            u32 obj = FindExSel(ROOT_TASK, 0);
+            if (!obj)
+            {
+                if (g_timer == 300)
+                    OSD::Notify("PS: select task not found");
+                return;
+            }
+
+            u8 st = 0;
+            Process::Read8(obj + 0x91B9, st);
+            if ((int)st != g_lastSt)
+            {
+                g_lastSt = st;
+                OSD::Notify(Utils::Format("PS: select state %02X", st));
+            }
+
+            if (g_phase == T_SELECT)
+            {
+                if (st != 0x0B)
+                    return;
+                Process::Write8(obj + 0x190, 2);
+                Process::Write32(obj + 388, (u32)g_slot);
+                Process::Write8(obj + 381, 0x0C);
+                g_wait  = 0;
+                g_phase = T_RESULT;
+                OSD::Notify("PS: try UI poke");
+            }
+            else if (g_phase == T_RESULT)
+            {
+                if (st != 0x0B)
+                {
+                    g_phase = T_FIELD;
+                    OSD::Notify("PS: accepted");
+                    return;
+                }
+                if (++g_wait < UI_WAIT)
+                    return;
+                Process::Write32(obj + 0x91BC, (u32)g_slot);
+                Process::Write8(0x68BAD1, 0);
+                Process::Write8(obj + 0x91B8, 0x0C);
+                g_phase = T_FIELD;
+                OSD::Notify("PS: direct decide");
+            }
         }
 
-        // シーンフローのリスナー (FLOW+12)。状態変更の直後に、ゲーム本来のスレッドから1回だけ呼ばれる
-        static void FlowListener(s32 state, u32 arg)
+        // ---------------- ルートB: 直接 ----------------
+        static void FrameDirectRoute(u32 cur)
         {
-            (void)arg;
-            if (state != (s32)STATE_IDLE)
-                return;
-            Process::Write32(FLOW_OBJ + 12, 0);
-            ResetSlotState();
-            g_uiAttached = false;
-            ((FnU32)FN_MGR_INIT)(MGR_OBJ);
-            g_mgrInit = true;
-            if (HIDE_SELECT_UI)
-                g_uiHidden = Process::Write32(UI_OPEN_ADDR, ARM_NOP);
-            g_vtblPatched = Process::Write32(VTBL_EXSEL_UPDATE, (u32)&ExSelUpdateWrapper);
-            g_sendResult = ((SendFn)FN_SEND)(ROOT_TASK, DESC_EXSEL);
-            g_sent = true;
-        }
-
-        // menu->Callback から毎フレーム呼ばれる (切り替え中以外は即 return)
-        static void OnFrame(void)
-        {
-            if (g_phase == IDLE)
-                return;
-
-            // 重くならないよう、切り替え中も3フレームに1回だけ調べる
-            if (g_phase != D_BLANK && (++g_tick % 3) != 0)
-                return;
-
-            u32 cur = 0;
-            Process::Read32(FLOW_OBJ + 48, cur);
-
             switch (g_phase)
             {
             case D_BLANK:
             {
+                // ゲームのスレッドで、フィールド片付け後の初期化とタスク作成が行われるのを待つ
                 if (!g_sent)
                 {
                     if (++g_wait > 600)
                         Abort("PS: flow listener not called");
                     return;
                 }
-                Say(Utils::Format("PS: send=%d vtbl=%d", (int)g_sendResult, (int)g_vtblPatched));
+                OSD::Notify(Utils::Format("PS: send result=%d vtbl=%d", (int)g_sendResult, (int)g_vtblPatched));
                 g_wait = 0;
                 g_lastSt = -1;
                 g_phase = D_SEL;
@@ -3209,10 +3278,10 @@ namespace CTRPluginFramework
             }
             case D_SEL:
             {
-                u32 obj = FindByVptr(ROOT_TASK, VPTR_EXSEL, 0);
+                u32 obj = FindExSel(ROOT_TASK, 0);
                 if (!obj)
                 {
-                    if (++g_wait > 100)
+                    if (++g_wait > 300)
                         Abort("PS: select task not created");
                     return;
                 }
@@ -3222,32 +3291,44 @@ namespace CTRPluginFramework
                 if ((int)st != g_lastSt)
                 {
                     g_lastSt = st;
-                    Say(Utils::Format("PS: select state %02X", st));
+                    OSD::Notify(Utils::Format("PS: select state %02X", st));
                 }
+
                 // UIを開く(0A)/決定待ち(0B)に来たら、決定済みにして読み込み(0C以降)へ進める
                 if (st == 0x0A || st == 0x0B || nx == 0x0A || nx == 0x0B)
                 {
                     Process::Write32(obj + 0x91BC, (u32)g_slot);
                     Process::Write8(0x68BAD1, 0);
                     Process::Write8(obj + 0x91B8, 0x0C);
-                    Say("PS: decide -> load");
+                    OSD::Notify("PS: decide -> load");
                     g_wait = 0;
                     g_phase = D_DONE;
                 }
-                else if (++g_wait > MAX_FRAMES / 3)
-                    Abort("PS: select timeout");
+                else
+                {
+                    if (st == 0x01 && g_wait == 600)
+                    {
+                        u8 rw1 = 0, rw2 = 0; u32 fl = 0;
+                        Process::Read8(obj + 0x23C0 + 0x5C, rw1);
+                        Process::Read8(obj + 0x4AB8 + 0x5C, rw2);
+                        Process::Read32(obj + 372, fl);
+                        OSD::Notify(Utils::Format("PS: stuck st1 rw1=%d rw2=%d fl=%X", rw1, rw2, fl));
+                    }
+                    if (++g_wait > MAX_FRAMES)
+                        Abort("PS: select timeout");
+                }
                 break;
             }
             case D_DONE:
             {
                 // スロット選択タスクが自分で終了するのを待つ
-                if (FindByVptr(ROOT_TASK, VPTR_EXSEL, 0))
+                if (FindExSel(ROOT_TASK, 0))
                 {
-                    if (++g_wait > MAX_FRAMES / 3)
+                    if (++g_wait > MAX_FRAMES)
                         Abort("PS: load timeout");
                     return;
                 }
-                Say("PS: load finished");
+                OSD::Notify("PS: load finished");
                 CleanupDirect();
                 g_wait = 0;
                 g_phase = D_RESTART;
@@ -3259,17 +3340,17 @@ namespace CTRPluginFramework
                 {
                     RestoreIdleMsg();
                     g_phase = IDLE;
-                    Say("PS: done");
+                    OSD::Notify("PS: done");
                     return;
                 }
-                // ゲーム側が自分でフィールドを作らない場合は、こちらから要求する
-                if (++g_wait == 40)
+                // ゲーム側が自分でフィールドを作らない場合は、2秒待って要求する
+                if (++g_wait == 120)
                 {
                     RestoreIdleMsg();
                     RequestState(STATE_FIELD);
-                    Say("PS: request field");
+                    OSD::Notify("PS: request field");
                 }
-                else if (g_wait > 600)
+                else if (g_wait > 1800)
                     Abort("PS: field timeout");
                 break;
             }
@@ -3278,42 +3359,88 @@ namespace CTRPluginFramework
             }
         }
 
-        // メニュー項目から呼ばれる
-        static void Entry(MenuEntry *entry)
+        // menu->Callback で毎フレーム呼ばれる
+        static void OnFrame(void)
         {
-            (void)entry;
+            if (g_phase == IDLE)
+                return;
+
+            u32 cur = 0;
+            Process::Read32(FLOW_OBJ + 48, cur);
+
+            if (g_phase >= D_BLANK)
+            {
+                FrameDirectRoute(cur);
+                return;
+            }
+
+            if (++g_timer > MAX_FRAMES)
+            {
+                g_phase = IDLE;
+                OSD::Notify("PS: timeout");
+                return;
+            }
+            FrameTitleRoute(cur);
+        }
+
+        static bool CheckStart(int &slotOut)
+        {
             u32 cur = 0;
             Process::Read32(FLOW_OBJ + 48, cur);
             if (cur != STATE_FIELD)
             {
                 OSD::Notify("Fieldでのみ使えます");
-                return;
+                return false;
             }
             if (g_phase != IDLE)
             {
                 OSD::Notify("処理中です");
-                return;
+                return false;
             }
             Keyboard kb("プレイヤーを選択", { "プレイヤー 1", "プレイヤー 2", "プレイヤー 3" });
             int r = kb.Open();
             if (r < 0)
-                return;
+                return false;
+            slotOut = r;
+            return true;
+        }
 
+        // ルートA
+        static void EntryTitle(MenuEntry *entry)
+        {
+            (void)entry;
+            int r = -1;
+            if (!CheckStart(r))
+                return;
+            g_slot = r; g_timer = 0; g_wait = 0; g_lastSt = -1; g_lastTitleSt = -1; g_skipWait = 0;
+            g_phase = T_SELECT;
+            RequestState(STATE_TITLE);
+            OSD::Notify("Switching (title)...");
+        }
+
+        // ルートB
+        static void EntryDirect(MenuEntry *entry)
+        {
+            (void)entry;
+            int r = -1;
+            if (!CheckStart(r))
+                return;
             // 状態IDLEが新しいシーンを作らないよう、メッセージ番号を範囲外にしておく
             if (!Process::Write16(IDLE_MSG_ADDR, 0x7FFF))
             {
                 OSD::Notify("PS: cannot patch table");
                 return;
             }
-            g_slot = r; g_wait = 0; g_tick = 0; g_lastSt = -1;
+            g_slot = r; g_timer = 0; g_wait = 0; g_settle = 0; g_lastSt = -1;
             g_sent = false;
             Process::Write32(FLOW_OBJ + 24, 0);
             Process::Write32(FLOW_OBJ + 12, (u32)&FlowListener);
             g_phase = D_BLANK;
             RequestState(STATE_IDLE);
+            OSD::Notify("Switching (direct)...");
         }
     }
-             
+
     // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
@@ -3335,14 +3462,8 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-
-        menu->Append(new MenuEntry("プレイヤー切り替え", nullptr, PlayerSwitch::Entry,
-                                   "フィールドで実行します。タイトルを経由せず、選んだプレイヤーのデータに切り替えます。\n"
-                                   "使う前に、セーブのバックアップを取ってください。"));
-        menu->Callback(PlayerSwitch::OnFrame);
         
         AddMaterialZero(menu);
-
         AddLifeChange(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
@@ -3414,7 +3535,7 @@ namespace CTRPluginFramework
                                    "固まった場合は、セーブせずにゲームを再起動してください。"));
         menu->Append(new MenuEntry("プレイヤー切り替え タイトル経由 (実験)", nullptr, PlayerSwitch::EntryTitle,
                                    "タイトル画面を一瞬経由して、自動でスロットを選びます。"));
-    
+        menu->Callback(PlayerSwitch::OnFrame);
         menu->Callback(PosNotifyFrame);
         
         menu->Run();
