@@ -80,6 +80,6 @@ namespace CTRPluginFramework
     static void AddMaterialZero(TMenu *menu)
     {
         // テスト版: 項目名と説明文を英数字だけにしてある (文字が原因かどうかの切り分け用)
-        menu->Append(new MenuEntry("Material Zero", nullptr, MaterialZeroEntry, "test"));
+        menu->Append(new MenuEntry("必要素材数0個", nullptr, MaterialZeroEntry, "test"));
     }
 }
