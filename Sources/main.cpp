@@ -275,6 +275,129 @@ extern "C"
         }
         return g_warpArea + 1;   // エリアID+1 (0 = ワープなし と区別するため)
     }
+
+    // ============================================================
+    //  魔法使い: Aボタンで全属性のチャージ技を、モーションなしで出す (実験)
+    //
+    //   ・Aのスキル枠(状態機械 0x2400E4)が「押された」瞬間に、状態を進めずに終わらせる
+    //     (= 溜めポーズも通常攻撃も出ない)。かわりに「ゴースト」を1つ作る。
+    //   ・プレイヤーのアクション更新 (0x22C254) の入口で、ゴーストの時間を1フレームずつ進め、
+    //     魔法の判定を作る本体 (0x22C258) を、全16スキルのIDで直接呼ぶ。
+    //     呼ぶあいだだけ、コントローラ (C+0x558) の [+8]=スキルID と [+0xC4]=時間 を書き換え、
+    //     呼び終わったら元に戻す。プレイヤー自身のアクションは変わらない(待機のまま)。
+    //   ・Cは起動のたびに変わるので、毎回 [[0x68BBB8]+0x7828] から取り直す。
+    // ============================================================
+    void jp_hookMageS0(void);
+    void jp_hookMageTick(void);
+    void jp_callBody(u32 ctrl);
+
+    volatile u32 g_mageWatch    = 0;      // 毎フレームプラグイン側が補充。0なら機能オフ
+    volatile u32 g_mageAlive    = 0;      // MageTickが補充。0なら (フックが動いていない) A を消費しない
+    volatile u32 g_mageTmax     = 120;    // 判定を作る最大フレーム
+    volatile u32 g_mageCool     = 6;      // 連続発動の最短間隔 (フレーム)
+    volatile u32 g_mageCoolLeft = 0;
+    volatile u32 g_mageCasts    = 0;
+    volatile u32 g_mageTicks    = 0;
+    volatile u32 g_mageCtrl     = 0;
+    #define MAGE_MAXG 6
+    static volatile s32 g_mageT[MAGE_MAXG] = { -1, -1, -1, -1, -1, -1 };
+
+    static const u32 g_mageIds[16] = {
+        0x01000018, 0x0100001E, 0x0100002A, 0x0100002E,   // A 2段階目 (火 水 風 地)
+        0x01000017, 0x0100001D, 0x01000023, 0x0100002D,   // A 1段階目
+        0x01000019, 0x0100001F, 0x0100002B, 0x0100002F,   // X 1段階目
+        0x0100001A, 0x01000020, 0x0100002C, 0x01000030    // X 2段階目
+    };
+
+    static u32 MageObj(void)     // C = [[0x68BBB8] + 0x7828]
+    {
+        const u32 mgr = *(volatile u32 *)0x68BBB8;
+        if (mgr < 0x08000000u || mgr >= 0x1F000000u || (mgr & 3))
+            return 0;
+        const u32 obj = *(volatile u32 *)(mgr + 0x7828);
+        if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
+            return 0;
+        return obj;
+    }
+
+    static bool MageIsId(u32 id)
+    {
+        for (int i = 0; i < 16; ++i)
+            if (g_mageIds[i] == id)
+                return true;
+        return false;
+    }
+
+    // Aのスキル枠の状態0 (押された瞬間) で呼ばれる。1を返すと、状態機械は何もせず終わる。
+    u32 MageS0Check(u32 slot, u32 pressed)
+    {
+        if (!g_mageWatch || !g_mageAlive || !pressed)
+            return 0;
+        const u32 C = MageObj();
+        if (!C || slot != C + 0x888)                       // Aのスキル枠だけ
+            return 0;
+        if (!MageIsId(*(volatile u32 *)(slot + 0x48)))     // 魔法使いのスキルIDのときだけ
+            return 0;
+        if (g_mageCoolLeft)
+            return 1;                                      // 間隔の間は、押下を消費して何もしない
+        g_mageCoolLeft = g_mageCool;
+
+        int k = -1, oldest = 0;
+        for (int i = 0; i < MAGE_MAXG; ++i)
+        {
+            if (g_mageT[i] < 0) { k = i; break; }
+            if (g_mageT[i] > g_mageT[oldest]) oldest = i;
+        }
+        if (k < 0) k = oldest;
+        g_mageT[k] = 0;
+        g_mageCasts = g_mageCasts + 1;
+        return 1;
+    }
+
+    // プレイヤーのアクション更新 (0x22C254) の入口で、毎フレーム呼ばれる。
+    void MageTick(u32 K)
+    {
+        if (!g_mageWatch)
+            return;
+        const u32 C = MageObj();
+        if (!C || K != C + 0x558)                          // プレイヤーのコントローラだけ
+            return;
+
+        g_mageAlive = 20;
+        g_mageTicks = g_mageTicks + 1;
+        if (g_mageWatch > 0) g_mageWatch = g_mageWatch - 1;
+        if (g_mageCoolLeft) g_mageCoolLeft = g_mageCoolLeft - 1;
+
+        if (K != g_mageCtrl)                               // エリア移動などで作り直されたら、ゴーストを捨てる
+        {
+            for (int i = 0; i < MAGE_MAXG; ++i) g_mageT[i] = -1;
+            g_mageCtrl = K;
+            return;
+        }
+
+        for (int i = 0; i < MAGE_MAXG; ++i)
+        {
+            const s32 t = g_mageT[i];
+            if (t < 0)
+                continue;
+            if ((u32)t > g_mageTmax)
+            {
+                g_mageT[i] = -1;
+                continue;
+            }
+            const u32 savedId   = *(volatile u32 *)(K + 8);
+            const u32 savedTime = *(volatile u32 *)(K + 0xC4);
+            for (int n = 0; n < 16; ++n)
+            {
+                *(volatile u32 *)(K + 8)        = g_mageIds[n];
+                *(volatile float *)(K + 0xC4)   = (float)t;
+                jp_callBody(K);
+            }
+            *(volatile u32 *)(K + 8)    = savedId;
+            *(volatile u32 *)(K + 0xC4) = savedTime;
+            g_mageT[i] = t + 1;
+        }
+    }
 }
 
 asm(R"(
@@ -341,6 +464,50 @@ jp_hookWarp:
 1:  push  {r4-r11, lr}           @ 0x5A2AB8 の元命令
     mov   r4, r0                 @ 0x5A2ABC の元命令
     ldr   pc, =0x5A2AC0          @ 続きの元コードへ
+
+    @ ---- 魔法使い: Aスキル枠の状態0 (押された瞬間) ----
+    @ 0x240258: cmp r0,#0 / 0x24025C: ldrne r1,[r4,#0x48] の2命令を置き換え、0x240260 へ戻る。
+    @ r0 = 押されたか (0以外), r4 = スキル枠。MageS0Check が 1 を返したら、
+    @ 状態機械の終了処理 (0x240BA4: r0=0 で戻る) へ飛ぶ。
+    .global jp_hookMageS0
+    .type jp_hookMageS0, %function
+jp_hookMageS0:
+    push  {r0-r3, r12, lr}
+    mov   r1, r0
+    mov   r0, r4
+    bl    MageS0Check
+    cmp   r0, #0
+    pop   {r0-r3, r12, lr}       @ pop はフラグを変えない
+    bne   1f
+    cmp   r0, #0                 @ 0x240258 の元命令
+    ldrne r1, [r4, #0x48]        @ 0x24025C の元命令
+    ldr   pc, =0x240260
+1:  mov   r0, #0
+    ldr   pc, =0x240BA4
+
+    @ ---- 魔法使い: プレイヤーのアクション更新の入口 (0x22C254) ----
+    @ 置き換えた2命令 (push {r0,r4-r11,lr} / vpush {d8-d10}) を再現し、0x22C25C へ戻る。
+    .global jp_hookMageTick
+    .type jp_hookMageTick, %function
+jp_hookMageTick:
+    push  {r0-r3, r12, lr}
+    bl    MageTick               @ r0 = コントローラ
+    pop   {r0-r3, r12, lr}
+    push  {r0, r4-r11, lr}       @ 0x22C254 の元命令
+    vpush {d8-d10}               @ 0x22C258 の元命令
+    ldr   pc, =0x22C25C
+
+    @ ---- 魔法の判定を作る本体 (0x22C258) を、C から呼ぶための橋 ----
+    @ jp_callBody(r0 = コントローラ)。本体は「push {r0,r4-r11,lr}」のあとの状態で入る前提
+    @ なので、同じ push をしてから 0x22C258 へ入り、lr に戻り先 (1:) を積んでおく。
+    .global jp_callBody
+    .type jp_callBody, %function
+jp_callBody:
+    push  {r4-r11, r12, lr}      @ 40バイト: 8バイト境界を保つ
+    adr   lr, 1f
+    push  {r0, r4-r11, lr}       @ 0x22C254 の元命令と同じ
+    ldr   pc, =0x22C258
+1:  pop   {r4-r11, r12, pc}
     .ltorg
 )");
 
@@ -3315,6 +3482,118 @@ namespace CTRPluginFramework
         }
     }
 
+
+    // ------------------------------------------------------------
+    //  魔法使い: Aボタンで全属性チャージ技 (モーションなし)  【実験・実機未検証】
+    //   ・ゲームのコード2か所を、2語ずつ書き換える (ワープと同じ方式)。
+    //       0x240258 : Aスキル枠の状態0 (押された瞬間)
+    //       0x22C254 : プレイヤーのアクション更新の入口
+    //   ・以前のARコード (魔法使いA連打) とは同時に使えない。必ずOFFにして、
+    //     ゲームを再起動してから使うこと (0x22C254 を書き換えるため)。
+    // ------------------------------------------------------------
+    static constexpr u32 HOOK_MAGE_S0   = 0x00240258;
+    static constexpr u32 HOOK_MAGE_TICK = 0x0022C254;
+
+    static bool g_mageHooked = false;
+
+    static bool InstallMageHooks(void)
+    {
+        if (g_mageHooked)
+            return true;
+
+        // 0x240258: cmp r0,#0 / ldrne r1,[r4,#0x48]
+        static const u32 expectS0[2]   = { 0xE3500000, 0x15941048 };
+        // 0x22C254: push {r0,r4-r11,lr} / vpush {d8-d10}
+        static const u32 expectTick[2] = { 0xE92D4FF1, 0xED2D8B06 };
+        if (!CheckWords(HOOK_MAGE_S0, expectS0, 2) || !CheckWords(HOOK_MAGE_TICK, expectTick, 2))
+        {
+            MessageBox("エラー",
+                       "魔法使い用のフック位置の命令が想定と違います。\n"
+                       "魔法使い連射のARコードがONになっていないか確認し、OFFにしてゲームを再起動してください。\n"
+                       "それでも出る場合は、ゲームのバージョンが異なる可能性があります。")();
+            return false;
+        }
+
+        // 先にジャンプ先の値(2語目)を書き、そのあとで ldr pc 命令(1語目)を書く。
+        Process::Write32(HOOK_MAGE_S0 + 4,   (u32)(uintptr_t)jp_hookMageS0);
+        Process::Write32(HOOK_MAGE_S0,       0xE51FF004);   // ldr pc, [pc, #-4]
+        Process::Write32(HOOK_MAGE_TICK + 4, (u32)(uintptr_t)jp_hookMageTick);
+        Process::Write32(HOOK_MAGE_TICK,     0xE51FF004);
+
+        g_mageHooked = true;
+        return true;
+    }
+
+    // 有効な間、毎フレーム呼ばれる。メニューをOFFにすると呼ばれなくなり、
+    // g_mageWatch が数フレームで0になって、機能が止まる。
+    static void MageRapidEntry(MenuEntry *entry)
+    {
+        static u32 shownTick = 0;
+        static u32 lastCasts = 0;
+
+        if (!InstallMageHooks())
+        {
+            entry->Disable();
+            return;
+        }
+        g_mageWatch = 6;
+        if (g_mageAlive) g_mageAlive = g_mageAlive - 1;
+
+        if (!shownTick && g_mageTicks)
+        {
+            shownTick = 1;
+            OSD::Notify("Mage: hook OK");
+        }
+        if (g_mageCasts != lastCasts)
+        {
+            lastCasts = g_mageCasts;
+            if (g_mageCasts <= 3)
+                OSD::Notify(Utils::Format("Mage: cast #%u", (unsigned)g_mageCasts));
+        }
+    }
+
+    static void MageSettingsEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        {
+            Keyboard kb("判定を作る最大フレーム (10〜300)\n魔法が途中で消えるなら増やす。\n今の値は " + std::to_string((unsigned)g_mageTmax) + " です。");
+            kb.IsHexadecimal(false);
+            u32 v = g_mageTmax;
+            if (kb.Open(v, v) == 0)
+            {
+                if (v < 10) v = 10;
+                if (v > 300) v = 300;
+                g_mageTmax = v;
+            }
+        }
+        {
+            Keyboard kb("連続発動の最短間隔 (1〜30フレーム)\n小さいほど速く連射する。\n今の値は " + std::to_string((unsigned)g_mageCool) + " です。");
+            kb.IsHexadecimal(false);
+            u32 v = g_mageCool;
+            if (kb.Open(v, v) == 0)
+            {
+                if (v < 1) v = 1;
+                if (v > 30) v = 30;
+                g_mageCool = v;
+            }
+        }
+    }
+
+    static void AddMageRapid(PluginMenu *menu)
+    {
+        MenuFolder *f = new MenuFolder("魔法使い連射 (実験)",
+                                       "魔法使いで、Aボタンを押すと、全属性のチャージ技(A/X・1段階/2段階)を、"
+                                       "プレイヤーのモーションなしで出します。");
+        f->Append(new MenuEntry("Aボタンで全属性チャージ技 (モーションなし)", MageRapidEntry, nullptr,
+                                "魔法使いで有効にして、フィールドでAボタンを押します。\n"
+                                "押している間は、設定した間隔で出続けます。\n"
+                                "以前の魔法使い連射のARコードとは同時に使えません。ARをOFFにして、ゲームを再起動してから使ってください。\n"
+                                "止める場合は、このメニューをOFFにします(フック自体はゲームを再起動するまで残ります)。"));
+        f->Append(new MenuEntry("設定 (最大フレーム・発動間隔)", nullptr, MageSettingsEntry,
+                                "魔法の判定を作る最大フレーム数と、連続発動の最短間隔を変えます。"));
+        menu->Append(f);
+    }
+
     // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
@@ -3402,6 +3681,7 @@ namespace CTRPluginFramework
 
         AddQualityFix(menu);
         AddRecommended(menu);
+        AddMageRapid(menu);
         
         menu->Append(new MenuEntry("プレイヤー切り替え (v5)", nullptr, PlayerSwitch::Entry,
                                    "フィールドで実行します。タイトルを経由せず、選んだプレイヤーのデータに切り替えます。\n"
