@@ -79,10 +79,7 @@ namespace CTRPluginFramework
     template <typename TMenu>
     static void AddMaterialZero(TMenu *menu)
     {
-        menu->Append(new MenuEntry("制作の素材を0個にする", nullptr, MaterialZeroEntry,
-                                   "制作の素材の必要個数を0として読ませます。\n"
-                                   "持っていない素材でも制作でき、素材は消費されません (想定)。\n"
-                                   "制作の前にONにして、終わったらOFFに戻してください。\n"
-                                   "実機未検証です。必ずセーブのバックアップを取ってから使ってください。"));
+        // テスト版: 項目名と説明文を英数字だけにしてある (文字が原因かどうかの切り分け用)
+        menu->Append(new MenuEntry("Material Zero", nullptr, MaterialZeroEntry, "test"));
     }
 }
