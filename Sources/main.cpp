@@ -45,6 +45,7 @@ static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
 #include "Life.hpp"
 #include "QualityFix.hpp"
+#include "MaterialZero.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -825,11 +826,43 @@ namespace CTRPluginFramework
         return n ? std::string(n) : Utils::Format("0x%04X", id);
     }
 
+    // かばんの連結リスト(管理領域 0x6DCD2C)をたどって、使用中の枠番号を集める。想定と違えば false。
+    // 捨てた・削除した枠には、古いIDが残ることがあるので、IDだけでは使用中かどうか判断できない。
+    static bool WalkLiveBagSlots(std::vector<bool> &inUse)
+    {
+        static const u32 LIVE = 0x006DCD2C;
+        u32 p = 0;
+        u16 head = 0, cnt = 0;
+        if (!Process::Read32(LIVE + 0x08, p) || p != BAG_BASE - 4)
+            return false;
+        if (!Process::Read16(LIVE + 0x1E, head) || !Process::Read16(LIVE + 0x1C, cnt))
+            return false;
+        inUse.assign(BAG_SLOTS, false);
+        u32 n = 0;
+        u16 idx = head;
+        while (idx != 0xFFFF)
+        {
+            if (idx >= BAG_SLOTS || inUse[idx])
+                return false;
+            inUse[idx] = true;
+            ++n;
+            u16 next = 0;
+            if (!Process::Read16(BAG_BASE - 4 + (u32)idx * SLOT_SIZE, next))
+                return false;
+            idx = next;
+        }
+        return n == cnt;
+    }
+
     // かばんの中で、このカテゴリのアイテムがある枠と、その現在のIDを集める
     static void CollectBagSlots(const Category &cat, std::vector<u32> &slots, std::vector<u32> &ids)
     {
+        std::vector<bool> inUse;
+        const bool useList = WalkLiveBagSlots(inUse);   // 失敗したときは、IDだけで判断する
         for (u32 slot = 0; slot < BAG_SLOTS; ++slot)
         {
+            if (useList && !inUse[slot])
+                continue;
             u16 id = 0;
             if (!Process::Read16(SlotAddr(slot) + OFF_ID, id))
                 continue;
@@ -1097,7 +1130,7 @@ namespace CTRPluginFramework
     //   ・倉庫も同じ作り(ダンプで確認: 管理領域 0x6DCD70、リンク配列 0x6E5460、1500枠、先頭は1499番から)。
     static constexpr u32 ROW_DATA   = 0x38;
     static constexpr u16 NO_LINK    = 0xFFFF;
-    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行に入っていたID (削除時にこれを書く・推測)
+    static constexpr u32 EMPTY_ID   = 0x0666;              // 空き行の初期値(ゲームが最初に全行へ入れているID)。削除した行に書く
     static constexpr size_t DUP_THRESHOLD = 3;             // 名前がこの件数以上かぶると「未実装」とみなす
 
     // 連結リストを持つ入れ物。live=管理領域 (+8 リンク配列のアドレス、+0x1C 件数、+0x1E 先頭)
@@ -1108,9 +1141,10 @@ namespace CTRPluginFramework
         u32 live;
         u32 linkBase;
         u32 slots;
+        u32 arr;      // 空き枠の番号表 (u16 が slots 個)。管理領域の +0x10 が指す
     };
-    static const Container g_bag   = { "かばん", 0x006DCD2C, 0x006DDF28,  500 };
-    static const Container g_store = { "倉庫",   0x006DCD70, 0x006E5460, 1500 };
+    static const Container g_bag   = { "かばん", 0x006DCD2C, 0x006DDF28,  500, 0x006DCDF8 };
+    static const Container g_store = { "倉庫",   0x006DCD70, 0x006E5460, 1500, 0x006DD1E0 };
 
     struct BagState
     {
@@ -1131,6 +1165,12 @@ namespace CTRPluginFramework
         if (!Process::Read32(c.live + 0x08, p) || p != c.linkBase)
         {
             err = Utils::Format("%sの管理領域が想定と違います。(バージョン違いの可能性。何も書いていません)", c.name);
+            return false;
+        }
+        u32 ap = 0;
+        if (!Process::Read32(c.live + 0x10, ap) || ap != c.arr)
+        {
+            err = Utils::Format("%sの空き枠の表が想定と違います。(何も書いていません)", c.name);
             return false;
         }
         u16 head = 0, cnt = 0;
@@ -1197,9 +1237,21 @@ namespace CTRPluginFramework
         return n;
     }
 
+    // 空き枠の表を作り直す。ゲームは「表の arr[件数] を次に使う枠」として取り出し、
+    // 削除では arr[件数-1] に外した枠を入れる。arr[件数 以降] = 今あいている枠すべて、が成り立つ必要がある。
+    // (これが崩れると、次にゲームがアイテムを入手したときに使用中の枠を取り出してフリーズする)
+    static void SyncFreeArray(const BagState &b)
+    {
+        u32 w = (u32)b.order.size();
+        for (int k = (int)b.c->slots - 1; k >= 0; --k)
+            if (!b.used[k])
+                Process::Write16(b.c->arr + (w++) * 2, (u16)k);
+    }
+
     static void CommitCount(const BagState &b)
     {
         Process::Write16(b.c->live + 0x1C, (u16)b.order.size());
+        SyncFreeArray(b);
     }
 
     // ------------------------------------------------------------
@@ -2040,8 +2092,10 @@ namespace CTRPluginFramework
 
     // ------------------------------------------------------------
     //  アイテム削除 (かばん / 倉庫)
-    //  連結リストから外し、件数を減らし、行のIDを空き行の値(0x666)にする。
-    //  ※ゲーム本人の削除処理は未確認。
+    //  連結リストから外し、件数を減らし、空き枠の表を整え、行のIDを空き行の値(0x666)にする。
+    //  (通常の「捨てる」と前後ダンプを比べて、リンクを FFFF/FFFF にすること、
+    //   空き枠の表に外した枠を入れることを確認した。行のIDを消すのはチート独自の処理で、
+    //   空き枠の表を整えたうえで消しても入手時にフリーズしないかは、実機で未確認)
     //  装備中の印: かばんの行の +8 の bit0 (装備を付け替えたときの前後ダンプで確認。
     //  武器1・防具6・ライフ道具8 が印つきだった)。装備中の行は、どの削除でも消さない。
     // ------------------------------------------------------------
@@ -2065,7 +2119,11 @@ namespace CTRPluginFramework
 
         for (u16 s : del)
         {
-            Process::Write32(RowOf(b, s) + OFF_ID, EMPTY_ID);
+            u8 flag = 0;
+            Process::Read8(RowOf(b, s) + 8, flag);
+            if (flag & 1)
+                Process::Write32(RowOf(b, s) + 8, 0);          // 装備中の印も消す
+            Process::Write32(RowOf(b, s) + OFF_ID, EMPTY_ID);  // アイテムデータを消す
             Process::Write16(LnkOf(b, s),     NO_LINK);
             Process::Write16(LnkOf(b, s) + 2, NO_LINK);
             b.used[s] = false;
@@ -2078,6 +2136,7 @@ namespace CTRPluginFramework
         Process::Write16(b.c->live + 0x1E, keep.empty() ? NO_LINK : keep[0]);
         Process::Write16(b.c->live + 0x1C, (u16)keep.size());
         b.order = keep;
+        SyncFreeArray(b);
     }
 
     // カテゴリ単位 / 未実装だけ、まとめて削除
@@ -2100,7 +2159,8 @@ namespace CTRPluginFramework
         const bool all = ((size_t)ci == sizeof(g_cats) / sizeof(g_cats[0]));
 
         std::vector<std::string> modes;
-        modes.push_back("そのカテゴリのアイテムをすべて削除");
+        modes.push_back(all ? std::string("全てのアイテムを削除")
+                            : Utils::Format("%sを全て削除", g_cats[ci].name));
         modes.push_back("未実装アイテムだけ削除");
         Keyboard kmo("削除する対象", modes);
         const int mo = kmo.Open();
@@ -2159,8 +2219,34 @@ namespace CTRPluginFramework
                                          "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
     }
 
-    // 装備中の武器・防具・ライフ道具以外を、かばんからすべて削除
-    static void DeleteExceptEquippedEntry(MenuEntry *entry)
+    // 空き枠の表の修復 (以前のチート生成・削除で崩れた分を直す)
+    static void RepairFreeEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        if (!(MessageBox("空き枠情報の修復",
+                         "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。\n"
+                         "チートで生成・削除したあと、通常のプレイで入手してフリーズする場合に使います。\n"
+                         "セーブのバックアップは取りましたか?", DialogType::DialogYesNo))())
+            return;
+        std::string res;
+        const Container *conts[2] = { &g_bag, &g_store };
+        for (const Container *ct : conts)
+        {
+            BagState b;
+            std::string err;
+            if (!LoadBag(b, *ct, err))
+            {
+                res += Utils::Format("%s: 修復できません (%s)\n", ct->name, err.c_str());
+                continue;
+            }
+            SyncFreeArray(b);
+            res += Utils::Format("%s: %u 件 / 空き %u 枠を整えました\n", ct->name, (u32)b.order.size(), FreeRows(b));
+        }
+        MessageBox("完了", res)();
+    }
+
+    // 装備中の武器・防具・ライフ道具も含めて、かばんのすべてを削除
+    static void DeleteAllIncludingEquippedEntry(MenuEntry *entry)
     {
         (void)entry;
 
@@ -2171,49 +2257,42 @@ namespace CTRPluginFramework
             MessageBox("削除できませんでした", err)();
             return;
         }
+        if (b.order.empty())
+        {
+            MessageBox("対象なし", "かばんにアイテムがありません。")();
+            return;
+        }
 
-        std::vector<u16> del;
         u32 eqW = 0, eqA = 0, eqT = 0, eqOther = 0;
         for (u16 s : b.order)
         {
+            if (!IsEquipped(b, s))
+                continue;
             u32 id = 0;
             Process::Read32(RowOf(b, s) + OFF_ID, id);
-            if (IsEquipped(b, s))
-            {
-                const Category *cg = FindCategory((u16)id);
-                if (cg == &g_cats[0])      ++eqW;
-                else if (cg == &g_cats[1]) ++eqA;
-                else if (cg == &g_cats[2]) ++eqT;
-                else                       ++eqOther;
-            }
-            else
-                del.push_back(s);
-        }
-        const u32 eq = eqW + eqA + eqT + eqOther;
-        if (eq == 0)
-        {
-            MessageBox("中止", "装備中の印がついたアイテムが1つも見つかりません。\n"
-                               "全部消してしまう恐れがあるので、何も削除せずに止めました。")();
-            return;
-        }
-        if (del.empty())
-        {
-            MessageBox("対象なし", "削除するアイテムがありません。")();
-            return;
+            const Category *cg = FindCategory((u16)id);
+            if (cg == &g_cats[0])      ++eqW;
+            else if (cg == &g_cats[1]) ++eqA;
+            else if (cg == &g_cats[2]) ++eqT;
+            else                       ++eqOther;
         }
 
-        std::string msg = Utils::Format("残すもの(装備中): 武器 %u / 防具 %u / ライフ道具 %u", eqW, eqA, eqT);
+        std::string msg = Utils::Format("かばんの全 %u 件を削除します。(家具・素材も含む)\n", (u32)b.order.size());
+        msg += Utils::Format("装備中の 武器 %u / 防具 %u / ライフ道具 %u", eqW, eqA, eqT);
         if (eqOther)
             msg += Utils::Format(" / その他 %u", eqOther);
-        msg += Utils::Format("\n削除するもの: それ以外のかばん内すべて %u 件\n"
-                             "(家具・素材なども含みます)\n"
-                             "セーブのバックアップは取りましたか?\n実行しますか?", (u32)del.size());
-        if (!(MessageBox("装備中以外をすべて削除", msg, DialogType::DialogYesNo))())
+        msg += " も消えます。\n装備は外れた状態になります。(実機未検証)\n"
+               "セーブのバックアップは取りましたか?\n実行しますか?";
+        if (!(MessageBox("装備中も含めて全て削除", msg, DialogType::DialogYesNo))())
+            return;
+        if (!(MessageBox("最終確認", "本当に、かばんのすべてを削除しますか?", DialogType::DialogYesNo))())
             return;
 
+        std::vector<u16> del = b.order;
         DeleteRows(b, del);
         MessageBox("完了", Utils::Format("%u 件を削除しました。\n"
-                                         "かばん画面は、一度閉じて開き直すと反映されます。", (u32)del.size()))();
+                                         "かばん画面は、一度閉じて開き直すと反映されます。\n"
+                                         "装備は、装備画面で付け直してください。", (u32)del.size()))();
     }
 
     // 1つずつ削除 (連続)。カテゴリを選び、一覧から選ぶたびにその場で削除する。Bで終了。
@@ -3383,7 +3462,8 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-
+        
+        AddMaterialZero(menu);
         AddLifeChange(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
@@ -3407,18 +3487,21 @@ namespace CTRPluginFramework
             gen->Append(new MenuEntry("IDを指定して1つずつ生成", nullptr, ContinuousCreateEntry,
                                       "カテゴリを選び、追加項目を決めたら、一覧から選ぶたびにその場で作ります。\n"
                                       "一覧は同じページに戻るので、続けて選べます。Bで終了します。"));
+            gen->Append(new MenuEntry("空き枠情報を修復 (フリーズ対策)", nullptr, RepairFreeEntry,
+                                      "チートで生成・削除したあと、通常プレイでの入手時にフリーズする場合に使います。\n"
+                                      "かばん・倉庫の空き枠の表を、実際の使用状況に合わせて作り直します。"));
             gen->Append(new MenuEntry("同じアイテムをN個(別枠)", nullptr, CreateNEntry,
                                       "同じアイテムを、別々の枠にN個作ります。(素材・消耗品は1枠にまとまります)"));
             menu->Append(gen);
         }
         {
             MenuFolder *del = new MenuFolder("アイテム削除",
-                                             "かばん・倉庫のアイテムを削除します。装備中のものは消えません。必ずセーブのバックアップを取ってから使ってください。");
+                                             "かばん・倉庫のアイテムを削除します。「装備中の…を含む全てを削除」以外は、装備中のものを残します。必ずセーブのバックアップを取ってから使ってください。");
             del->Append(new MenuEntry("カテゴリ・未実装をまとめて削除", nullptr, BulkDeleteEntry,
                                       "かばんまたは倉庫で、カテゴリ単位 / 未実装アイテムだけ、まとめて削除します。"));
-            del->Append(new MenuEntry("装備中の武器・防具・ライフ道具以外を削除", nullptr, DeleteExceptEquippedEntry,
-                                      "かばんの中の、装備中の武器・防具・ライフ道具以外をすべて削除します。(家具・素材も含む)\n"
-                                      "装備中の印が見つからないときは、何も消さずに止まります。"));
+            del->Append(new MenuEntry("装備中の武器・防具・ライフ道具を含む全てを削除", nullptr, DeleteAllIncludingEquippedEntry,
+                                      "かばんの中のすべてを、装備中の武器・防具・ライフ道具も含めて削除します。(家具・素材も含む)\n"
+                                      "装備は外れた状態になります。必ずバックアップを取ってから使ってください。"));
             del->Append(new MenuEntry("1つずつ削除", nullptr, DeleteOneByOneEntry,
                                       "かばんまたは倉庫で、カテゴリを選び、一覧から選ぶたびにその場で削除します。Bで終了します。"));
             menu->Append(del);
