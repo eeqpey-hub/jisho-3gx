@@ -43,10 +43,9 @@ struct NameEntry
 static const NameEntry g_itemNames[]   = { { 0xFFFF, nullptr } };
 static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
-
-#include "MaterialZero.hpp"
 #include "Life.hpp"
 #include "QualityFix.hpp"
+#include "MaterialZero.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -276,129 +275,6 @@ extern "C"
         }
         return g_warpArea + 1;   // エリアID+1 (0 = ワープなし と区別するため)
     }
-
-    // ============================================================
-    //  魔法使い: Aボタンで全属性のチャージ技を、モーションなしで出す (実験)
-    //
-    //   ・Aのスキル枠(状態機械 0x2400E4)が「押された」瞬間に、状態を進めずに終わらせる
-    //     (= 溜めポーズも通常攻撃も出ない)。かわりに「ゴースト」を1つ作る。
-    //   ・プレイヤーのアクション更新 (0x22C254) の入口で、ゴーストの時間を1フレームずつ進め、
-    //     魔法の判定を作る本体 (0x22C25C 以降) を、全16スキルのIDで直接呼ぶ。
-    //     呼ぶあいだだけ、コントローラ (C+0x558) の [+8]=スキルID と [+0xC4]=時間 を書き換え、
-    //     呼び終わったら元に戻す。プレイヤー自身のアクションは変わらない(待機のまま)。
-    //   ・Cは起動のたびに変わるので、毎回 [[0x68BBB8]+0x7828] から取り直す。
-    // ============================================================
-    void jp_hookMageS0(void);
-    void jp_hookMageTick(void);
-    void jp_callBody(u32 ctrl);
-
-    volatile u32 g_mageWatch    = 0;      // 毎フレームプラグイン側が補充。0なら機能オフ
-    volatile u32 g_mageAlive    = 0;      // MageTickが補充。0なら (フックが動いていない) A を消費しない
-    volatile u32 g_mageTmax     = 120;    // 判定を作る最大フレーム
-    volatile u32 g_mageCool     = 6;      // 連続発動の最短間隔 (フレーム)
-    volatile u32 g_mageCoolLeft = 0;
-    volatile u32 g_mageCasts    = 0;
-    volatile u32 g_mageTicks    = 0;
-    volatile u32 g_mageCtrl     = 0;
-    #define MAGE_MAXG 6
-    static volatile s32 g_mageT[MAGE_MAXG] = { -1, -1, -1, -1, -1, -1 };
-
-    static const u32 g_mageIds[16] = {
-        0x01000018, 0x0100001E, 0x0100002A, 0x0100002E,   // A 2段階目 (火 水 風 地)
-        0x01000017, 0x0100001D, 0x01000023, 0x0100002D,   // A 1段階目
-        0x01000019, 0x0100001F, 0x0100002B, 0x0100002F,   // X 1段階目
-        0x0100001A, 0x01000020, 0x0100002C, 0x01000030    // X 2段階目
-    };
-
-    static u32 MageObj(void)     // C = [[0x68BBB8] + 0x7828]
-    {
-        const u32 mgr = *(volatile u32 *)0x68BBB8;
-        if (mgr < 0x08000000u || mgr >= 0x1F000000u || (mgr & 3))
-            return 0;
-        const u32 obj = *(volatile u32 *)(mgr + 0x7828);
-        if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
-            return 0;
-        return obj;
-    }
-
-    static bool MageIsId(u32 id)
-    {
-        for (int i = 0; i < 16; ++i)
-            if (g_mageIds[i] == id)
-                return true;
-        return false;
-    }
-
-    // Aのスキル枠の状態0 (押された瞬間) で呼ばれる。1を返すと、状態機械は何もせず終わる。
-    u32 MageS0Check(u32 slot, u32 pressed)
-    {
-        if (!g_mageWatch || !g_mageAlive || !pressed)
-            return 0;
-        const u32 C = MageObj();
-        if (!C || slot != C + 0x888)                       // Aのスキル枠だけ
-            return 0;
-        if (!MageIsId(*(volatile u32 *)(slot + 0x48)))     // 魔法使いのスキルIDのときだけ
-            return 0;
-        if (g_mageCoolLeft)
-            return 1;                                      // 間隔の間は、押下を消費して何もしない
-        g_mageCoolLeft = g_mageCool;
-
-        int k = -1, oldest = 0;
-        for (int i = 0; i < MAGE_MAXG; ++i)
-        {
-            if (g_mageT[i] < 0) { k = i; break; }
-            if (g_mageT[i] > g_mageT[oldest]) oldest = i;
-        }
-        if (k < 0) k = oldest;
-        g_mageT[k] = 0;
-        g_mageCasts = g_mageCasts + 1;
-        return 1;
-    }
-
-    // プレイヤーのアクション更新 (0x22C254) の入口で、毎フレーム呼ばれる。
-    void MageTick(u32 K)
-    {
-        if (!g_mageWatch)
-            return;
-        const u32 C = MageObj();
-        if (!C || K != C + 0x558)                          // プレイヤーのコントローラだけ
-            return;
-
-        g_mageAlive = 20;
-        g_mageTicks = g_mageTicks + 1;
-        if (g_mageWatch > 0) g_mageWatch = g_mageWatch - 1;
-        if (g_mageCoolLeft) g_mageCoolLeft = g_mageCoolLeft - 1;
-
-        if (K != g_mageCtrl)                               // エリア移動などで作り直されたら、ゴーストを捨てる
-        {
-            for (int i = 0; i < MAGE_MAXG; ++i) g_mageT[i] = -1;
-            g_mageCtrl = K;
-            return;
-        }
-
-        for (int i = 0; i < MAGE_MAXG; ++i)
-        {
-            const s32 t = g_mageT[i];
-            if (t < 0)
-                continue;
-            if ((u32)t > g_mageTmax)
-            {
-                g_mageT[i] = -1;
-                continue;
-            }
-            const u32 savedId   = *(volatile u32 *)(K + 8);
-            const u32 savedTime = *(volatile u32 *)(K + 0xC4);
-            for (int n = 0; n < 16; ++n)
-            {
-                *(volatile u32 *)(K + 8)        = g_mageIds[n];
-                *(volatile float *)(K + 0xC4)   = (float)t;
-                jp_callBody(K);
-            }
-            *(volatile u32 *)(K + 8)    = savedId;
-            *(volatile u32 *)(K + 0xC4) = savedTime;
-            g_mageT[i] = t + 1;
-        }
-    }
 }
 
 asm(R"(
@@ -465,53 +341,6 @@ jp_hookWarp:
 1:  push  {r4-r11, lr}           @ 0x5A2AB8 の元命令
     mov   r4, r0                 @ 0x5A2ABC の元命令
     ldr   pc, =0x5A2AC0          @ 続きの元コードへ
-
-    @ ---- 魔法使い: Aスキル枠の状態0 (押された瞬間) ----
-    @ 0x240258: cmp r0,#0 / 0x24025C: ldrne r1,[r4,#0x48] の2命令を置き換え、0x240260 へ戻る。
-    @ r0 = 押されたか (0以外), r4 = スキル枠。MageS0Check が 1 を返したら、
-    @ 状態機械の終了処理 (0x240BA4: r0=0 で戻る) へ飛ぶ。
-    .global jp_hookMageS0
-    .type jp_hookMageS0, %function
-jp_hookMageS0:
-    push  {r0-r3, r12, lr}
-    mov   r1, r0
-    mov   r0, r4
-    bl    MageS0Check
-    cmp   r0, #0
-    pop   {r0-r3, r12, lr}       @ pop はフラグを変えない
-    bne   1f
-    cmp   r0, #0                 @ 0x240258 の元命令
-    ldrne r1, [r4, #0x48]        @ 0x24025C の元命令
-    ldr   pc, =0x240260
-1:  mov   r0, #0
-    ldr   pc, =0x240BA4
-
-    @ ---- 魔法使い: プレイヤーのアクション更新の入口 (0x22C254) ----
-    @ 置き換えた2命令 (push {r0,r4-r11,lr} / vpush {d8-d10}) を再現し、0x22C25C へ戻る。
-    .global jp_hookMageTick
-    .type jp_hookMageTick, %function
-jp_hookMageTick:
-    push  {r0-r3, r12, lr}
-    bl    MageTick               @ r0 = コントローラ
-    pop   {r0-r3, r12, lr}
-    push  {r0, r4-r11, lr}       @ 0x22C254 の元命令
-    vpush {d8-d10}               @ 0x22C258 の元命令
-    ldr   pc, =0x22C25C
-
-    @ ---- 魔法の判定を作る本体を、C から呼ぶための橋 ----
-    @ jp_callBody(r0 = コントローラ)。本体は「push {r0,r4-r11,lr}」「vpush {d8-d10}」の
-    @ あとの状態 (0x22C25C) で入る前提。0x22C254/0x22C258 は私たちのフックで書き換えて
-    @ あるので、そこへは飛ばず、同じ2命令をここで実行してから 0x22C25C へ入る。
-    @ lr には戻り先 (1:) を積んでおく。
-    .global jp_callBody
-    .type jp_callBody, %function
-jp_callBody:
-    push  {r4-r11, r12, lr}      @ 40バイト: 8バイト境界を保つ
-    adr   lr, 1f
-    push  {r0, r4-r11, lr}       @ 0x22C254 の元命令と同じ
-    vpush {d8-d10}               @ 0x22C258 の元命令と同じ
-    ldr   pc, =0x22C25C
-1:  pop   {r4-r11, r12, pc}
     .ltorg
 )");
 
@@ -3199,9 +3028,9 @@ namespace CTRPluginFramework
     {
         // true にすると、進行状況を画面に出します(不具合調査用)
         static constexpr bool VERBOSE = false;
-        // true にすると、スロット選択画面(オレンジ色の背景)を開かずに進めます
-        // (必ず先にGDBで動作確認してから true にしてください)
-        static constexpr bool HIDE_SELECT_UI = false;
+        // true にすると、スロット選択画面(オレンジ色の背景とアバター)を出さずに進めます
+        // (実機GDBで確認済み: UIの初期化と「UIを開く」を止め、UIの準備完了の印を手動で立てる)
+        static constexpr bool HIDE_SELECT_UI = true;
 
         static constexpr u32 FLOW_OBJ       = 0x7208DC;   // シーンフロー (+36 切替要求, +44 要求状態, +48 現在状態)
         static constexpr u32 ROOT_TASK      = 0x6B95EC;   // ルートタスク
@@ -3223,6 +3052,8 @@ namespace CTRPluginFramework
         static constexpr u32 SLOT_VAR       = 0x71BA40;
         static constexpr u32 UI_OPEN_ADDR   = 0x41251C;   // bl 0x308888 (スロット選択UIを開く)
         static constexpr u32 UI_OPEN_ORIG   = 0xEBFBD8D9;
+        static constexpr u32 UI_INIT_ADDR   = 0x412F9C;   // bl 0x30aba8 (スロット選択UIの初期化)
+        static constexpr u32 UI_INIT_ORIG   = 0xEBFBDF01;
         static constexpr u32 ARM_NOP        = 0xE1A00000;
         static constexpr u32 MAX_FRAMES     = 60 * 90;
 
@@ -3238,7 +3069,7 @@ namespace CTRPluginFramework
         static u32           g_tick  = 0;
         static volatile bool g_sent  = false;
         static volatile s32  g_sendResult = 0;
-        static bool g_mgrInit = false, g_vtblPatched = false, g_uiAttached = false, g_uiHidden = false;
+        static bool g_mgrInit = false, g_vtblPatched = false, g_uiAttached = false, g_uiHidden = false, g_uiInitHidden = false;
         static int  g_lastSt = -1;
 
         static void Say(const std::string &m) { if (VERBOSE) OSD::Notify(m); }
@@ -3282,6 +3113,8 @@ namespace CTRPluginFramework
             if (!g_uiAttached)
             {
                 ((FnU32x2)FN_ATTACH)(self, UIMGR_OBJ);
+                if (HIDE_SELECT_UI)
+                    *(volatile u32 *)(self + 372) |= 3;   // UIの準備完了の印 (UIの初期化を止めたので手動で立てる)
                 g_uiAttached = true;
             }
             volatile u8 *nextSt = (volatile u8 *)(self + 0x91B8);
@@ -3306,6 +3139,11 @@ namespace CTRPluginFramework
             {
                 Process::Write32(UI_OPEN_ADDR, UI_OPEN_ORIG);
                 g_uiHidden = false;
+            }
+            if (g_uiInitHidden)
+            {
+                Process::Write32(UI_INIT_ADDR, UI_INIT_ORIG);
+                g_uiInitHidden = false;
             }
             if (g_mgrInit)
             {
@@ -3343,7 +3181,10 @@ namespace CTRPluginFramework
             ((FnU32)FN_MGR_INIT)(MGR_OBJ);
             g_mgrInit = true;
             if (HIDE_SELECT_UI)
+            {
                 g_uiHidden = Process::Write32(UI_OPEN_ADDR, ARM_NOP);
+                g_uiInitHidden = Process::Write32(UI_INIT_ADDR, ARM_NOP);
+            }
             g_vtblPatched = Process::Write32(VTBL_EXSEL_UPDATE, (u32)&ExSelUpdateWrapper);
             g_sendResult = ((SendFn)FN_SEND)(ROOT_TASK, DESC_EXSEL);
             g_sent = true;
@@ -3486,474 +3327,6 @@ namespace CTRPluginFramework
         }
     }
 
-
-    // ------------------------------------------------------------
-    //  魔法使い: Aボタンで全属性チャージ技 (モーションなし)  【実験・実機未検証】
-    //   ・ゲームのコード2か所を、2語ずつ書き換える (ワープと同じ方式)。
-    //       0x240258 : Aスキル枠の状態0 (押された瞬間)
-    //       0x22C254 : プレイヤーのアクション更新の入口
-    //   ・以前のARコード (魔法使いA連打) とは同時に使えない。必ずOFFにして、
-    //     ゲームを再起動してから使うこと (0x22C254 を書き換えるため)。
-    // ------------------------------------------------------------
-    static constexpr u32 HOOK_MAGE_S0   = 0x00240258;
-    static constexpr u32 HOOK_MAGE_TICK = 0x0022C254;
-
-    static bool g_mageHooked = false;
-
-    static bool InstallMageHooks(void)
-    {
-        if (g_mageHooked)
-            return true;
-
-        // 0x240258: cmp r0,#0 / ldrne r1,[r4,#0x48]
-        static const u32 expectS0[2]   = { 0xE3500000, 0x15941048 };
-        // 0x22C254: push {r0,r4-r11,lr} / vpush {d8-d10}
-        static const u32 expectTick[2] = { 0xE92D4FF1, 0xED2D8B06 };
-        if (!CheckWords(HOOK_MAGE_S0, expectS0, 2) || !CheckWords(HOOK_MAGE_TICK, expectTick, 2))
-        {
-            MessageBox("エラー",
-                       "魔法使い用のフック位置の命令が想定と違います。\n"
-                       "魔法使い連射のARコードがONになっていないか確認し、OFFにしてゲームを再起動してください。\n"
-                       "それでも出る場合は、ゲームのバージョンが異なる可能性があります。")();
-            return false;
-        }
-
-        // 先にジャンプ先の値(2語目)を書き、そのあとで ldr pc 命令(1語目)を書く。
-        Process::Write32(HOOK_MAGE_S0 + 4,   (u32)(uintptr_t)jp_hookMageS0);
-        Process::Write32(HOOK_MAGE_S0,       0xE51FF004);   // ldr pc, [pc, #-4]
-        Process::Write32(HOOK_MAGE_TICK + 4, (u32)(uintptr_t)jp_hookMageTick);
-        Process::Write32(HOOK_MAGE_TICK,     0xE51FF004);
-
-        g_mageHooked = true;
-        return true;
-    }
-
-    // 有効な間、毎フレーム呼ばれる。メニューをOFFにすると呼ばれなくなり、
-    // g_mageWatch が数フレームで0になって、機能が止まる。
-    static void MageRapidEntry(MenuEntry *entry)
-    {
-        static u32 shownTick = 0;
-        static u32 lastCasts = 0;
-
-        if (!InstallMageHooks())
-        {
-            entry->Disable();
-            return;
-        }
-        g_mageWatch = 6;
-        if (g_mageAlive) g_mageAlive = g_mageAlive - 1;
-
-        if (!shownTick && g_mageTicks)
-        {
-            shownTick = 1;
-            OSD::Notify("Mage: hook OK");
-        }
-        if (g_mageCasts != lastCasts)
-        {
-            lastCasts = g_mageCasts;
-            if (g_mageCasts <= 3)
-                OSD::Notify(Utils::Format("Mage: cast #%u", (unsigned)g_mageCasts));
-        }
-    }
-
-    static void MageSettingsEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        {
-            Keyboard kb("判定を作る最大フレーム (10〜300)\n魔法が途中で消えるなら増やす。\n今の値は " + std::to_string((unsigned)g_mageTmax) + " です。");
-            kb.IsHexadecimal(false);
-            u32 v = g_mageTmax;
-            if (kb.Open(v, v) == 0)
-            {
-                if (v < 10) v = 10;
-                if (v > 300) v = 300;
-                g_mageTmax = v;
-            }
-        }
-        {
-            Keyboard kb("連続発動の最短間隔 (1〜30フレーム)\n小さいほど速く連射する。\n今の値は " + std::to_string((unsigned)g_mageCool) + " です。");
-            kb.IsHexadecimal(false);
-            u32 v = g_mageCool;
-            if (kb.Open(v, v) == 0)
-            {
-                if (v < 1) v = 1;
-                if (v > 30) v = 30;
-                g_mageCool = v;
-            }
-        }
-    }
-
-    static void AddMageRapid(PluginMenu *menu)
-    {
-        MenuFolder *f = new MenuFolder("魔法使い連射 (実験)",
-                                       "魔法使いで、Aボタンを押すと、全属性のチャージ技(A/X・1段階/2段階)を、"
-                                       "プレイヤーのモーションなしで出します。");
-        f->Append(new MenuEntry("Aボタンで全属性チャージ技 (モーションなし)", MageRapidEntry, nullptr,
-                                "魔法使いで有効にして、フィールドでAボタンを押します。\n"
-                                "押している間は、設定した間隔で出続けます。\n"
-                                "以前の魔法使い連射のARコードとは同時に使えません。ARをOFFにして、ゲームを再起動してから使ってください。\n"
-                                "止める場合は、このメニューをOFFにします(フック自体はゲームを再起動するまで残ります)。"));
-        f->Append(new MenuEntry("設定 (最大フレーム・発動間隔)", nullptr, MageSettingsEntry,
-                                "魔法の判定を作る最大フレーム数と、連続発動の最短間隔を変えます。"));
-        menu->Append(f);
-    }
-
-    // ------------------------------------------------------------
-    //  固有効果を変更 (武器・防具)
-    //  固有効果は、かばんの1つ1つのアイテムではなく、ゲームがメモリに読み込んでいる
-    //  「データ表」(1アイテム1行。行の決まった位置の2バイトが効果ID)で決まる。
-    //  この表をメモリ上で書き換える。同じIDのアイテムすべてに効き、自分のゲームの中だけで有効。
-    //  ゲームを終了すると元に戻る。表の場所は、メモリを検索して見つける。
-    //   武器: 行 = ID (0x0000-0x008F)、1行24バイト、行の+14
-    //   防具: 行 = ID - 0x99 (0x0099-0x0386)、1行48バイト、行の+38
-    //  ライフ道具は、表がまだ見つかっていないため対象外。
-    // ------------------------------------------------------------
-    static constexpr u32 INN_MAGIC      = 0x1D038013u;   // 表ファイルの先頭の目印
-    static constexpr u32 INN_ROWS_OFF_W = 0x110;
-    static constexpr u32 INN_ROWS_OFF_A = 0x14C;
-    static constexpr u32 INN_EFFECT_MAX = 0x240;         // 効果IDの最大
-    static constexpr int INN_CATS       = 2;
-    static constexpr u32 INN_MAX_ITEMS  = 0x400;         // 1カテゴリの最大アイテム数
-
-    // 照合用: 固有効果より前にある列の値 (効果を書き換えても変わらない)
-    static const u8 s_w_0[14] = { 0x06, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x65, 0x02, 0xE8, 0x03 };
-    static const u8 s_w_1[14] = { 0x0C, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x66, 0x02, 0xE8, 0x03 };
-    static const u8 s_w_81[14] = { 0x78, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2C, 0x04, 0xE8, 0x03 };
-    static const u8 s_w_143[14] = { 0x00, 0x00, 0x02, 0x00, 0x64, 0x00, 0x01, 0x00, 0x50, 0x00, 0x4C, 0x06, 0xE8, 0x03 };
-    static const u8 s_a_0[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
-    static const u8 s_a_1[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
-    static const u8 s_a_150[36] = { 0x00, 0x00, 0x80, 0x3F, 0x16, 0x00, 0x16, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
-    static const u8 s_a_300[36] = { 0x00, 0x00, 0x80, 0x3F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
-    static const u8 s_a_500[36] = { 0x00, 0x00, 0x80, 0x3F, 0x22, 0x00, 0x11, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
-    static const u8 s_a_749[36] = { 0x00, 0x00, 0x80, 0x3F, 0x06, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
-
-    struct InnateRow { u32 row; const u8 *bytes; };
-    static const InnateRow g_innSigW[] =
-    {
-        { 0, s_w_0 },
-        { 1, s_w_1 },
-        { 81, s_w_81 },
-        { 143, s_w_143 }
-    };
-    static const InnateRow g_innSigA[] =
-    {
-        { 0, s_a_0 },
-        { 1, s_a_1 },
-        { 150, s_a_150 },
-        { 300, s_a_300 },
-        { 500, s_a_500 },
-        { 749, s_a_749 }
-    };
-
-    struct InnateCat
-    {
-        const char       *name;
-        u32               idMin, idMax;      // アイテムIDの範囲 (行 = id - idMin)
-        u32               rowsOff;           // 表の先頭から最初の行まで
-        u32               rowSize;
-        u32               effOff;            // 行の中の固有効果の位置 (u16)
-        u32               sigLen;            // 照合するバイト数
-        const InnateRow  *sigs;
-        int               sigN;
-    };
-
-    static const InnateCat g_innCats[INN_CATS] =
-    {
-        { "武器", 0x0000, 0x008F, INN_ROWS_OFF_W, 24, 14, 14, g_innSigW, 4 },
-        { "防具", 0x0099, 0x0386, INN_ROWS_OFF_A, 48, 38, 36, g_innSigA, 6 },
-    };
-
-    static u32  g_innTab[INN_CATS][8];                          // 見つかった表(コピー)の先頭アドレス
-    static int  g_innTabN[INN_CATS] = { 0, 0 };
-    static u16  g_innOrig[INN_CATS][INN_MAX_ITEMS];             // 変更前の効果ID
-    static bool g_innHas[INN_CATS][INN_MAX_ITEMS];              // 変更済みか
-
-    static u32 InnCount(const InnateCat &c) { return c.idMax - c.idMin + 1; }
-
-    static u32 InnEffAddr(const InnateCat &c, u32 base, u32 id)
-    {
-        return base + c.rowsOff + c.rowSize * (id - c.idMin) + c.effOff;
-    }
-
-    static bool InnIsTable(const InnateCat &c, u32 base)
-    {
-        u32 v = 0;
-        if (!Process::Read32(base, v) || v != INN_MAGIC)
-            return false;
-        for (int k = 0; k < c.sigN; ++k)
-        {
-            const u32 a = base + c.rowsOff + c.rowSize * c.sigs[k].row;
-            const u8 *want = c.sigs[k].bytes;
-            u32 i = 0;
-            for (; i + 4 <= c.sigLen; i += 4)
-            {
-                u32 x = 0;
-                if (!Process::Read32(a + i, x))
-                    return false;
-                const u32 w = (u32)want[i] | ((u32)want[i + 1] << 8) | ((u32)want[i + 2] << 16) | ((u32)want[i + 3] << 24);
-                if (x != w)
-                    return false;
-            }
-            if (i + 2 <= c.sigLen)
-            {
-                u16 x = 0;
-                if (!Process::Read16(a + i, x))
-                    return false;
-                const u16 w = (u16)((u32)want[i] | ((u32)want[i + 1] << 8));
-                if (x != w)
-                    return false;
-            }
-        }
-        return true;
-    }
-
-    static void InnAdd(int ci, u32 base)
-    {
-        for (int i = 0; i < g_innTabN[ci]; ++i)
-            if (g_innTab[ci][i] == base)
-                return;
-        if (g_innTabN[ci] < 8)
-            g_innTab[ci][g_innTabN[ci]++] = base;
-    }
-
-    // 読めない所はページ単位で飛ばしながら、16バイトおきに目印を探す
-    // 見つかった表は、武器・防具のどちらのものか調べて、それぞれに記録する
-    static void InnScanPass(u32 start, u32 end, u32 off)
-    {
-        u32 a = start + off;
-        while (a < end)
-        {
-            u32 v = 0;
-            if (!Process::Read32(a, v))
-            {
-                a = ((a | 0xFFFu) + 1) + off;
-                continue;
-            }
-            if (v == INN_MAGIC)
-                for (int ci = 0; ci < INN_CATS; ++ci)
-                    if (InnIsTable(g_innCats[ci], a))
-                        InnAdd(ci, a);
-            a += 16;
-        }
-    }
-
-    // 0=やめた 1=見つかった 2=見つからなかった
-    static int InnFind(int ci)
-    {
-        for (int c = 0; c < INN_CATS; ++c)     // 前回見つけた場所がまだ有効なものだけ残す
-        {
-            int k = 0;
-            for (int i = 0; i < g_innTabN[c]; ++i)
-                if (InnIsTable(g_innCats[c], g_innTab[c][i]))
-                    g_innTab[c][k++] = g_innTab[c][i];
-            g_innTabN[c] = k;
-        }
-        if (g_innTabN[ci] > 0)
-            return 1;
-
-        if (!(MessageBox("データの検索",
-                         "メモリから固有効果のデータ表を探します。\n数十秒かかることがあります。\n(最初の1回だけです)",
-                         DialogType::DialogYesNo))())
-            return 0;
-
-        static const u32 ranges[2][2] = { { 0x08000000u, 0x10000000u }, { 0x14000000u, 0x1C000000u } };
-        for (u32 off = 0; off < 16 && g_innTabN[ci] == 0; off += 4)
-            for (int r = 0; r < 2; ++r)
-                InnScanPass(ranges[r][0], ranges[r][1], off);
-        return g_innTabN[ci] > 0 ? 1 : 2;
-    }
-
-    static bool InnRead(int ci, u32 id, u16 &out)
-    {
-        return g_innTabN[ci] > 0 && Process::Read16(InnEffAddr(g_innCats[ci], g_innTab[ci][0], id), out);
-    }
-
-    static bool InnWrite(int ci, u32 id, u16 eff)
-    {
-        bool ok = false;
-        for (int i = 0; i < g_innTabN[ci]; ++i)
-        {
-            const u32 a = InnEffAddr(g_innCats[ci], g_innTab[ci][i], id);
-            u16 back = 0;
-            if (Process::Write16(a, eff) && Process::Read16(a, back) && back == eff)
-                ok = true;
-        }
-        return ok;
-    }
-
-    // 1件の効果を変える (元の値を保存しておく)。変更できたら true
-    static bool InnSet(int ci, u32 id, u16 eff)
-    {
-        const InnateCat &c = g_innCats[ci];
-        const u32 k = id - c.idMin;
-        u16 cur = 0;
-        InnRead(ci, id, cur);
-        if (!g_innHas[ci][k])
-        {
-            g_innOrig[ci][k] = cur;
-            g_innHas[ci][k]  = true;
-        }
-        if (!InnWrite(ci, id, eff))
-            return false;
-        if (eff == g_innOrig[ci][k])
-            g_innHas[ci][k] = false;
-        return true;
-    }
-
-    static std::string InnEffName(u32 id)
-    {
-        const char *n = LookupName(g_effectNames, id);
-        return n ? std::string(n) : Utils::Format("0x%04X", id);
-    }
-
-    // カテゴリ全体 / ID範囲を、同じ固有効果にまとめて変える
-    static void InnBulk(int ci)
-    {
-        const InnateCat &c = g_innCats[ci];
-        u32 from = c.idMin, to = c.idMax;
-
-        std::vector<std::string> sc;
-        sc.push_back(Utils::Format("%sすべて (%u件)", c.name, InnCount(c)));
-        sc.push_back("ID範囲を指定する");
-        Keyboard ks(Utils::Format("%sの固有効果を一括変更: 対象", c.name), sc);
-        const int s = ks.Open();
-        if (s < 0)
-            return;
-        if (s == 1)
-        {
-            if (!PickFromNames(Utils::Format("開始 [%s]", c.name), g_itemNames, true, c.idMin, c.idMax, c.idMin, from))
-                return;
-            if (!PickFromNames(Utils::Format("終了 [%s]", c.name), g_itemNames, true, from, c.idMax, c.idMax, to))
-                return;
-        }
-
-        std::vector<std::string> fl;
-        fl.push_back("すべて");
-        fl.push_back("今、固有効果が付いているものだけ");
-        fl.push_back("今、固有効果が「なし」のものだけ");
-        Keyboard kf("どれを変更しますか?", fl);
-        const int f = kf.Open();
-        if (f < 0)
-            return;
-
-        u32 eff = 0;
-        if (!PickFromNames(Utils::Format("固有効果 [%s 一括]", c.name), g_effectNames, false, 0, 0, 0, eff))
-            return;
-        if (eff > INN_EFFECT_MAX)
-        {
-            MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
-            return;
-        }
-
-        std::vector<u32> ids;
-        for (u32 id = from; id <= to; ++id)
-        {
-            u16 cur = 0;
-            if (!InnRead(ci, id, cur))
-                continue;
-            if (f == 1 && cur == 0)
-                continue;
-            if (f == 2 && cur != 0)
-                continue;
-            ids.push_back(id);
-        }
-        if (ids.empty())
-        {
-            MessageBox("対象なし", "条件に合うものがありません。")();
-            return;
-        }
-        if (!(MessageBox("確認",
-                         Utils::Format("%s %s から %s までのうち %u件の\n固有効果を\n%s\nにします。よろしいですか?",
-                                       c.name, IdName(from).c_str(), IdName(to).c_str(), (u32)ids.size(),
-                                       InnEffName(eff).c_str()),
-                         DialogType::DialogYesNo))())
-            return;
-
-        u32 n = 0;
-        for (u32 id : ids)
-            if (InnSet(ci, id, (u16)eff))
-                ++n;
-        MessageBox("変更しました",
-                   Utils::Format("%u 件の固有効果を\n%s\nにしました。\n装備を つけ直すと反映されます。", n,
-                                 InnEffName(eff).c_str()))();
-    }
-
-    static void InnateEditEntry(int ci)
-    {
-        const InnateCat &c = g_innCats[ci];
-        const int found = InnFind(ci);
-        if (found == 0)
-            return;
-        if (found == 2)
-        {
-            MessageBox("見つかりません", Utils::Format("%sのデータ表がメモリ上に見つかりませんでした。", c.name))();
-            return;
-        }
-
-        const u32 cnt = InnCount(c);
-        for (;;)
-        {
-            std::vector<std::string> rows;
-            rows.push_back("[カテゴリ全体を一括変更]");
-            rows.push_back("[変更をすべて元に戻す]");
-            for (u32 id = c.idMin; id <= c.idMax; ++id)
-            {
-                u16 e = 0;
-                InnRead(ci, id, e);
-                std::string s = IdName(id) + ": " + InnEffName(e);
-                if (g_innHas[ci][id - c.idMin])
-                    s += " *";
-                rows.push_back(s);
-            }
-            Keyboard kb(Utils::Format("%sの固有効果を変更 (*は変更済み。Bで戻る)", c.name), rows);
-            const int sel = kb.Open();
-            if (sel < 0)
-                return;
-
-            if (sel == 0)
-            {
-                InnBulk(ci);
-                continue;
-            }
-            if (sel == 1)
-            {
-                u32 n = 0;
-                for (u32 k = 0; k < cnt; ++k)
-                    if (g_innHas[ci][k] && InnWrite(ci, c.idMin + k, g_innOrig[ci][k]))
-                    {
-                        g_innHas[ci][k] = false;
-                        ++n;
-                    }
-                MessageBox("元に戻しました", Utils::Format("%u 件を元に戻しました。", n))();
-                continue;
-            }
-
-            const u32 id = c.idMin + (u32)(sel - 2);
-            u16 cur = 0;
-            InnRead(ci, id, cur);
-            u32 pick = 0;
-            if (!PickFromNames(Utils::Format("固有効果 [%s]", IdName(id).c_str()), g_effectNames,
-                               false, 0, 0, cur, pick))
-                continue;
-            if (pick > INN_EFFECT_MAX)
-            {
-                MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
-                continue;
-            }
-            if (!InnSet(ci, id, (u16)pick))
-            {
-                MessageBox("失敗", "書き込めませんでした。")();
-                continue;
-            }
-            MessageBox("変更しました",
-                       IdName(id) + " の固有効果を\n" + InnEffName(pick) +
-                       "\nにしました。\n装備をつけ直すと反映されます。")();
-        }
-    }
-
-    static void WeaponInnateEntry(MenuEntry *entry) { (void)entry; InnateEditEntry(0); }
-    static void ArmorInnateEntry(MenuEntry *entry)  { (void)entry; InnateEditEntry(1); }
-
     // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
@@ -3975,7 +3348,7 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-
+        
         AddMaterialZero(menu);
         AddLifeChange(menu);
 
@@ -4041,25 +3414,10 @@ namespace CTRPluginFramework
 
         AddQualityFix(menu);
         AddRecommended(menu);
-        AddMageRapid(menu);
         
-        menu->Append(new MenuEntry("プレイヤー切り替え (v5)", nullptr, PlayerSwitch::Entry,
+        menu->Append(new MenuEntry("プレイヤー切り替え (v6)", nullptr, PlayerSwitch::Entry,
                                    "フィールドで実行します。タイトルを経由せず、選んだプレイヤーのデータに切り替えます。\n"
                                    "使う前に、セーブのバックアップを取ってください。"));
-
-        // 固有効果の変更 (メニューの一番下。ライフ道具は表が未特定のため、まだありません)
-        menu->Append(new MenuEntry("武器の固有効果を変更", nullptr, WeaponInnateEntry,
-                                   "武器ごとの固有効果を、メモリ上のデータ表を書き換えて変更します。\n"
-                                   "1つずつ変更するほか、カテゴリ全体 / ID範囲を同じ効果にまとめて変更できます。\n"
-                                   "同じIDの武器すべてに効きます。自分のゲームの中だけで有効で、ゲームを終了すると元に戻ります。\n"
-                                   "変更したあと、武器をつけ直すと反映されます。\n"
-                                   "最初の1回は、表の場所をメモリから探すため時間がかかります。"));
-        menu->Append(new MenuEntry("防具の固有効果を変更", nullptr, ArmorInnateEntry,
-                                   "防具ごとの固有効果を、メモリ上のデータ表を書き換えて変更します。\n"
-                                   "1つずつ変更するほか、カテゴリ全体 / ID範囲を同じ効果にまとめて変更できます。\n"
-                                   "同じIDの防具すべてに効きます。自分のゲームの中だけで有効で、ゲームを終了すると元に戻ります。\n"
-                                   "変更したあと、防具をつけ直すと反映されます。\n"
-                                   "最初の1回は、表の場所をメモリから探すため時間がかかります。"));
         menu->Callback(PlayerSwitch::OnFrame);
         menu->Callback(PosNotifyFrame);
         
