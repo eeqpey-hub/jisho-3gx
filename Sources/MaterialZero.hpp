@@ -75,7 +75,9 @@ namespace CTRPluginFramework
         OSD::Notify(sel == 0 ? "Material zero: ON" : "Material zero: OFF");
     }
 
-    static void AddMaterialZero(PluginMenu *menu)
+    // PluginMenu* でも MenuFolder* でも渡せる
+    template <typename TMenu>
+    static void AddMaterialZero(TMenu *menu)
     {
         menu->Append(new MenuEntry("制作の素材を0個にする", nullptr, MaterialZeroEntry,
                                    "制作の素材の必要個数を0として読ませます。\n"
