@@ -317,6 +317,7 @@ extern "C"
     volatile u32 g_mageAutoCasts = 0;
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
+    volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
     volatile u32 g_mageFrame    = 0;      // プラグイン側が毎フレーム進める (同じフレームで2回進めないための目印)
     volatile u32 g_mageDrvFrame = 0;
     // --- AR準拠モード (プレイヤーのモーションあり。Aスキルを2段階目まで一瞬で溜めて撃ち、全属性・A/Xを同時に出す) ---
@@ -354,6 +355,12 @@ extern "C"
         if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
             return 0;
         return obj;
+    }
+
+    // n = 0〜15: 表のスキル / 16: Xの必殺技 (未設定なら 0)
+    static u32 MageIdAt(int n)
+    {
+        return n < 16 ? g_mageIds[n] : g_mageUltId;
     }
 
     static bool MageIsId(u32 id)
@@ -464,11 +471,11 @@ extern "C"
             {
                 if ((u32)t > g_mageTmax)
                     break;
-                for (int n = 0; n < 16; ++n)
+                for (int n = 0; n < 17; ++n)
                 {
-                    if (!((mask >> n) & 1))
+                    if (!((mask >> n) & 1) || !MageIdAt(n))
                         continue;
-                    *(volatile u32 *)(K + 8)      = g_mageIds[n];
+                    *(volatile u32 *)(K + 8)      = MageIdAt(n);
                     *(volatile float *)(K + 0xC4) = (float)t;
                     jp_callBody(K);                        // 魔法の判定・エフェクトを作る本体
                 }
@@ -567,11 +574,11 @@ extern "C"
             if (id == g_mageIds[0] || id == g_mageIds[1] || id == g_mageIds[2] || id == g_mageIds[3])
             {
                 const u32 mask = g_mageArMask;
-                for (int n = 0; n < 16; ++n)
+                for (int n = 0; n < 17; ++n)
                 {
-                    if (!((mask >> n) & 1) || g_mageIds[n] == id)
+                    if (!((mask >> n) & 1) || !MageIdAt(n) || MageIdAt(n) == id)
                         continue;
-                    *(volatile u32 *)(K + 8) = g_mageIds[n];
+                    *(volatile u32 *)(K + 8) = MageIdAt(n);
                     jp_callBody(K);
                 }
                 *(volatile u32 *)(K + 8) = id;
@@ -3951,6 +3958,7 @@ namespace CTRPluginFramework
             std::vector<std::string> opts;
             for (int i = 0; i < 16; ++i)
                 opts.push_back(std::string(((mask >> i) & 1) ? "[ON]  " : "[OFF] ") + attr[i % 4] + " " + kind[i / 4]);
+            opts.push_back(std::string(((mask >> 16) & 1) ? "[ON]  " : "[OFF] ") + "Xの必殺技" + (g_mageUltId ? "" : " (IDが未設定)"));
             opts.push_back("全部 ON");
             opts.push_back("全部 OFF");
             opts.push_back("A系だけ ON");
@@ -3960,16 +3968,53 @@ namespace CTRPluginFramework
             opts.push_back("戻る");
             Keyboard kb(title + " (押すと切り替わる)", opts);
             const int r = kb.Open();
-            if (r < 0 || r == 22)
+            if (r < 0 || r == 23)
                 break;
-            if (r < 16)
+            if (r < 17)
                 mask = mask ^ (1u << r);
-            else if (r == 16) mask = 0xFFFF;
-            else if (r == 17) mask = 0;
-            else if (r == 18) mask = 0x00FF;     // A系: ビット0-7 (A2段階目 + A1段階目)
-            else if (r == 19) mask = 0xFF00;     // X系: ビット8-15
-            else if (r == 20) mask = 0x0FF0;     // 1段階目: ビット4-7 (A1) + 8-11 (X1)
-            else if (r == 21) mask = 0xF00F;     // 2段階目: ビット0-3 (A2) + 12-15 (X2)
+            else if (r == 17) mask = 0x1FFFF;
+            else if (r == 18) mask = 0;
+            else if (r == 19) mask = 0x00FF;     // A系: ビット0-7 (A2段階目 + A1段階目)
+            else if (r == 20) mask = 0xFF00;     // X系: ビット8-15
+            else if (r == 21) mask = 0x0FF0;     // 1段階目: ビット4-7 (A1) + 8-11 (X1)
+            else if (r == 22) mask = 0xF00F;     // 2段階目: ビット0-3 (A2) + 12-15 (X2)
+        }
+    }
+
+    // Xの必殺技のIDの設定
+    static void MageUltIdEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        Keyboard kb("Xの必殺技のアクションID (16進)\n0 = 使わない。調べ方は「必殺技IDを調べる」を使う。\n今の値は " +
+                    Utils::Format("%08X", (unsigned)g_mageUltId) + " です。");
+        kb.IsHexadecimal(true);
+        u32 v = g_mageUltId;
+        if (kb.Open(v, v) == 0)
+        {
+            g_mageUltId = v;
+            if (v)
+            {
+                g_mageMask = g_mageMask | 0x10000;
+                g_mageAutoMask = g_mageAutoMask | 0x10000;
+                g_mageArMask = g_mageArMask | 0x10000;
+            }
+        }
+    }
+
+    // 動作が切り替わるたびに、そのアクションIDを画面に出す (必殺技のIDを調べるための補助)
+    static void MageLearnEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        static u32 last = 0;
+        const u32 C = MageObj();
+        if (!C)
+            return;
+        const u32 id = *(volatile u32 *)(C + 0x558 + 8);
+        if (id != last)
+        {
+            last = id;
+            if (id != 1)
+                OSD::Notify(Utils::Format("Act %08X", (unsigned)id));
         }
     }
 
@@ -4058,6 +4103,10 @@ namespace CTRPluginFramework
                                 "自動発動で出す技を、1つずつON/OFFできます。"));
         f->Append(new MenuEntry("自動発動の設定 (距離・間隔)", nullptr, MageAutoSettingsEntry,
                                 "敵に近づいたと判定する距離と、自動発動の間隔を変えます。"));
+        f->Append(new MenuEntry("Xの必殺技のIDを設定 (16進)", nullptr, MageUltIdEntry,
+                                "Xの必殺技のアクションIDを入れます。入れると、技の選択で選べます。"));
+        f->Append(new MenuEntry("必殺技IDを調べる (画面に出す)", MageLearnEntry, nullptr,
+                                "ONにして、ゲージを溜めたXの必殺技を撃つと、動作のIDが画面の上に出ます。"));
         f->Append(new MenuEntry("AR準拠: Aスキル+全属性 (モーションあり)", MageArEntry, nullptr,
                                 "以前のARコードと同じ動きです。Aのスキルを2段階目まで一瞬で溜めて撃ち、ほかの技も同時に出します。\n"
                                 "魔法使い連射・敵即死のARコードとは同時に使えません。"));
