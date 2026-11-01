@@ -86,7 +86,7 @@ extern "C"
     //  ・位置が POS_QUIET_FRAMES フレーム続けて保存位置のままなら、ゲームの配置は終わったとみなして離す。
     //  ・いったん落ち着いたあと、位置がずれたら (= 操作が始まった) すぐ離す。
     //  プレイヤーのデータが出来る前や、読み込み中は、書かない。
-    #define POS_START_FRAMES    5        // 新しいプレイヤーを見つけて、このフレーム数のあとに書き始める
+    #define POS_START_FRAMES    1        // 新しいプレイヤーを見つけて、このフレーム数のあとに書き始める
     #define POS_QUIET_FRAMES    45       // 保存位置のまま、これだけ続いたら離す
     #define POS_MIN_HOLD        30       // 最低でも、これだけは書く
     #define POS_MAX_HOLD        600      // これ以上は書き続けない (約10秒)
@@ -141,6 +141,21 @@ extern "C"
     //   行列A (+0x04 から3行): [ c 0 s tx ] [ 0 1 0 ty ] [ -s 0 c tz ]   (c = cos, s = sin)
     //   行列B (+0x34 から3行): Aを拡大率 k (+0x48, 0.11) 倍したもの
     // 向きが変わるのは、行列の回転部分だけ。座標はそのままにする。
+    // 新しいプレイヤーのデータが出来た直後でも使える確認 (座標のコピーが、まだ揃っていなくてもよい)。
+    // cAppUnit の vptr (GDBで確認) なら、そのまま採用する。違う場合だけ、コピーの一致で確かめる。
+    static u32 PosPlayerRaw(void)
+    {
+        const u32 mgr = *(volatile u32 *)0x68BBB8;
+        if (mgr < 0x08000000u || mgr >= 0x1F000000u || (mgr & 3))
+            return 0;
+        const u32 obj = *(volatile u32 *)(mgr + 0x7828);
+        if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
+            return 0;
+        if (*(volatile u32 *)obj == 0x671EB8u)
+            return obj;
+        return PosPlayerObj();
+    }
+
     static void PosApplyYaw(u32 obj, float c, float s)
     {
         float k = *(volatile float *)(obj + 0x48);
@@ -162,9 +177,14 @@ extern "C"
 
     static void PosApply(u32 obj, float tx, float ty, float tz)
     {
-        static const u16 offX[] = { 0x7C, 0x40, 0x10, 0x20C, 0x218 };
-        static const u16 offY[] = { 0x80, 0x50, 0x20, 0x210, 0x21C };
-        static const u16 offZ[] = { 0x84, 0x60, 0x30, 0x214, 0x220 };
+        // 主な座標のコピー (x,y,z の値そのもの): 保存した値を、そのまま書く
+        static const u16 mainX[] = { 0x7C, 0x40, 0x10 };
+        static const u16 mainY[] = { 0x80, 0x50, 0x20 };
+        static const u16 mainZ[] = { 0x84, 0x60, 0x30 };
+        // 周囲の判定用らしい座標 (高さに +0.5 などが入っている): 現在値との差を保って動かす
+        static const u16 subX[] = { 0x20C, 0x218 };
+        static const u16 subY[] = { 0x210, 0x21C };
+        static const u16 subZ[] = { 0x214, 0x220 };
 
         const float cx = *(volatile float *)(obj + 0x7C);
         const float cy = *(volatile float *)(obj + 0x80);
@@ -175,10 +195,16 @@ extern "C"
         const float dx = tx - cx, dy = ty - cy, dz = tz - cz;
         if (dx != 0.0f || dy != 0.0f || dz != 0.0f)
         {
-            for (unsigned i = 0; i < sizeof(offX) / sizeof(offX[0]); ++i) *(volatile float *)(obj + offX[i]) += dx;
-            for (unsigned i = 0; i < sizeof(offY) / sizeof(offY[0]); ++i) *(volatile float *)(obj + offY[i]) += dy;
-            for (unsigned i = 0; i < sizeof(offZ) / sizeof(offZ[0]); ++i) *(volatile float *)(obj + offZ[i]) += dz;
+            for (unsigned i = 0; i < sizeof(subX) / sizeof(subX[0]); ++i)
+                if (PosSane(*(volatile float *)(obj + subX[i]))) *(volatile float *)(obj + subX[i]) += dx;
+            for (unsigned i = 0; i < sizeof(subY) / sizeof(subY[0]); ++i)
+                if (PosSane(*(volatile float *)(obj + subY[i]))) *(volatile float *)(obj + subY[i]) += dy;
+            for (unsigned i = 0; i < sizeof(subZ) / sizeof(subZ[0]); ++i)
+                if (PosSane(*(volatile float *)(obj + subZ[i]))) *(volatile float *)(obj + subZ[i]) += dz;
         }
+        for (unsigned i = 0; i < sizeof(mainX) / sizeof(mainX[0]); ++i) *(volatile float *)(obj + mainX[i]) = tx;
+        for (unsigned i = 0; i < sizeof(mainY) / sizeof(mainY[0]); ++i) *(volatile float *)(obj + mainY[i]) = ty;
+        for (unsigned i = 0; i < sizeof(mainZ) / sizeof(mainZ[0]); ++i) *(volatile float *)(obj + mainZ[i]) = tz;
         if (g_posYawOn)
             PosApplyYaw(obj, g_posYaw[0], g_posYaw[1]);
     }
@@ -233,7 +259,7 @@ extern "C"
         if (!g_posMode)
             return;
 
-        const u32 obj   = PosPlayerObj();
+        const u32 obj   = PosPlayerRaw();
         const u32 area  = *(volatile u16 *)(task + 0x6B2);
         const u32 state = *(volatile u8 *)(task + 624);
         float p[3] = { 0.0f, 0.0f, 0.0f };
@@ -346,7 +372,7 @@ extern "C"
     {
         if (!g_posMode || !unit)
             return;
-        if (unit != PosPlayerObj())
+        if (unit != PosPlayerRaw())
             return;
         if (g_posMode == 1)
         {
