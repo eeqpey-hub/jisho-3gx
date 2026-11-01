@@ -318,7 +318,9 @@ extern "C"
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
-    volatile u32 g_mageUltTmax  = 900;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
+    volatile u32 g_mageUltTmax  = 600;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
+    volatile u32 g_mageBudget   = 48;     // 1フレームに魔法の判定を作る関数を呼ぶ回数の上限 (重くなりすぎないように)
+    volatile u32 g_mageClear    = 0;      // 1にすると、動いているゴーストを全部止める
     volatile u32 g_mageFrame    = 0;      // プラグイン側が毎フレーム進める (同じフレームで2回進めないための目印)
     volatile u32 g_mageDrvFrame = 0;
     // --- AR準拠モード (プレイヤーのモーションあり。Aスキルを2段階目まで一瞬で溜めて撃ち、全属性・A/Xを同時に出す) ---
@@ -376,6 +378,15 @@ extern "C"
     // ゴーストを1つ作る (全部使用中なら、いちばん進んだものを作り直す)
     static void MageStart(u32 mask, bool manual)
     {
+        // 必殺技は同時に1つだけ (長く続くので、重なると重くなりすぎる)。すでに動いていたら、必殺技を外す。
+        if ((mask >> 16) & 1)
+        {
+            for (int i = 0; i < MAGE_MAXG; ++i)
+                if (g_mageT[i] >= 0 && ((g_mageGM[i] >> 16) & 1))
+                    mask &= ~0x10000u;
+        }
+        if (!(mask & 0x1FFFF))
+            return;
         if (manual)
         {
             g_mageCoolLeft = g_mageCool;
@@ -439,6 +450,12 @@ extern "C"
         if (g_mageAutoLeft) g_mageAutoLeft = g_mageAutoLeft - 1;
         if (g_mageSince < 1000) g_mageSince = g_mageSince + 1;
 
+        if (g_mageClear)                                   // 緊急停止
+        {
+            for (int i = 0; i < MAGE_MAXG; ++i) g_mageT[i] = -1;
+            g_mageClear = 0;
+        }
+
         if (K != g_mageCtrl)                               // エリア移動などで作り直されたら、ゴーストを捨てる
         {
             for (int i = 0; i < MAGE_MAXG; ++i) g_mageT[i] = -1;
@@ -461,6 +478,7 @@ extern "C"
         }
 
         const u32 step = g_mageStep < 1 ? 1 : g_mageStep;
+        u32 budget = g_mageBudget < 17 ? 17 : g_mageBudget;
         for (int i = 0; i < MAGE_MAXG; ++i)
         {
             s32 t = g_mageT[i];
@@ -475,6 +493,13 @@ extern "C"
             {
                 if ((u32)t > tmaxEff)
                     break;
+                u32 need = 0;                                  // この時間で呼ぶ回数
+                for (int n = 0; n < 17; ++n)
+                    if (((mask >> n) & 1) && MageIdAt(n) && !(n < 16 && (u32)t > g_mageTmax))
+                        ++need;
+                if (need > budget)
+                    break;                                     // 今フレームの上限を超えるので、続きは次のフレームへ
+                budget -= need;
                 for (int n = 0; n < 17; ++n)
                 {
                     if (!((mask >> n) & 1) || !MageIdAt(n))
@@ -3931,8 +3956,11 @@ namespace CTRPluginFramework
         if (MageAskNumber("判定を作る最大フレーム (10〜600)\n魔法が途中で消えるなら増やす。", v, 10, 600))
             g_mageTmax = v;
         v = g_mageUltTmax;
-        if (MageAskNumber("必殺技の最大フレーム (10〜1800)\n隕石などが途中で止まるなら増やす。", v, 10, 1800))
+        if (MageAskNumber("必殺技の最大フレーム (10〜1800)\n隕石などが途中で止まるなら増やす。降りすぎるなら減らす。", v, 10, 1800))
             g_mageUltTmax = v;
+        v = g_mageBudget;
+        if (MageAskNumber("1フレームの処理の上限 (17〜200)\n重い・固まるときは減らす。減らしすぎると魔法が遅れる。", v, 17, 200))
+            g_mageBudget = v;
         v = g_mageStep;
         if (MageAskNumber("魔法が出る速さ (1〜10)\n1 = 本来の速さ。大きいほど早く出る(遅延が減る)。", v, 1, 10))
             g_mageStep = v;
@@ -4000,6 +4028,14 @@ namespace CTRPluginFramework
             else if (r == 21) mask = 0x0FF0;     // 1段階目: ビット4-7 (A1) + 8-11 (X1)
             else if (r == 22) mask = 0xF00F;     // 2段階目: ビット0-3 (A2) + 12-15 (X2)
         }
+    }
+
+    // 動いているゴーストを全部止める
+    static void MageStopEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        g_mageClear = 1;
+        OSD::Notify("Mage: stop");
     }
 
     // Xの必殺技のIDの設定
@@ -4124,6 +4160,8 @@ namespace CTRPluginFramework
                                 "自動発動で出す技を、1つずつON/OFFできます。"));
         f->Append(new MenuEntry("自動発動の設定 (距離・間隔)", nullptr, MageAutoSettingsEntry,
                                 "敵に近づいたと判定する距離と、自動発動の間隔を変えます。"));
+        f->Append(new MenuEntry("動いている魔法を全部止める", nullptr, MageStopEntry,
+                                "降り続けている魔法を止めます。重いときに使います。"));
         f->Append(new MenuEntry("Xの必殺技のIDを設定 (16進)", nullptr, MageUltIdEntry,
                                 "Xの必殺技のアクションIDを入れます。入れると、技の選択で選べます。"));
         f->Append(new MenuEntry("必殺技IDを調べる (画面に出す)", MageLearnEntry, nullptr,
