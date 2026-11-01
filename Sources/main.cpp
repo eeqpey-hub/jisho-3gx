@@ -318,6 +318,7 @@ extern "C"
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
+    volatile u32 g_mageUltTmax  = 900;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
     volatile u32 g_mageFrame    = 0;      // プラグイン側が毎フレーム進める (同じフレームで2回進めないための目印)
     volatile u32 g_mageDrvFrame = 0;
     // --- AR準拠モード (プレイヤーのモーションあり。Aスキルを2段階目まで一瞬で溜めて撃ち、全属性・A/Xを同時に出す) ---
@@ -465,15 +466,19 @@ extern "C"
             if (t < 0)
                 continue;
             const u32 mask = g_mageGM[i];
+            // 必殺技を含むゴーストは、必殺技の最大フレームまで続ける (ほかの技は、従来の最大フレームで止める)
+            const u32 tmaxEff = (((mask >> 16) & 1) && g_mageUltId && g_mageUltTmax > g_mageTmax) ? g_mageUltTmax : g_mageTmax;
             const u32 savedId   = *(volatile u32 *)(K + 8);
             const u32 savedTime = *(volatile u32 *)(K + 0xC4);
             for (u32 sp = 0; sp < step; ++sp)              // 1フレームに step だけ時間を進める (飛ばさず全部呼ぶ)
             {
-                if ((u32)t > g_mageTmax)
+                if ((u32)t > tmaxEff)
                     break;
                 for (int n = 0; n < 17; ++n)
                 {
                     if (!((mask >> n) & 1) || !MageIdAt(n))
+                        continue;
+                    if (n < 16 && (u32)t > g_mageTmax)
                         continue;
                     *(volatile u32 *)(K + 8)      = MageIdAt(n);
                     *(volatile float *)(K + 0xC4) = (float)t;
@@ -483,7 +488,7 @@ extern "C"
             }
             *(volatile u32 *)(K + 8)    = savedId;
             *(volatile u32 *)(K + 0xC4) = savedTime;
-            g_mageT[i] = ((u32)t > g_mageTmax) ? -1 : t;
+            g_mageT[i] = ((u32)t > tmaxEff) ? -1 : t;
         }
 
         // 手動で発動した直後に、ゲーム側が別経路で始める通常攻撃を、待機の強制予約で消す。
@@ -3912,6 +3917,9 @@ namespace CTRPluginFramework
         v = g_mageTmax;
         if (MageAskNumber("判定を作る最大フレーム (10〜600)\n魔法が途中で消えるなら増やす。", v, 10, 600))
             g_mageTmax = v;
+        v = g_mageUltTmax;
+        if (MageAskNumber("必殺技の最大フレーム (10〜1800)\n隕石などが途中で止まるなら増やす。", v, 10, 1800))
+            g_mageUltTmax = v;
         v = g_mageStep;
         if (MageAskNumber("魔法が出る速さ (1〜10)\n1 = 本来の速さ。大きいほど早く出る(遅延が減る)。", v, 1, 10))
             g_mageStep = v;
@@ -4141,6 +4149,7 @@ namespace CTRPluginFramework
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
         
+        AddMaterialZero(menu);
         AddLifeChange(menu);
 
         menu->Append(new MenuEntry("新しく装備したアイテムを編集", EquipEditEntry, nullptr,
@@ -4204,7 +4213,6 @@ namespace CTRPluginFramework
                                    "別のエリアの保存位置へうまく移動できないときの、調査用です。"));
 
         AddQualityFix(menu);
-        AddMaterialZero(menu);
         AddRecommended(menu);
         AddMageRapid(menu);
         
