@@ -292,6 +292,9 @@ extern "C"
     // ============================================================
     void jp_hookMageS0(void);
     void jp_hookMageUnit(void);
+    void jp_hookMageTick(void);
+    void jp_hookMageChan(void);
+    void jp_callBody(u32 ctrl);
 
     volatile u32 g_mageWatch    = 0;      // 手動発動: 毎フレームプラグイン側が補充。0ならオフ
     volatile u32 g_mageAutoWatch = 0;     // 自動発動: 同上
@@ -314,6 +317,19 @@ extern "C"
     volatile u32 g_mageAutoCasts = 0;
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
+    volatile u32 g_mageFrame    = 0;      // プラグイン側が毎フレーム進める (同じフレームで2回進めないための目印)
+    volatile u32 g_mageDrvFrame = 0;
+    // --- AR準拠モード (プレイヤーのモーションあり。Aスキルを2段階目まで一瞬で溜めて撃ち、全属性・A/Xを同時に出す) ---
+    volatile u32 g_mageArWatch  = 0;
+    volatile u32 g_mageArMask   = 0xFFFF;
+    volatile u32 g_mageArKey    = 0;      // 0 = A / 1 = X / 2 = B / 3 = Y / 4 = L / 5 = R
+    volatile u32 g_mageArN      = 10;     // 「押している」扱いにするフレーム数
+    volatile u32 g_mageArReq    = 0;
+    volatile u32 g_mageArReqSeen = 0;
+    volatile s32 g_mageSim      = -1;     // 入力の再現中のフレーム (-1 = なし)
+    volatile u32 g_mageChR2     = 0;      // MageChan の結果 (アセンブラが読む)
+    volatile u32 g_mageChR3     = 0;
+    volatile u32 g_mageArCasts  = 0;
     volatile u32 g_mageSince    = 1000;   // 最後に手動で発動してからのフレーム数
     volatile u32 g_mageCancelWin = 40;    // 手動で発動してから何フレームの間、通常攻撃を消すか (0でオフ)
     volatile u32 g_mageActLog   = 0;      // 消した動きの回数 (診断用)
@@ -454,7 +470,7 @@ extern "C"
                         continue;
                     *(volatile u32 *)(K + 8)      = g_mageIds[n];
                     *(volatile float *)(K + 0xC4) = (float)t;
-                    ((void (*)(u32))0x22C254)(K);          // 魔法の判定・エフェクトを作る本体
+                    jp_callBody(K);                        // 魔法の判定・エフェクトを作る本体
                 }
                 ++t;
             }
@@ -497,17 +513,32 @@ extern "C"
         return (dx * dx + dy * dy + dz * dz) <= g_mageAutoDist2;
     }
 
+    // 1フレームに1回だけ、ゴーストの進行を行う (ユニット更新とアクション更新の両方から呼ばれる)。
+    // プレイヤーが動いているときと止まっているときで、呼ばれる側が違うため、両方から呼ぶ。
+    static void MageDrive(u32 K)
+    {
+        if (g_mageDrvFrame == g_mageFrame && g_mageFrame != 0)
+            return;
+        g_mageDrvFrame = g_mageFrame;
+        MageTickCore(K);
+    }
+
+    static bool MageAnyWatch(void)
+    {
+        return g_mageWatch || g_mageAutoWatch || g_mageArWatch;
+    }
+
     // ユニット更新 (0x1A63FC) の入口で、全ユニットについて毎フレーム呼ばれる。
     void MageUnitCheck(u32 unit)
     {
-        if (!g_mageWatch && !g_mageAutoWatch)
+        if (!MageAnyWatch())
             return;
         const u32 C = MageObj();
         if (!C)
             return;
         if (unit == C)
         {
-            MageTickCore(C + 0x558);
+            MageDrive(C + 0x558);
             return;
         }
         if (!g_mageAutoWatch || g_mageAutoLeft || !g_mageCtrl)
@@ -516,6 +547,88 @@ extern "C"
         {
             g_mageAutoLeft = g_mageAutoCool;
             MageStart(g_mageAutoMask, false);
+        }
+    }
+
+    // プレイヤーのアクション更新 (0x22C254) の入口で呼ばれる。r0 = コントローラ。
+    void MageTick(u32 K)
+    {
+        if (!MageAnyWatch())
+            return;
+        const u32 C = MageObj();
+        if (!C || K != C + 0x558)
+            return;
+        MageDrive(K);
+
+        // AR準拠: Aの2段階目のスキルが動いている間、同じ時間のまま、ほかの技の判定も作る
+        if (g_mageArWatch && g_mageAlive)
+        {
+            const u32 id = *(volatile u32 *)(K + 8);
+            if (id == g_mageIds[0] || id == g_mageIds[1] || id == g_mageIds[2] || id == g_mageIds[3])
+            {
+                const u32 mask = g_mageArMask;
+                for (int n = 0; n < 16; ++n)
+                {
+                    if (!((mask >> n) & 1) || g_mageIds[n] == id)
+                        continue;
+                    *(volatile u32 *)(K + 8) = g_mageIds[n];
+                    jp_callBody(K);
+                }
+                *(volatile u32 *)(K + 8) = id;
+                g_mageArCasts = g_mageArCasts + 1;
+            }
+        }
+    }
+
+    // チャージ入力の更新 (0x240E50) の途中 (0x240E58) で呼ばれる。
+    // chanBase = オブジェクト + チャンネル番号×8, held = 押している, just = 押した瞬間。
+    // Aのチャンネルについて、押下を一定フレームの間「押している」扱いにして、溜めを一瞬で満たす。
+    void MageChan(u32 chanBase, u32 held, u32 just)
+    {
+        g_mageChR2 = held;
+        g_mageChR3 = just;
+        if (!g_mageArWatch || !g_mageAlive)
+            return;
+        const u32 C = MageObj();
+        if (!C)
+            return;
+        const u32 obj = *(volatile u32 *)(C + 0x888 + 4);              // Aスキル枠の持ち主 (入力オブジェクト)
+        if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
+            return;
+        const u32 chA = *(volatile u8 *)(obj + 0x1E8);
+        if (chA > 3 || chanBase != obj + chA * 8)                      // Aのチャンネルだけ
+            return;
+        if (!MageIsId(*(volatile u32 *)(C + 0x888 + 0x48)))            // 魔法使いのときだけ
+            return;
+
+        if (g_mageSim < 0)
+        {
+            bool start = false;
+            if (g_mageArKey == 0)
+                start = (just != 0);                                   // 実際のAを押した瞬間
+            else if (g_mageArReqSeen != g_mageArReq)                   // ほかのボタン (プラグイン側が数えている)
+            {
+                g_mageArReqSeen = g_mageArReq;
+                start = true;
+            }
+            if (start)
+                g_mageSim = 0;
+        }
+        if (g_mageSim >= 0)
+        {
+            if ((u32)g_mageSim < g_mageArN)
+            {
+                g_mageChR2 = 1;
+                g_mageChR3 = (g_mageSim == 0) ? 1 : 0;
+                *(volatile float *)(chanBase + 0x1CC) = 100000.0f;     // 溜め量を一瞬で最大にする
+                g_mageSim = g_mageSim + 1;
+            }
+            else
+            {
+                g_mageChR2 = 0;                                        // 離した扱い → 溜め技が出る
+                g_mageChR3 = 0;
+                g_mageSim = -1;
+            }
         }
     }
 }
@@ -620,6 +733,52 @@ jp_hookMageUnit:
     vpush {d8}                   @ 0x1A6404 の元命令
     vabs.f32 s16, s0             @ 0x1A6408 の元命令
     ldr   pc, =0x1A640C
+
+    @ ---- 魔法使い: プレイヤーのアクション更新の入口 (0x22C254) ----
+    @ 置き換えた2命令 (push {r0,r4-r11,lr} / vpush {d8-d10}) を再現し、0x22C25C へ戻る。
+    .global jp_hookMageTick
+    .type jp_hookMageTick, %function
+jp_hookMageTick:
+    push  {r0-r3, r12, lr}
+    bl    MageTick               @ r0 = コントローラ
+    pop   {r0-r3, r12, lr}
+    push  {r0, r4-r11, lr}       @ 0x22C254 の元命令
+    vpush {d8-d10}               @ 0x22C258 の元命令
+    ldr   pc, =0x22C25C
+
+    @ ---- 魔法の判定を作る本体を、C から呼ぶための橋 ----
+    @ jp_callBody(r0 = コントローラ)。0x22C254/0x22C258 は私たちのフックで書き換えてあるので、
+    @ そこへは飛ばず、同じ2命令をここで実行してから 0x22C25C へ入る。lr には戻り先 (1:) を積む。
+    .global jp_callBody
+    .type jp_callBody, %function
+jp_callBody:
+    push  {r4-r11, r12, lr}      @ 40バイト: 8バイト境界を保つ
+    adr   lr, 1f
+    push  {r0, r4-r11, lr}       @ 0x22C254 の元命令と同じ
+    vpush {d8-d10}               @ 0x22C258 の元命令と同じ
+    ldr   pc, =0x22C25C
+1:  pop   {r4-r11, r12, pc}
+
+    @ ---- 魔法使い: チャージ入力の更新 (0x240E50) の途中 (0x240E58) ----
+    @ 置き換えた2命令 (ldrb r1,[r0,#0x1c8] / cmp r2,#0) を再現し、0x240E60 へ戻る。
+    @ 入る時点で r0 = オブジェクト+ch*8, r2 = 押している, r3 = 押した瞬間, s0/s1 = 経過量/0。
+    .global jp_hookMageChan
+    .type jp_hookMageChan, %function
+jp_hookMageChan:
+    push  {r0-r3, r12, lr}
+    vpush {d0-d1}
+    mov   r1, r2
+    mov   r2, r3
+    bl    MageChan
+    vpop  {d0-d1}
+    pop   {r0-r3, r12, lr}
+    ldr   r2, =g_mageChR2
+    ldr   r2, [r2]
+    ldr   r3, =g_mageChR3
+    ldr   r3, [r3]
+    ldrb  r1, [r0, #0x1c8]       @ 0x240E58 の元命令
+    cmp   r2, #0                 @ 0x240E5C の元命令
+    ldr   pc, =0x240E60
     .ltorg
 )");
 
@@ -3597,14 +3756,18 @@ namespace CTRPluginFramework
 
     // ------------------------------------------------------------
     //  魔法使い: チャージ技をモーションなしで出す  【実験】
-    //   ・ゲームのコード2か所を、2語ずつ書き換える (ワープと同じ方式)。
+    //   ・ゲームのコード4か所を、2語ずつ書き換える (ワープと同じ方式)。
     //       0x240258 : Aスキル枠の状態0 (押された瞬間)
     //       0x1A6404 : ユニット更新の入口 (敵即死のARコードと同じ場所)
+    //       0x22C254 : プレイヤーのアクション更新の入口 (魔法使い連射のARコードと同じ場所)
+    //       0x240E58 : チャージ入力の更新の途中 (AR準拠モードで、Aの押下を再現する)
     //   ・以前の魔法使い連射のARコードと、敵即死のARコードとは同時に使えない。
     //     必ずOFFにして、ゲームを再起動してから使うこと (同じ場所を書き換えるため)。
     // ------------------------------------------------------------
     static constexpr u32 HOOK_MAGE_S0   = 0x00240258;
     static constexpr u32 HOOK_MAGE_UNIT = 0x001A6404;
+    static constexpr u32 HOOK_MAGE_TICK = 0x0022C254;
+    static constexpr u32 HOOK_MAGE_CHAN = 0x00240E58;
 
     static bool g_mageHooked = false;
 
@@ -3617,7 +3780,12 @@ namespace CTRPluginFramework
         static const u32 expectS0[2]   = { 0xE3500000, 0x15941048 };
         // 0x1A6404: vpush {d8} / vabs.f32 s16,s0
         static const u32 expectUnit[2] = { 0xED2D8B02, 0xEEB08A40 };
-        if (!CheckWords(HOOK_MAGE_S0, expectS0, 2) || !CheckWords(HOOK_MAGE_UNIT, expectUnit, 2))
+        // 0x22C254: push {r0,r4-r11,lr} / vpush {d8-d10}
+        static const u32 expectTick[2] = { 0xE92D4FF1, 0xED2D8B06 };
+        // 0x240E58: ldrb r1,[r0,#0x1c8] / cmp r2,#0
+        static const u32 expectChan[2] = { 0xE5D011C8, 0xE3520000 };
+        if (!CheckWords(HOOK_MAGE_S0, expectS0, 2) || !CheckWords(HOOK_MAGE_UNIT, expectUnit, 2) ||
+            !CheckWords(HOOK_MAGE_TICK, expectTick, 2) || !CheckWords(HOOK_MAGE_CHAN, expectChan, 2))
         {
             MessageBox("エラー",
                        "魔法使い用のフック位置の命令が想定と違います。\n"
@@ -3631,6 +3799,10 @@ namespace CTRPluginFramework
         Process::Write32(HOOK_MAGE_S0,       0xE51FF004);   // ldr pc, [pc, #-4]
         Process::Write32(HOOK_MAGE_UNIT + 4, (u32)(uintptr_t)jp_hookMageUnit);
         Process::Write32(HOOK_MAGE_UNIT,     0xE51FF004);
+        Process::Write32(HOOK_MAGE_TICK + 4, (u32)(uintptr_t)jp_hookMageTick);
+        Process::Write32(HOOK_MAGE_TICK,     0xE51FF004);
+        Process::Write32(HOOK_MAGE_CHAN + 4, (u32)(uintptr_t)jp_hookMageChan);
+        Process::Write32(HOOK_MAGE_CHAN,     0xE51FF004);
 
         g_mageHooked = true;
         return true;
@@ -3675,6 +3847,7 @@ namespace CTRPluginFramework
             return;
         }
         g_mageWatch = 6;
+        g_mageFrame = g_mageFrame + 1;
         if (g_mageAlive) g_mageAlive = g_mageAlive - 1;
 
         // A以外のボタンで発動する設定: 押した瞬間と押している間を、ここ(プラグイン側)で見る
@@ -3704,6 +3877,7 @@ namespace CTRPluginFramework
             return;
         }
         g_mageAutoWatch = 6;
+        g_mageFrame = g_mageFrame + 1;
         MageNotify();
     }
 
@@ -3802,6 +3976,65 @@ namespace CTRPluginFramework
     static void MageSkillEntry(MenuEntry *entry)     { (void)entry; MageSkillSelect(g_mageMask, "手動で出す技"); }
     static void MageAutoSkillEntry(MenuEntry *entry) { (void)entry; MageSkillSelect(g_mageAutoMask, "自動で出す技"); }
 
+    // AR準拠モード (プレイヤーのモーションあり)
+    static void MageArEntry(MenuEntry *entry)
+    {
+        static u32 lastAr = 0;
+        if (!InstallMageHooks())
+        {
+            entry->Disable();
+            return;
+        }
+        g_mageArWatch = 6;
+        g_mageFrame = g_mageFrame + 1;
+        if (g_mageAlive) g_mageAlive = g_mageAlive - 1;
+
+        // A以外のボタンで発動する設定: 押した瞬間をここ(プラグイン側)で数える
+        if (g_mageArKey)
+        {
+            Key k = Key::X;
+            if (g_mageArKey == 2) k = Key::B;
+            else if (g_mageArKey == 3) k = Key::Y;
+            else if (g_mageArKey == 4) k = Key::L;
+            else if (g_mageArKey == 5) k = Key::R;
+            if (Controller::IsKeyPressed(k))
+                g_mageArReq = g_mageArReq + 1;
+        }
+        MageNotify();
+        if (g_mageArCasts != lastAr)
+        {
+            lastAr = g_mageArCasts;
+            if (g_mageArCasts <= 2)
+                OSD::Notify("Mage: AR style cast");
+        }
+    }
+
+    static void MageArKeyEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        std::vector<std::string> opts;
+        opts.push_back("A");
+        opts.push_back("X");
+        opts.push_back("B");
+        opts.push_back("Y");
+        opts.push_back("L");
+        opts.push_back("R");
+        Keyboard kb("AR準拠の発動ボタン\n今は: " + opts[g_mageArKey < 6 ? g_mageArKey : 0], opts);
+        const int r = kb.Open();
+        if (r >= 0 && r < 6)
+            g_mageArKey = (u32)r;
+    }
+
+    static void MageArSkillEntry(MenuEntry *entry) { (void)entry; MageSkillSelect(g_mageArMask, "AR準拠で出す技"); }
+
+    static void MageArSettingsEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        u32 v = g_mageArN;
+        if (MageAskNumber("押している扱いにするフレーム数 (3〜60)\n溜めが足りず通常攻撃になるときは増やす。", v, 3, 60))
+            g_mageArN = v;
+    }
+
     static void AddMageRapid(PluginMenu *menu)
     {
         MenuFolder *f = new MenuFolder("魔法使い連射 (実験)",
@@ -3812,11 +4045,9 @@ namespace CTRPluginFramework
                                 "以前の魔法使い連射のARコードと、敵即死のARコードとは同時に使えません。ARをOFFにして、ゲームを再起動してから使ってください。\n"
                                 "止める場合は、このメニューをOFFにします(フック自体はゲームを再起動するまで残ります)。"));
         f->Append(new MenuEntry("発動するボタンを選ぶ (A / B / Y / L / R)", nullptr, MageKeyEntry,
-                                "Aのままだと、Aを横取りするので通常攻撃は出ません。\n"
-                                "B・Y・L・Rを選ぶと、Aの通常攻撃はそのまま使えて、選んだボタンでチャージ技が出ます。"));
+                                "発動に使うボタンを選びます。"));
         f->Append(new MenuEntry("手動で出す技を選ぶ (属性・A/X・段階)", nullptr, MageSkillEntry,
-                                "16個の技を1つずつON/OFFできます。全部ON、A系だけ、X系だけ、1段階目だけ、2段階目だけも選べます。\n"
-                                "音が割れるときは、出す技を減らしてください。"));
+                                "出す技を1つずつ選びます。"));
         f->Append(new MenuEntry("手動のタイミング設定 (間隔・最大フレーム・速さ・通常攻撃消し)", nullptr, MageTimingEntry,
                                 "連続発動の間隔(0で1回押すと1回だけ)、判定を作る最大フレーム、魔法が出る速さ、通常攻撃を消す期間を変えます。"));
         f->Append(new MenuEntry("近づいたら自動でチャージ技を出す (敵)", MageAutoEntry, nullptr,
@@ -3827,6 +4058,15 @@ namespace CTRPluginFramework
                                 "自動発動で出す技を、1つずつON/OFFできます。"));
         f->Append(new MenuEntry("自動発動の設定 (距離・間隔)", nullptr, MageAutoSettingsEntry,
                                 "敵に近づいたと判定する距離と、自動発動の間隔を変えます。"));
+        f->Append(new MenuEntry("AR準拠: Aスキル+全属性 (モーションあり)", MageArEntry, nullptr,
+                                "以前のARコードと同じ動きです。Aのスキルを2段階目まで一瞬で溜めて撃ち、ほかの技も同時に出します。\n"
+                                "魔法使い連射・敵即死のARコードとは同時に使えません。"));
+        f->Append(new MenuEntry("AR準拠の発動ボタン (A / X / B / Y / L / R)", nullptr, MageArKeyEntry,
+                                "AR準拠モードを発動するボタンを選びます。"));
+        f->Append(new MenuEntry("AR準拠で出す技を選ぶ", nullptr, MageArSkillEntry,
+                                "AR準拠モードで、同時に出す技を選びます。"));
+        f->Append(new MenuEntry("AR準拠の設定 (押している扱いのフレーム数)", nullptr, MageArSettingsEntry,
+                                "溜めの再現に使うフレーム数を変えます。"));
         menu->Append(f);
     }
 
