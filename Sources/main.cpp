@@ -332,6 +332,7 @@ extern "C"
     volatile u32 g_mageChR2     = 0;      // MageChan の結果 (アセンブラが読む)
     volatile u32 g_mageChR3     = 0;
     volatile u32 g_mageArCasts  = 0;
+    volatile u32 g_mageArUlt    = 0;      // 今のAスキルの間に、必殺技のゴーストを始めたか
     volatile u32 g_mageSince    = 1000;   // 最後に手動で発動してからのフレーム数
     volatile u32 g_mageCancelWin = 40;    // 手動で発動してから何フレームの間、通常攻撃を消すか (0でオフ)
     volatile u32 g_mageActLog   = 0;      // 消した動きの回数 (診断用)
@@ -579,15 +580,27 @@ extern "C"
             if (id == g_mageIds[0] || id == g_mageIds[1] || id == g_mageIds[2] || id == g_mageIds[3])
             {
                 const u32 mask = g_mageArMask;
-                for (int n = 0; n < 17; ++n)
+                for (int n = 0; n < 16; ++n)                           // 表のスキル: Aスキルと同じ時間で判定を作る
                 {
-                    if (!((mask >> n) & 1) || !MageIdAt(n) || MageIdAt(n) == id)
+                    if (!((mask >> n) & 1) || g_mageIds[n] == id)
                         continue;
-                    *(volatile u32 *)(K + 8) = MageIdAt(n);
+                    *(volatile u32 *)(K + 8) = g_mageIds[n];
                     jp_callBody(K);
                 }
                 *(volatile u32 *)(K + 8) = id;
                 g_mageArCasts = g_mageArCasts + 1;
+
+                // 必殺技は、Aスキルより動きが長い (隕石が何秒も降る) ので、Aスキルの時間では足りない。
+                // Aスキルが始まったときに、必殺技だけ、別の時間で進めるゴーストを1つ始める。
+                if (((mask >> 16) & 1) && g_mageUltId && !g_mageArUlt)
+                {
+                    g_mageArUlt = 1;
+                    MageStart(0x10000, false);
+                }
+            }
+            else
+            {
+                g_mageArUlt = 0;
             }
         }
     }
