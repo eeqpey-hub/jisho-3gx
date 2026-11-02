@@ -4200,6 +4200,446 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
+    //  固有効果を変更 (武器・防具・ライフ道具)
+    //  固有効果は、かばんの1つ1つのアイテムではなく、ゲームがメモリに読み込んでいる
+    //  「データ表」(1アイテム1行。行の決まった位置の2バイトが効果ID)で決まる。
+    //  この表をメモリ上で書き換える。同じIDのアイテムすべてに効き、自分のゲームの中だけで有効。
+    //  ゲームを終了すると元に戻る。表の場所は、メモリを検索して見つける。
+    //   武器: 行 = ID (0x0000-0x008F)、1行24バイト、行の+14
+    //   防具: 行 = ID - 0x99 (0x0099-0x0386)、1行48バイト、行の+38
+    //  ライフ道具: ゲームが持つ「表オブジェクト」から表の場所をたどる (メモリ検索は不要)。
+    //    行 = ID - 0x387 (0x0387-0x0435)、行の+2。
+    // ------------------------------------------------------------
+    static constexpr u32 INN_MAGIC      = 0x1D038013u;   // 表ファイルの先頭の目印
+    static constexpr u32 INN_ROWS_OFF_W = 0x110;
+    static constexpr u32 INN_ROWS_OFF_A = 0x14C;
+    static constexpr u32 INN_EFFECT_MAX = 0x240;         // 効果IDの最大
+    static constexpr int INN_CATS       = 3;
+    static constexpr u32 INN_MAX_ITEMS  = 0x400;         // 1カテゴリの最大アイテム数
+
+    // 照合用: 固有効果より前にある列の値 (効果を書き換えても変わらない)
+    static const u8 s_w_0[14] = { 0x06, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x65, 0x02, 0xE8, 0x03 };
+    static const u8 s_w_1[14] = { 0x0C, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x66, 0x02, 0xE8, 0x03 };
+    static const u8 s_w_81[14] = { 0x78, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2C, 0x04, 0xE8, 0x03 };
+    static const u8 s_w_143[14] = { 0x00, 0x00, 0x02, 0x00, 0x64, 0x00, 0x01, 0x00, 0x50, 0x00, 0x4C, 0x06, 0xE8, 0x03 };
+    static const u8 s_a_0[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_1[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_150[36] = { 0x00, 0x00, 0x80, 0x3F, 0x16, 0x00, 0x16, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_300[36] = { 0x00, 0x00, 0x80, 0x3F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_500[36] = { 0x00, 0x00, 0x80, 0x3F, 0x22, 0x00, 0x11, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_749[36] = { 0x00, 0x00, 0x80, 0x3F, 0x06, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+
+    struct InnateRow { u32 row; const u8 *bytes; };
+    static const InnateRow g_innSigW[] =
+    {
+        { 0, s_w_0 },
+        { 1, s_w_1 },
+        { 81, s_w_81 },
+        { 143, s_w_143 }
+    };
+    static const InnateRow g_innSigA[] =
+    {
+        { 0, s_a_0 },
+        { 1, s_a_1 },
+        { 150, s_a_150 },
+        { 300, s_a_300 },
+        { 500, s_a_500 },
+        { 749, s_a_749 }
+    };
+
+    struct InnateCat
+    {
+        const char       *name;
+        u32               idMin, idMax;      // アイテムIDの範囲 (行 = id - idMin)
+        u32               rowsOff;           // 表の先頭から最初の行まで
+        u32               rowSize;
+        u32               effOff;            // 行の中の固有効果の位置 (u16)
+        u32               sigLen;            // 照合するバイト数
+        const InnateRow  *sigs;
+        int               sigN;
+    };
+
+    static const InnateCat g_innCats[INN_CATS] =
+    {
+        { "武器", 0x0000, 0x008F, INN_ROWS_OFF_W, 24, 14, 14, g_innSigW, 4 },
+        { "防具", 0x0099, 0x0386, INN_ROWS_OFF_A, 48, 38, 36, g_innSigA, 6 },
+        { "ライフ道具", 0x0387, 0x0435, 0, 0, 2, 0, nullptr, 0 },   // 行サイズは実行中に読む
+    };
+
+    static u32  g_innTab[INN_CATS][8];                          // 見つかった表(コピー)の先頭アドレス
+    static int  g_innTabN[INN_CATS] = { 0, 0, 0 };
+    static u32  g_innDynRowSize = 0;                            // ライフ道具の表の行サイズ (実行中に読む)
+    static std::string g_innErr;                                // ライフ道具の表が見つからないときの理由
+    static u16  g_innOrig[INN_CATS][INN_MAX_ITEMS];             // 変更前の効果ID
+    static bool g_innHas[INN_CATS][INN_MAX_ITEMS];              // 変更済みか
+
+    static u32 InnCount(const InnateCat &c) { return c.idMax - c.idMin + 1; }
+
+    static u32 InnEffAddr(const InnateCat &c, u32 base, u32 id)
+    {
+        const u32 rs = c.rowSize ? c.rowSize : g_innDynRowSize;
+        return base + c.rowsOff + rs * (id - c.idMin) + c.effOff;
+    }
+
+    static bool InnIsTable(const InnateCat &c, u32 base)
+    {
+        u32 v = 0;
+        if (!Process::Read32(base, v) || v != INN_MAGIC)
+            return false;
+        for (int k = 0; k < c.sigN; ++k)
+        {
+            const u32 a = base + c.rowsOff + c.rowSize * c.sigs[k].row;
+            const u8 *want = c.sigs[k].bytes;
+            u32 i = 0;
+            for (; i + 4 <= c.sigLen; i += 4)
+            {
+                u32 x = 0;
+                if (!Process::Read32(a + i, x))
+                    return false;
+                const u32 w = (u32)want[i] | ((u32)want[i + 1] << 8) | ((u32)want[i + 2] << 16) | ((u32)want[i + 3] << 24);
+                if (x != w)
+                    return false;
+            }
+            if (i + 2 <= c.sigLen)
+            {
+                u16 x = 0;
+                if (!Process::Read16(a + i, x))
+                    return false;
+                const u16 w = (u16)((u32)want[i] | ((u32)want[i + 1] << 8));
+                if (x != w)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    static void InnAdd(int ci, u32 base)
+    {
+        for (int i = 0; i < g_innTabN[ci]; ++i)
+            if (g_innTab[ci][i] == base)
+                return;
+        if (g_innTabN[ci] < 8)
+            g_innTab[ci][g_innTabN[ci]++] = base;
+    }
+
+    // 読めない所はページ単位で飛ばしながら、16バイトおきに目印を探す
+    // 見つかった表は、武器・防具のどちらのものか調べて、それぞれに記録する
+    static void InnScanPass(u32 start, u32 end, u32 off)
+    {
+        u32 a = start + off;
+        while (a < end)
+        {
+            u32 v = 0;
+            if (!Process::Read32(a, v))
+            {
+                a = ((a | 0xFFFu) + 1) + off;
+                continue;
+            }
+            if (v == INN_MAGIC)
+                for (int ci = 0; ci < INN_CATS; ++ci)
+                    if (g_innCats[ci].sigN > 0 && InnIsTable(g_innCats[ci], a))
+                        InnAdd(ci, a);
+            a += 16;
+        }
+    }
+
+    // ライフ道具: ゲームの「データ管理」(0x6DCA1C) が、種類ごとの表オブジェクト(60バイト)を持つ。
+    // ライフ道具の種類は2で、表5 = 管理 + 60*5。ゲーム自身が固有効果を読むときと同じ経路でたどる。
+    static constexpr u32 INN_MGR        = 0x006DCA1Cu;
+    static constexpr u32 INN_TAB_STRIDE = 60;
+    static constexpr u32 INN_TYPEBASE   = 720;           // 管理 + 720 + 種類*4 = その種類の先頭ID
+    static constexpr u32 INN_VTABLE     = 0x031C6040u;   // 表オブジェクトの目印
+
+    static bool InnLocateTools(u32 &rowsBase, u32 &rowSize)
+    {
+        const InnateCat &c = g_innCats[2];
+        const u32 obj = INN_MGR + INN_TAB_STRIDE * 5;
+        u32 vt = 0, p = 0, cnt = 0, rs = 0, rb = 0, tb = 0;
+        u8 st = 0;
+        if (!Process::Read32(obj, vt) || vt != INN_VTABLE || !Process::Read8(obj + 20, st) || st != 2)
+        {
+            g_innErr = "表がまだ読み込まれていません。\nゲームの中で、ライフ道具を装備してから、もう一度開いてください。";
+            return false;
+        }
+        if (!Process::Read32(obj + 4, p) || p == 0 || !Process::Read32(p, cnt) || !Process::Read32(p + 4, rs) ||
+            !Process::Read32(p + 8, rb) || !Process::Read32(INN_MGR + INN_TYPEBASE + 2 * 4, tb))
+        {
+            g_innErr = "表の情報を読めませんでした。";
+            return false;
+        }
+        if (tb != c.idMin || rs < 4 || rs > 0x200 || cnt < InnCount(c) || rb == 0)
+        {
+            g_innErr = Utils::Format("表の形が想定と違います。\n先頭ID=0x%X (想定0x%X)\n行数=%u (想定%u以上)\n行サイズ=%u",
+                                     tb, c.idMin, cnt, InnCount(c), rs);
+            return false;
+        }
+        // 教えてもらった道具の固有効果と照合する (すでに変更した道具は照合しない)
+        static const struct { u32 id, eff; } chk[] =
+        {
+            { 0x038C, 0x00B1 }, { 0x03A6, 0x014F }, { 0x03F4, 0x01B0 },
+            { 0x03F6, 0x01AE }, { 0x03FD, 0x0198 }, { 0x040A, 0x0195 },
+        };
+        for (const auto &k : chk)
+        {
+            if (g_innHas[2][k.id - c.idMin])
+                continue;
+            u16 v = 0;
+            if (!Process::Read16(rb + rs * (k.id - c.idMin) + c.effOff, v) || v != k.eff)
+            {
+                g_innErr = Utils::Format("表の中身が想定と違います。\n%s: 想定0x%04X 実際0x%04X\n(行サイズ=%u)",
+                                         IdName(k.id).c_str(), k.eff, v, rs);
+                return false;
+            }
+        }
+        rowsBase = rb;
+        rowSize  = rs;
+        return true;
+    }
+
+    // 0=やめた 1=見つかった 2=見つからなかった
+    static int InnFind(int ci)
+    {
+        if (ci == 2)                         // ライフ道具: 検索は不要 (表オブジェクトからたどる)
+        {
+            u32 rb = 0, rs = 0;
+            if (!InnLocateTools(rb, rs))
+                return 2;
+            g_innTab[2][0]  = rb;
+            g_innTabN[2]    = 1;
+            g_innDynRowSize = rs;
+            return 1;
+        }
+        for (int c = 0; c < 2; ++c)            // 前回見つけた場所がまだ有効なものだけ残す
+        {
+            int k = 0;
+            for (int i = 0; i < g_innTabN[c]; ++i)
+                if (InnIsTable(g_innCats[c], g_innTab[c][i]))
+                    g_innTab[c][k++] = g_innTab[c][i];
+            g_innTabN[c] = k;
+        }
+        if (g_innTabN[ci] > 0)
+            return 1;
+
+        if (!(MessageBox("データの検索",
+                         "メモリから固有効果のデータ表を探します。\n数十秒かかることがあります。\n(最初の1回だけです)",
+                         DialogType::DialogYesNo))())
+            return 0;
+
+        static const u32 ranges[2][2] = { { 0x08000000u, 0x10000000u }, { 0x14000000u, 0x1C000000u } };
+        for (u32 off = 0; off < 16 && g_innTabN[ci] == 0; off += 4)
+            for (int r = 0; r < 2; ++r)
+                InnScanPass(ranges[r][0], ranges[r][1], off);
+        return g_innTabN[ci] > 0 ? 1 : 2;
+    }
+
+    static bool InnRead(int ci, u32 id, u16 &out)
+    {
+        return g_innTabN[ci] > 0 && Process::Read16(InnEffAddr(g_innCats[ci], g_innTab[ci][0], id), out);
+    }
+
+    static bool InnWrite(int ci, u32 id, u16 eff)
+    {
+        bool ok = false;
+        for (int i = 0; i < g_innTabN[ci]; ++i)
+        {
+            const u32 a = InnEffAddr(g_innCats[ci], g_innTab[ci][i], id);
+            u16 back = 0;
+            if (Process::Write16(a, eff) && Process::Read16(a, back) && back == eff)
+                ok = true;
+        }
+        return ok;
+    }
+
+    // 1件の効果を変える (元の値を保存しておく)。変更できたら true
+    static bool InnSet(int ci, u32 id, u16 eff)
+    {
+        const InnateCat &c = g_innCats[ci];
+        const u32 k = id - c.idMin;
+        u16 cur = 0;
+        InnRead(ci, id, cur);
+        if (!g_innHas[ci][k])
+        {
+            g_innOrig[ci][k] = cur;
+            g_innHas[ci][k]  = true;
+        }
+        if (!InnWrite(ci, id, eff))
+            return false;
+        if (eff == g_innOrig[ci][k])
+            g_innHas[ci][k] = false;
+        return true;
+    }
+
+    static std::string InnEffName(u32 id)
+    {
+        const char *n = LookupName(g_effectNames, id);
+        return n ? std::string(n) : Utils::Format("0x%04X", id);
+    }
+
+    // カテゴリ全体 / ID範囲を、同じ固有効果にまとめて変える
+    static void InnBulk(int ci)
+    {
+        const InnateCat &c = g_innCats[ci];
+        u32 from = c.idMin, to = c.idMax;
+
+        std::vector<std::string> sc;
+        sc.push_back(Utils::Format("%sすべて (%u件)", c.name, InnCount(c)));
+        sc.push_back("ID範囲を指定する");
+        Keyboard ks(Utils::Format("%sの固有効果を一括変更: 対象", c.name), sc);
+        const int s = ks.Open();
+        if (s < 0)
+            return;
+        if (s == 1)
+        {
+            if (!PickFromNames(Utils::Format("開始 [%s]", c.name), g_itemNames, true, c.idMin, c.idMax, c.idMin, from))
+                return;
+            if (!PickFromNames(Utils::Format("終了 [%s]", c.name), g_itemNames, true, from, c.idMax, c.idMax, to))
+                return;
+        }
+
+        std::vector<std::string> fl;
+        fl.push_back("すべて");
+        fl.push_back("今、固有効果が付いているものだけ");
+        fl.push_back("今、固有効果が「なし」のものだけ");
+        Keyboard kf("どれを変更しますか?", fl);
+        const int f = kf.Open();
+        if (f < 0)
+            return;
+
+        u32 eff = 0;
+        if (!PickFromNames(Utils::Format("固有効果 [%s 一括]", c.name), g_effectNames, false, 0, 0, 0, eff))
+            return;
+        if (eff > INN_EFFECT_MAX)
+        {
+            MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
+            return;
+        }
+
+        std::vector<u32> ids;
+        for (u32 id = from; id <= to; ++id)
+        {
+            u16 cur = 0;
+            if (!InnRead(ci, id, cur))
+                continue;
+            if (f == 1 && cur == 0)
+                continue;
+            if (f == 2 && cur != 0)
+                continue;
+            ids.push_back(id);
+        }
+        if (ids.empty())
+        {
+            MessageBox("対象なし", "条件に合うものがありません。")();
+            return;
+        }
+        if (!(MessageBox("確認",
+                         Utils::Format("%s %s から %s までのうち %u件の\n固有効果を\n%s\nにします。よろしいですか?",
+                                       c.name, IdName(from).c_str(), IdName(to).c_str(), (u32)ids.size(),
+                                       InnEffName(eff).c_str()),
+                         DialogType::DialogYesNo))())
+            return;
+
+        u32 n = 0;
+        for (u32 id : ids)
+            if (InnSet(ci, id, (u16)eff))
+                ++n;
+        MessageBox("変更しました",
+                   Utils::Format("%u 件の固有効果を\n%s\nにしました。\n装備を つけ直すと反映されます。", n,
+                                 InnEffName(eff).c_str()))();
+    }
+
+    static void InnateEditEntry(int ci)
+    {
+        const InnateCat &c = g_innCats[ci];
+        const int found = InnFind(ci);
+        if (found == 0)
+            return;
+        if (found == 2)
+        {
+            MessageBox("見つかりません",
+                       ci == 2 ? g_innErr : Utils::Format("%sのデータ表がメモリ上に見つかりませんでした。", c.name))();
+            return;
+        }
+
+        const u32 cnt = InnCount(c);
+        for (;;)
+        {
+            std::vector<std::string> rows;
+            rows.push_back("[カテゴリ全体を一括変更]");
+            rows.push_back("[変更をすべて元に戻す]");
+            for (u32 id = c.idMin; id <= c.idMax; ++id)
+            {
+                u16 e = 0;
+                InnRead(ci, id, e);
+                std::string s = IdName(id) + ": " + InnEffName(e);
+                if (g_innHas[ci][id - c.idMin])
+                    s += " *";
+                rows.push_back(s);
+            }
+            Keyboard kb(Utils::Format("%sの固有効果を変更 (*は変更済み。Bで戻る)", c.name), rows);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return;
+
+            if (sel == 0)
+            {
+                InnBulk(ci);
+                continue;
+            }
+            if (sel == 1)
+            {
+                u32 n = 0;
+                for (u32 k = 0; k < cnt; ++k)
+                    if (g_innHas[ci][k] && InnWrite(ci, c.idMin + k, g_innOrig[ci][k]))
+                    {
+                        g_innHas[ci][k] = false;
+                        ++n;
+                    }
+                MessageBox("元に戻しました", Utils::Format("%u 件を元に戻しました。", n))();
+                continue;
+            }
+
+            const u32 id = c.idMin + (u32)(sel - 2);
+            u16 cur = 0;
+            InnRead(ci, id, cur);
+            u32 pick = 0;
+            if (!PickFromNames(Utils::Format("固有効果 [%s]", IdName(id).c_str()), g_effectNames,
+                               false, 0, 0, cur, pick))
+                continue;
+            if (pick > INN_EFFECT_MAX)
+            {
+                MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
+                continue;
+            }
+            if (!InnSet(ci, id, (u16)pick))
+            {
+                MessageBox("失敗", "書き込めませんでした。")();
+                continue;
+            }
+            MessageBox("変更しました",
+                       IdName(id) + " の固有効果を\n" + InnEffName(pick) +
+                       "\nにしました。\n装備をつけ直すと反映されます。")();
+        }
+    }
+
+    // メニューの項目は「固有効果変更」の1つだけ。押すと、武器 / 防具 / ライフ道具 を選ぶ。
+    // Bで、カテゴリの選択に戻る。カテゴリの選択でBを押すと終了。
+    static void InnateMainEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        for (;;)
+        {
+            std::vector<std::string> cats;
+            for (int i = 0; i < INN_CATS; ++i)
+                cats.push_back(g_innCats[i].name);
+            Keyboard kb("固有効果を変更するカテゴリを選択", cats);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return;
+            InnateEditEntry(sel);
+        }
+    }
+
+    // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
     void PatchProcess(FwkSettings &settings)
@@ -4288,9 +4728,18 @@ namespace CTRPluginFramework
         AddRecommended(menu);
         AddMageRapid(menu);
         
-        menu->Append(new MenuEntry("プレイヤー切り替え (v5)", nullptr, PlayerSwitch::Entry,
+        menu->Append(new MenuEntry("プレイヤー切り替え", nullptr, PlayerSwitch::Entry,
                                    "フィールドで実行します。タイトルを経由せず、選んだプレイヤーのデータに切り替えます。\n"
                                    "使う前に、セーブのバックアップを取ってください。"));
+
+        // 固有効果変更 (メニューの一番下。押すと 武器 / 防具 / ライフ道具 を選ぶ)
+        menu->Append(new MenuEntry("固有効果変更", nullptr, InnateMainEntry,
+                                   "武器・防具・ライフ道具の固有効果を、メモリ上のデータ表を書き換えて変更します。\n"
+                                   "押すと、カテゴリ(武器 / 防具 / ライフ道具)を選べます。\n"
+                                   "1つずつ変更するほか、カテゴリ全体 / ID範囲を同じ効果にまとめて変更できます。\n"
+                                   "同じIDのアイテムすべてに効きます。自分のゲームの中だけで有効で、ゲームを終了すると元に戻ります。\n"
+                                   "変更したあと、装備をつけ直すと反映されます。\n"
+                                   "ライフ道具は、ゲームの中で一度装備してから開いてください。"));
         menu->Callback(PlayerSwitch::OnFrame);
         menu->Callback(PosNotifyFrame);
         
