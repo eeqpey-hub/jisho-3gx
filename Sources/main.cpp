@@ -1101,6 +1101,28 @@ namespace CTRPluginFramework
         return true;
     }
 
+    // 数値の入力。最初は空欄 (0や1が入っていない)。そのまま決定すると 0 になる
+    static bool AskValueBlank(const std::string &msg, bool hex, u32 maxV, u32 &out)
+    {
+        Keyboard kb(msg);
+        kb.IsHexadecimal(hex);
+        int len = 4;
+        if (!hex)
+        {
+            len = 1;
+            for (u32 t = maxV; t >= 10; t /= 10)
+                ++len;
+        }
+        kb.SetMaxLength(len);
+        u32 v = 0;
+        if (kb.Open(v) != 0)
+            return false;
+        if (v > maxV)
+            v = maxV;
+        out = v;
+        return true;
+    }
+
     // 選択式の入力。キャンセルなら false
     static bool AskChoice(const std::string &msg, const std::vector<std::string> &choices, u32 &out)
     {
@@ -1172,7 +1194,7 @@ namespace CTRPluginFramework
     }
 
     // 項目ごとの入力方法をまとめたもの (装備編集・かばん編集・一括変更で共通)
-    static bool AskFieldValue(const Field &f, const Category *cat, u32 cur, u32 &out)
+    static bool AskFieldValue(const Field &f, const Category *cat, u32 cur, u32 &out, bool blank = false)
     {
         if (!f.choices.empty())
             return AskChoice(f.label, f.choices, out);
@@ -1188,6 +1210,8 @@ namespace CTRPluginFramework
         if (f.kind == K_EFFECT)
             return PickFromNames(f.label, g_effectNames, false, 0, 0xFFFF, cur, out);
 
+        if (blank)
+            return AskValueBlank(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, out);
         return AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, out);
     }
 
@@ -2094,10 +2118,15 @@ namespace CTRPluginFramework
                 continue;
             }
             u32 cur = sp.use[sel] ? sp.val[sel] : 0, v = 0;
-            if (AskFieldValue(sp.fields[sel], cat, cur, v))
+            if (AskFieldValue(sp.fields[sel], cat, cur, v, true))
             {
-                sp.use[sel] = true;
-                sp.val[sel] = v;
+                if (v == 0 && sp.fields[sel].off == OFF_COUNT)
+                    sp.use[sel] = false;          // 個数が空欄のまま決定 = 指定しない (1個)
+                else
+                {
+                    sp.use[sel] = true;
+                    sp.val[sel] = v;
+                }
             }
         }
         count = SpecValue(&sp, OFF_COUNT, 1);
@@ -2137,6 +2166,18 @@ namespace CTRPluginFramework
 
     static bool NameTableLoaded() { return g_itemNames[0].name != nullptr; }
 
+    // 名前だけでは判定できない、未実装・イベント用アイテムのID (手作業の一覧)
+    static const u16 EXTRA_UNIMPL[] =
+    {
+        0x637, 0x64B, 0x72D, 0x845, 0x865, 0x983, 0x984, 0x8D0, 0x9C7, 0x9C9, 0x9CA, 0x9CB, 0x910, 0x91F, 0x936,
+        0x5B0, 0x597, 0x596, 0x594, 0x534, 0x50E, 0x50D, 0x50C, 0x50B, 0x50A, 0x509, 0x508, 0x507, 0x4FF,
+        0x3DE, 0x3D3, 0x3C9, 0x3BE, 0x3B2, 0x3A7, 0x39C, 0x391,
+        0x2B5, 0x2B6, 0x2BA, 0x2C0, 0x2C6, 0x2D0, 0x2D6, 0x2DE, 0x2DF, 0x2E2, 0x2FE, 0x2FF, 0x300, 0x30C, 0x311,
+        0x315, 0x31C, 0x321, 0x323, 0x325, 0x329, 0x32B, 0x32E, 0x331, 0x334, 0x335, 0x367, 0x34A, 0x350, 0x344,
+        0x340, 0x233, 0x215, 0x130, 0x06C, 0x039, 0x02C, 0x01B, 0x010, 0x00F,
+        0x2CE, 0x31A, 0x339, 0x358, 0x37C
+    };
+
     static bool IsUnimplemented(u32 id)
     {
         static std::vector<char> tbl;
@@ -2162,6 +2203,9 @@ namespace CTRPluginFramework
                         tbl[v[k].second] = 1;
                 i = j;
             }
+            for (u16 x : EXTRA_UNIMPL)
+                if (x <= MAX_ID)
+                    tbl[x] = 1;
         }
         return id <= MAX_ID && tbl[id] != 0;
     }
@@ -2280,16 +2324,53 @@ namespace CTRPluginFramework
         return true;
     }
 
-    // カテゴリの中から1つ選ぶ (一覧の先頭に [ID入力] あり)。cat=nullptr のときはID入力だけ
+    static void PoolIds(u32 from, u32 to, std::vector<u32> &out);
+    static void BuildPool(const Category &cat, bool hideUnimpl, std::vector<u32> &pool);
+
+    static bool g_hideUnimpl = false;   // 「未実装を隠す」の状態 (生成の一覧どうしで共有)
+
+    // カテゴリの中から1つ選ぶ (一覧の先頭に [ID入力] と [未実装を隠す] あり)。
+    // cat=nullptr のときはID入力だけ
     static bool PickOne(const Category *cat, const std::string &title, u32 &id)
     {
-        if (cat)
-            return PickFromNames(Utils::Format("%s [%s]", title.c_str(), cat->name), g_itemNames,
-                                 true, cat->idMin, cat->idMax, cat->idMin, id);
-        return AskHexId(title + " (16進)", 0, false, 0, MAX_ID, id);
+        if (!cat)
+            return AskHexId(title + " (16進)", 0, false, 0, MAX_ID, id);
+
+        const std::string full = Utils::Format("%s [%s]", title.c_str(), cat->name);
+        std::vector<u32> pool;
+        for (;;)
+        {
+            BuildPool(*cat, g_hideUnimpl, pool);
+            std::vector<std::string> opts;
+            opts.push_back(Utils::Format("[ID入力] 現在 0x%04X", cat->idMin));
+            opts.push_back(!NameTableLoaded() ? std::string("(名前の表がないので未実装の判定なし)")
+                           : g_hideUnimpl ? std::string("[未実装を隠している → 表示する]")
+                                          : std::string("[未実装を隠す]"));
+            for (u32 v : pool)
+                opts.push_back(Utils::Format("%s (%X)", IdName(v).c_str(), v));
+
+            Keyboard kb(full, opts);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return false;
+            if (sel == 0)
+            {
+                if (AskHexId(full + " (16進)", cat->idMin, true, cat->idMin, cat->idMax, id))
+                    return true;
+                continue;
+            }
+            if (sel == 1)
+            {
+                if (NameTableLoaded())
+                    g_hideUnimpl = !g_hideUnimpl;
+                continue;
+            }
+            id = pool[(size_t)sel - 2];
+            return true;
+        }
     }
 
-    // 1つ生成する流れ (追加項目 → 確認 → 生成 → 続けて編集)
+    // 1つ生成する流れ (追加項目 → 確認 → 生成)
     static void CreateOneFlow(const Container &ct, u32 id)
     {
         if (id > MAX_ID)
@@ -2313,7 +2394,7 @@ namespace CTRPluginFramework
                                            "消耗品などとして追加しますか?", id),
                              DialogType::DialogYesNo))())
                 return;
-            if (!AskValue("個数", false, MAX_COUNT, 1, count) || count == 0)
+            if (!AskValueBlank("個数", false, MAX_COUNT, count) || count == 0)
                 return;
         }
 
@@ -2341,8 +2422,6 @@ namespace CTRPluginFramework
         MessageBox("完了", Utils::Format("%d枠目に追加しました。\n"
                                          "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", slot + 1))();
 
-        if (MessageBox("続けて編集", "個数や追加効果などを編集しますか?", DialogType::DialogYesNo)())
-            EditAt(RowOf(b, (u32)slot), "生成したアイテムの編集", true);
     }
 
     // アイテムを1つ生成: カテゴリを選ぶ → 一覧から選ぶ (ID入力も可)
@@ -2426,7 +2505,7 @@ namespace CTRPluginFramework
             if (!AskGenSpec(cat, Utils::Format("追加項目 [%s] (このあと選ぶ全部に適用)", cat->name), sp, count))
                 return;
         }
-        else if (!AskValue("個数 (このあと選ぶ全部に適用)", false, MAX_COUNT, 1, count) || count == 0)
+        else if (!AskValueBlank("個数 (このあと選ぶ全部に適用)", false, MAX_COUNT, count) || count == 0)
             return;
 
         std::string msg = Utils::Format("[%s / %s] 一覧から選ぶたびに、追加します。(Bで終了)\n",
@@ -2447,7 +2526,7 @@ namespace CTRPluginFramework
         static constexpr u32 PAGE = 20;
         static constexpr size_t HEAD = 5;     // 一覧の先頭の操作行の数
         std::vector<u32> pool;
-        bool hide = false;
+        bool hide = g_hideUnimpl;
         u32 page = 0, made = 0;
         if (cat)
             BuildPool(*cat, hide, pool);
@@ -2507,6 +2586,7 @@ namespace CTRPluginFramework
                     if (NameTableLoaded())
                     {
                         hide = !hide;
+                        g_hideUnimpl = hide;
                         BuildPool(*cat, hide, pool);
                         page = 0;
                     }
@@ -2658,7 +2738,7 @@ namespace CTRPluginFramework
             MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
             return;
         }
-        if (!AskValue("個数(枠の数)", false, ct->slots, 1, n) || n == 0)
+        if (!AskValueBlank("個数(枠の数)", false, ct->slots, n) || n == 0)
             return;
         std::vector<u32> ids(n, id);
         RunBulk(*ct, ids, Utils::Format("%s を %u 個", IdName(id).c_str(), n), false);
