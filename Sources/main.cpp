@@ -472,6 +472,22 @@ extern "C"
         }
     }
 
+    // 方向 d (0 〜 nd-1) のときの、座標のずらし量 (ox, oz)。前 = 向きの目安、右 = それを90度回した向き。
+    // nd = 1 のときは、前へずらす距離だけ。nd = 4 / 8 のときは、さらに方向ごとの距離を足す。
+    static void MageDirOffset(u32 nd, u32 d, float &ox, float &oz)
+    {
+        static const float cs[8][2] = { {1.0f, 0.0f}, {0.7071f, 0.7071f}, {0.0f, 1.0f}, {-0.7071f, 0.7071f},
+                                        {-1.0f, 0.0f}, {-0.7071f, -0.7071f}, {0.0f, -1.0f}, {0.7071f, -0.7071f} };
+        const float fx = g_mageFx, fz = g_mageFz;
+        const float rx = fz, rz = -fx;
+        const u32 ci = (nd == 8) ? d : d * 2;               // 4方向のときは、前・右・後ろ・左
+        const float a = (nd > 1) ? cs[ci][0] : 0.0f;        // 前方向の成分
+        const float b = (nd > 1) ? cs[ci][1] : 0.0f;        // 右方向の成分
+        const float dist = (nd > 1) ? g_mageDirD : 0.0f;
+        ox = fx * (g_mageFwdF + a * dist) + rx * (b * dist);
+        oz = fz * (g_mageFwdF + a * dist) + rz * (b * dist);
+    }
+
     // プレイヤーのユニット更新で、毎フレーム1回。ゴーストの進行と、通常攻撃の消去。
     static void MageTickCore(u32 K)
     {
@@ -685,13 +701,33 @@ extern "C"
             if (id == g_mageIds[0] || id == g_mageIds[1] || id == g_mageIds[2] || id == g_mageIds[3])
             {
                 const u32 mask = g_mageArMask;
-                for (int n = 0; n < 16; ++n)                           // 表のスキル: Aスキルと同じ時間で判定を作る
+                // 位置の設定 (前へずらす・同時方向) をここにも反映する。
+                // 本物のAスキルは、このあとゲーム本体がそのままの位置で出す。
+                // 方向が複数のときだけ、Aスキル自身も、ずらした位置から追加で出す。
+                const u32 nd = (g_mageDirs >= 8) ? 8 : (g_mageDirs >= 4 ? 4 : 1);
+                const bool shifted = (nd > 1) || (g_mageFwdF != 0.0f);
+                if (shifted)
+                    MageShiftSave(C);
+                for (u32 d = 0; d < nd; ++d)
                 {
-                    if (!((mask >> n) & 1) || g_mageIds[n] == id)
-                        continue;
-                    *(volatile u32 *)(K + 8) = g_mageIds[n];
-                    jp_callBody(K);
+                    if (shifted)
+                    {
+                        float ox, oz;
+                        MageDirOffset(nd, d, ox, oz);
+                        MageShiftSet(C, ox, oz);
+                    }
+                    for (int n = 0; n < 16; ++n)                       // 表のスキル: Aスキルと同じ時間で判定を作る
+                    {
+                        if (!((mask >> n) & 1))
+                            continue;
+                        if (g_mageIds[n] == id && nd == 1)             // 1方向のときは、本物のAスキルがあるので省く
+                            continue;
+                        *(volatile u32 *)(K + 8) = g_mageIds[n];
+                        jp_callBody(K);
+                    }
                 }
+                if (shifted)
+                    MageShiftSet(C, 0.0f, 0.0f);                       // 元の座標に戻す (保存した値そのまま)
                 *(volatile u32 *)(K + 8) = id;
                 g_mageArCasts = g_mageArCasts + 1;
 
