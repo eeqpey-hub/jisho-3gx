@@ -208,7 +208,7 @@ extern "C"
             volatile u32 *rr = (volatile u32 *)req;
             const u32 id = rr[0];
             const u32 n  = rr[0x18 / 4];
-            if (id >= 0x0800 && id <= 0x09FE && n >= 1 && n < 99)   // 素材 (ブロンズインゴット 0x900 など)
+            if (id >= 0x0000 && id <= 0x09FE && n >= 1 && n < 99)   // 素材 (ブロンズインゴット 0x900 など)
             {
                 rr[0x28 / 4] = 99 - n;
                 rr[0x2C / 4] = 99 - n;
