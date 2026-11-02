@@ -327,6 +327,7 @@ extern "C"
     volatile u32 g_mageCntTick  = 0;      // 診断: アクション更新フックが、プレイヤーで呼ばれた回数
     volatile u32 g_mageCntChan  = 0;      // 診断: 入力更新フックが呼ばれた回数
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
+    volatile u32 g_mageStagger  = 1;      // 同時に選んだ技を、1つずつ何フレームずつ遅らせて出すか (0 = 全部同じフレーム)
     volatile u32 g_mageUltTmax  = 600;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
     volatile u32 g_mageBudget   = 48;     // 1フレームに魔法の判定を作る関数を呼ぶ回数の上限 (重くなりすぎないように)
     volatile u32 g_mageClear    = 0;      // 1にすると、動いているゴーストを全部止める
@@ -546,6 +547,7 @@ extern "C"
 
         const u32 step = g_mageStep < 1 ? 1 : g_mageStep;
         u32 budget = g_mageBudget < 17 ? 17 : g_mageBudget;
+        const u32 budget0 = budget;
         for (int i = 0; i < MAGE_MAXG; ++i)
         {
             s32 t = g_mageT[i];
@@ -553,52 +555,66 @@ extern "C"
                 continue;
             const u32 mask = g_mageGM[i];
             // 必殺技を含むゴーストは、必殺技の最大フレームまで続ける (ほかの技は、従来の最大フレームで止める)
-            const u32 tmaxEff = (((mask >> 16) & 1) && g_mageUltId && g_mageUltTmax > g_mageTmax) ? g_mageUltTmax : g_mageTmax;
+            u32 nsel = 0;
+            for (int n = 0; n < 17; ++n)
+                if (((mask >> n) & 1) && MageIdAt(n))
+                    ++nsel;
+            const u32 baseTmax = (((mask >> 16) & 1) && g_mageUltId && g_mageUltTmax > g_mageTmax) ? g_mageUltTmax : g_mageTmax;
+            const u32 tmaxEff  = baseTmax + (nsel ? (nsel - 1) * g_mageStagger : 0);   // 遅らせた分だけ、続ける時間も延ばす
             const u32 savedId   = *(volatile u32 *)(K + 8);
             const u32 savedTime = *(volatile u32 *)(K + 0xC4);
             for (u32 sp = 0; sp < step; ++sp)              // 1フレームに step だけ時間を進める (飛ばさず全部呼ぶ)
             {
                 if ((u32)t > tmaxEff)
                     break;
+                // 選んだ技を順番に並べ、k 番目の技は k×g_mageStagger フレーム遅らせて出す。
+                // 全部を同じフレームで出すと、先に出した技 (Aの2段階目など) だけが優先され、
+                // 残りが出ないことがある (ゲーム側の同時に出せる数の上限のため)。
+                const u32 stg = g_mageStagger;
                 u32 need = 0;                                  // この時間で呼ぶ回数
-                for (int n = 0; n < 17; ++n)
-                    if (((mask >> n) & 1) && MageIdAt(n) && !(n < 16 && (u32)t > g_mageTmax))
-                        ++need;
+                {
+                    u32 rank = 0;
+                    for (int n = 0; n < 17; ++n)
+                    {
+                        if (!((mask >> n) & 1) || !MageIdAt(n))
+                            continue;
+                        const s32 tt = t - (s32)(rank * stg);
+                        const u32 lim = (n < 16) ? g_mageTmax : g_mageUltTmax;
+                        if (tt >= 0 && (u32)tt <= lim)
+                            ++need;
+                        ++rank;
+                    }
+                }
                 const u32 nd = (g_mageDirs >= 8) ? 8 : (g_mageDirs >= 4 ? 4 : 1);
                 need *= nd;
-                if (need > budget)
-                    break;                                     // 今フレームの上限を超えるので、続きは次のフレームへ
-                budget -= need;
+                if (need > budget && budget != budget0)
+                    break;                                     // 今フレームの上限を超えるので、続きは次のフレームへ (先頭のゴーストは必ず進める)
+                budget = (need > budget) ? 0 : budget - need;
 
                 const bool shifted = (nd > 1) || (g_mageFwdF != 0.0f);
                 const u32 pobj = K - 0x558;
                 if (shifted)
                     MageShiftSave(pobj);
-                // 方向 (前, 右, 後ろ, 左, ...): 前 = 向きの目安、右 = それを90度回した向き
-                static const float cs[8][2] = { {1.0f, 0.0f}, {0.7071f, 0.7071f}, {0.0f, 1.0f}, {-0.7071f, 0.7071f},
-                                                {-1.0f, 0.0f}, {-0.7071f, -0.7071f}, {0.0f, -1.0f}, {0.7071f, -0.7071f} };
-                const float fx = g_mageFx, fz = g_mageFz;      // 前
-                const float rx = fz, rz = -fx;                 // 右
                 for (u32 d = 0; d < nd; ++d)
                 {
                     if (shifted)
                     {
-                        const u32 ci = (nd == 8) ? d : d * 2;  // 4方向のときは、前・右・後ろ・左
-                        const float a = (nd > 1) ? cs[ci][0] : 0.0f;   // 前方向の成分
-                        const float b = (nd > 1) ? cs[ci][1] : 0.0f;   // 右方向の成分
-                        const float dist = (nd > 1) ? g_mageDirD : 0.0f;
-                        const float ox = fx * (g_mageFwdF + a * dist) + rx * (b * dist);
-                        const float oz = fz * (g_mageFwdF + a * dist) + rz * (b * dist);
+                        float ox, oz;
+                        MageDirOffset(nd, d, ox, oz);
                         MageShiftSet(pobj, ox, oz);
                     }
+                    u32 rank = 0;
                     for (int n = 0; n < 17; ++n)
                     {
                         if (!((mask >> n) & 1) || !MageIdAt(n))
                             continue;
-                        if (n < 16 && (u32)t > g_mageTmax)
+                        const s32 tt = t - (s32)(rank * stg);
+                        const u32 lim = (n < 16) ? g_mageTmax : g_mageUltTmax;
+                        ++rank;
+                        if (tt < 0 || (u32)tt > lim)
                             continue;
                         *(volatile u32 *)(K + 8)      = MageIdAt(n);
-                        *(volatile float *)(K + 0xC4) = (float)t;
+                        *(volatile float *)(K + 0xC4) = (float)tt;
                         jp_callBody(K);                    // 魔法の判定・エフェクトを作る本体
                     }
                 }
@@ -708,6 +724,11 @@ extern "C"
                 const bool shifted = (nd > 1) || (g_mageFwdF != 0.0f);
                 if (shifted)
                     MageShiftSave(C);
+                // 選んだ技を順番に並べ、k 番目の技は k×g_mageStagger フレーム遅らせた時間で出す。
+                // 全部を同じ時間で出すと、本物のAスキルが優先されて、ほかが出ないことがあるため。
+                const u32 savedTimeBits = *(volatile u32 *)(K + 0xC4);
+                const float tReal = *(volatile float *)(K + 0xC4);
+                const u32 stg = g_mageStagger;
                 for (u32 d = 0; d < nd; ++d)
                 {
                     if (shifted)
@@ -716,16 +737,23 @@ extern "C"
                         MageDirOffset(nd, d, ox, oz);
                         MageShiftSet(C, ox, oz);
                     }
+                    u32 rank = 0;
                     for (int n = 0; n < 16; ++n)                       // 表のスキル: Aスキルと同じ時間で判定を作る
                     {
                         if (!((mask >> n) & 1))
                             continue;
+                        const u32 k = rank++;
                         if (g_mageIds[n] == id && nd == 1)             // 1方向のときは、本物のAスキルがあるので省く
                             continue;
-                        *(volatile u32 *)(K + 8) = g_mageIds[n];
+                        const float tt = tReal - (float)(k * stg);
+                        if (tt < 0.0f)
+                            continue;
+                        *(volatile u32 *)(K + 8)      = g_mageIds[n];
+                        *(volatile float *)(K + 0xC4) = tt;
                         jp_callBody(K);
                     }
                 }
+                *(volatile u32 *)(K + 0xC4) = savedTimeBits;           // 時間を元に戻す
                 if (shifted)
                     MageShiftSet(C, 0.0f, 0.0f);                       // 元の座標に戻す (保存した値そのまま)
                 *(volatile u32 *)(K + 8) = id;
@@ -4135,6 +4163,9 @@ namespace CTRPluginFramework
         v = g_mageTmax;
         if (MageAskNumber("判定を作る最大フレーム (10〜600)\n魔法が途中で消えるなら増やす。", v, 10, 600))
             g_mageTmax = v;
+        v = g_mageStagger;
+        if (MageAskNumber("同時に出す技のずらし (0〜5フレーム)\n選んだ技を、1つずつ、このフレーム数ずつ遅らせて出す。\n0 = 全部同じフレーム。全部選ぶと一部が出ないときは、1〜2にする。", v, 0, 5))
+            g_mageStagger = v;
         v = g_mageUltTmax;
         if (MageAskNumber("必殺技の最大フレーム (10〜1800)\n隕石などが途中で止まるなら増やす。降りすぎるなら減らす。", v, 10, 1800))
             g_mageUltTmax = v;
