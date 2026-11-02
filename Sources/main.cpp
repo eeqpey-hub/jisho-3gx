@@ -317,6 +317,15 @@ extern "C"
     volatile u32 g_mageAutoCasts = 0;
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
+    // --- 位置の調整 (実験): 魔法を出す瞬間だけ、プレイヤーの座標をずらして、本体を呼ぶ ---
+    volatile float g_mageFwdF   = 0.0f;   // 前方へずらす距離 (正 = 前、負 = 後ろ)
+    volatile u32   g_mageDirs   = 1;      // 同時に出す方向の数: 1 / 4 / 8
+    volatile float g_mageDirD   = 6.0f;   // 方向ごとにずらす距離
+    volatile float g_mageFx     = 0.0f;   // 向きの目安 (直前の移動方向)
+    volatile float g_mageFz     = 1.0f;
+    volatile u32 g_mageCntUnit  = 0;      // 診断: ユニット更新フックが、プレイヤーで呼ばれた回数
+    volatile u32 g_mageCntTick  = 0;      // 診断: アクション更新フックが、プレイヤーで呼ばれた回数
+    volatile u32 g_mageCntChan  = 0;      // 診断: 入力更新フックが呼ばれた回数
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
     volatile u32 g_mageUltTmax  = 600;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
     volatile u32 g_mageBudget   = 48;     // 1フレームに魔法の判定を作る関数を呼ぶ回数の上限 (重くなりすぎないように)
@@ -439,11 +448,53 @@ extern "C"
         return 1;
     }
 
+    // プレイヤーの座標のコピー全部 (x,y,z 各5か所) を保存・ずらす・戻す。
+    // 座標はユニットの中に複数のコピーがあるため、全部ずらさないと魔法の位置が変わらないことがある。
+    static const u16 g_mageOffX[5] = { 0x7C, 0x40, 0x10, 0x20C, 0x218 };
+    static const u16 g_mageOffZ[5] = { 0x84, 0x60, 0x30, 0x214, 0x220 };
+    static float g_mageSavX[5], g_mageSavZ[5];
+
+    static void MageShiftSave(u32 obj)
+    {
+        for (int i = 0; i < 5; ++i)
+        {
+            g_mageSavX[i] = *(volatile float *)(obj + g_mageOffX[i]);
+            g_mageSavZ[i] = *(volatile float *)(obj + g_mageOffZ[i]);
+        }
+    }
+
+    static void MageShiftSet(u32 obj, float dx, float dz)
+    {
+        for (int i = 0; i < 5; ++i)
+        {
+            *(volatile float *)(obj + g_mageOffX[i]) = g_mageSavX[i] + dx;
+            *(volatile float *)(obj + g_mageOffZ[i]) = g_mageSavZ[i] + dz;
+        }
+    }
+
     // プレイヤーのユニット更新で、毎フレーム1回。ゴーストの進行と、通常攻撃の消去。
     static void MageTickCore(u32 K)
     {
         g_mageAlive = 20;
         g_mageTicks = g_mageTicks + 1;
+        {   // 向きの目安: 直前の移動方向 (止まっても最後の向きを覚えておく)
+            static float px = 0.0f, pz = 0.0f;
+            static bool have = false;
+            const u32 obj = K - 0x558;
+            const float x = *(volatile float *)(obj + 0x7C), z = *(volatile float *)(obj + 0x84);
+            if (have)
+            {
+                const float dx = x - px, dz = z - pz;
+                const float d2 = dx * dx + dz * dz;
+                if (d2 > 0.0004f && d2 < 4.0f)
+                {
+                    const float inv = 1.0f / __builtin_sqrtf(d2);
+                    g_mageFx = dx * inv;
+                    g_mageFz = dz * inv;
+                }
+            }
+            px = x; pz = z; have = true;
+        }
         if (g_mageWatch) g_mageWatch = g_mageWatch - 1;
         if (g_mageAutoWatch) g_mageAutoWatch = g_mageAutoWatch - 1;
         if (g_mageCoolLeft) g_mageCoolLeft = g_mageCoolLeft - 1;
@@ -497,19 +548,46 @@ extern "C"
                 for (int n = 0; n < 17; ++n)
                     if (((mask >> n) & 1) && MageIdAt(n) && !(n < 16 && (u32)t > g_mageTmax))
                         ++need;
+                const u32 nd = (g_mageDirs >= 8) ? 8 : (g_mageDirs >= 4 ? 4 : 1);
+                need *= nd;
                 if (need > budget)
                     break;                                     // 今フレームの上限を超えるので、続きは次のフレームへ
                 budget -= need;
-                for (int n = 0; n < 17; ++n)
+
+                const bool shifted = (nd > 1) || (g_mageFwdF != 0.0f);
+                const u32 pobj = K - 0x558;
+                if (shifted)
+                    MageShiftSave(pobj);
+                // 方向 (前, 右, 後ろ, 左, ...): 前 = 向きの目安、右 = それを90度回した向き
+                static const float cs[8][2] = { {1.0f, 0.0f}, {0.7071f, 0.7071f}, {0.0f, 1.0f}, {-0.7071f, 0.7071f},
+                                                {-1.0f, 0.0f}, {-0.7071f, -0.7071f}, {0.0f, -1.0f}, {0.7071f, -0.7071f} };
+                const float fx = g_mageFx, fz = g_mageFz;      // 前
+                const float rx = fz, rz = -fx;                 // 右
+                for (u32 d = 0; d < nd; ++d)
                 {
-                    if (!((mask >> n) & 1) || !MageIdAt(n))
-                        continue;
-                    if (n < 16 && (u32)t > g_mageTmax)
-                        continue;
-                    *(volatile u32 *)(K + 8)      = MageIdAt(n);
-                    *(volatile float *)(K + 0xC4) = (float)t;
-                    jp_callBody(K);                        // 魔法の判定・エフェクトを作る本体
+                    if (shifted)
+                    {
+                        const u32 ci = (nd == 8) ? d : d * 2;  // 4方向のときは、前・右・後ろ・左
+                        const float a = (nd > 1) ? cs[ci][0] : 0.0f;   // 前方向の成分
+                        const float b = (nd > 1) ? cs[ci][1] : 0.0f;   // 右方向の成分
+                        const float dist = (nd > 1) ? g_mageDirD : 0.0f;
+                        const float ox = fx * (g_mageFwdF + a * dist) + rx * (b * dist);
+                        const float oz = fz * (g_mageFwdF + a * dist) + rz * (b * dist);
+                        MageShiftSet(pobj, ox, oz);
+                    }
+                    for (int n = 0; n < 17; ++n)
+                    {
+                        if (!((mask >> n) & 1) || !MageIdAt(n))
+                            continue;
+                        if (n < 16 && (u32)t > g_mageTmax)
+                            continue;
+                        *(volatile u32 *)(K + 8)      = MageIdAt(n);
+                        *(volatile float *)(K + 0xC4) = (float)t;
+                        jp_callBody(K);                    // 魔法の判定・エフェクトを作る本体
+                    }
                 }
+                if (shifted)
+                    MageShiftSet(pobj, 0.0f, 0.0f);        // 元の座標に戻す (保存した値そのまま)
                 ++t;
             }
             *(volatile u32 *)(K + 8)    = savedId;
@@ -576,6 +654,7 @@ extern "C"
             return;
         if (unit == C)
         {
+            g_mageCntUnit = g_mageCntUnit + 1;
             MageDrive(C + 0x558);
             return;
         }
@@ -596,6 +675,7 @@ extern "C"
         const u32 C = MageObj();
         if (!C || K != C + 0x558)
             return;
+        g_mageCntTick = g_mageCntTick + 1;
         MageDrive(K);
 
         // AR準拠: Aの2段階目のスキルが動いている間、同じ時間のまま、ほかの技の判定も作る
@@ -644,6 +724,7 @@ extern "C"
             return;
         // チャージ入力の更新は、プレイヤーが止まっていても動いていても、毎フレーム必ず呼ばれる。
         // ゴーストの進行は、ここでも行う (1フレームに1回だけ。MageDrive が重複を防ぐ)。
+        g_mageCntChan = g_mageCntChan + 1;
         MageDrive(C + 0x558);
         if (!g_mageArWatch || !g_mageAlive)
             return;
@@ -4035,6 +4116,23 @@ namespace CTRPluginFramework
         }
     }
 
+    // 魔法の位置の設定 (実験)
+    static void MagePosEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        u32 v = (u32)(g_mageFwdF < 0 ? -g_mageFwdF : g_mageFwdF);
+        // 前方へずらす距離: 0〜40 を前方、41〜80 を後ろ (値 − 40 の距離) として入力する
+        u32 cur = g_mageFwdF >= 0 ? v : 40 + v;
+        if (MageAskNumber("魔法を出す位置を前へずらす距離 (0〜80)\n0 = ずらさない。1〜40 = 前へ。41〜80 = 後ろへ (値−40)。\n前 = 直前に動いた向きです。", cur, 0, 80))
+            g_mageFwdF = cur <= 40 ? (float)cur : -(float)(cur - 40);
+        v = g_mageDirs;
+        if (MageAskNumber("同時に出す方向の数 (1 / 4 / 8)\n1 = 今まで通り。4 = 前・右・後ろ・左。8 = 斜めも。\n動いている魔法の数が増えるので、重くなります。", v, 1, 8))
+            g_mageDirs = (v >= 8) ? 8 : (v >= 4 ? 4 : 1);
+        v = (u32)g_mageDirD;
+        if (MageAskNumber("方向ごとにずらす距離 (1〜40)\n方向の数が4か8のとき、プレイヤーからこの距離だけ離れた位置から出す。", v, 1, 40))
+            g_mageDirD = (float)v;
+    }
+
     // 手動の設定を、AR準拠の動きに近い値にまとめて切り替える
     static void MagePresetEntry(MenuEntry *entry)
     {
@@ -4101,14 +4199,19 @@ namespace CTRPluginFramework
     static void MageDiagEntry(MenuEntry *entry)
     {
         (void)entry;
-        static u32 n = 0;
+        static u32 n = 0, pu = 0, pt = 0, pc = 0, pd = 0;
         if (++n % 60)
             return;
         u32 g = 0;
         for (int i = 0; i < MAGE_MAXG; ++i)
             if (g_mageT[i] >= 0)
                 ++g;
-        OSD::Notify(Utils::Format("T=%u Q=%u G=%u C=%u", (unsigned)g_mageTicks, (unsigned)g_mageReq, (unsigned)g, (unsigned)g_mageCasts));
+        // 直前の1秒間に、各フックが何回呼ばれたか (U=ユニット更新 A=アクション更新 I=入力更新 D=魔法の進行)
+        OSD::Notify(Utils::Format("U=%u A=%u I=%u D=%u G=%u Q=%u C=%u",
+                                  (unsigned)(g_mageCntUnit - pu), (unsigned)(g_mageCntTick - pt),
+                                  (unsigned)(g_mageCntChan - pc), (unsigned)(g_mageTicks - pd),
+                                  (unsigned)g, (unsigned)g_mageReq, (unsigned)g_mageCasts));
+        pu = g_mageCntUnit; pt = g_mageCntTick; pc = g_mageCntChan; pd = g_mageTicks;
     }
 
     static void MageSkillEntry(MenuEntry *entry)     { (void)entry; MageSkillSelect(g_mageMask, "手動で出す技"); }
@@ -4196,6 +4299,8 @@ namespace CTRPluginFramework
                                 "自動発動で出す技を、1つずつON/OFFできます。"));
         f->Append(new MenuEntry("自動発動の設定 (距離・間隔)", nullptr, MageAutoSettingsEntry,
                                 "敵に近づいたと判定する距離と、自動発動の間隔を変えます。"));
+        f->Append(new MenuEntry("魔法の位置の設定 (前へずらす・同時方向)", nullptr, MagePosEntry,
+                                "魔法を出す位置を前後にずらしたり、同じ技を前後左右に同時に出したりします(実験)。"));
         f->Append(new MenuEntry("手動の設定をAR準拠に近い値にする", nullptr, MagePresetEntry,
                                 "手動発動の間隔、最大フレーム、速さなどを、おすすめの値にまとめて戻します。"));
         f->Append(new MenuEntry("動いている魔法を全部止める", nullptr, MageStopEntry,
