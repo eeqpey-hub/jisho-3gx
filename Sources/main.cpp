@@ -637,10 +637,15 @@ extern "C"
     {
         g_mageChR2 = held;
         g_mageChR3 = just;
-        if (!g_mageArWatch || !g_mageAlive)
+        if (!MageAnyWatch())
             return;
         const u32 C = MageObj();
         if (!C)
+            return;
+        // チャージ入力の更新は、プレイヤーが止まっていても動いていても、毎フレーム必ず呼ばれる。
+        // ゴーストの進行は、ここでも行う (1フレームに1回だけ。MageDrive が重複を防ぐ)。
+        MageDrive(C + 0x558);
+        if (!g_mageArWatch || !g_mageAlive)
             return;
         const u32 obj = *(volatile u32 *)(C + 0x888 + 4);              // Aスキル枠の持ち主 (入力オブジェクト)
         if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
@@ -3508,7 +3513,7 @@ namespace CTRPluginFramework
         OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, dest, link));
     }
 
-        // ============================================================
+    // ============================================================
     //  プレイヤー切り替え (直接版) / 日本語版 v1.7L
     //  実機GDBで通し確認済み
     // ============================================================
@@ -3516,9 +3521,9 @@ namespace CTRPluginFramework
     {
         // true にすると、進行状況を画面に出します(不具合調査用)
         static constexpr bool VERBOSE = false;
-        // true にすると、スロット選択画面(オレンジ色の背景とアバター)を出さずに進めます
-        // (実機GDBで確認済み: UIの初期化と「UIを開く」を止め、UIの準備完了の印を手動で立てる)
-        static constexpr bool HIDE_SELECT_UI = true;
+        // true にすると、スロット選択画面(オレンジ色の背景)を開かずに進めます
+        // (必ず先にGDBで動作確認してから true にしてください)
+        static constexpr bool HIDE_SELECT_UI = false;
 
         static constexpr u32 FLOW_OBJ       = 0x7208DC;   // シーンフロー (+36 切替要求, +44 要求状態, +48 現在状態)
         static constexpr u32 ROOT_TASK      = 0x6B95EC;   // ルートタスク
@@ -3540,8 +3545,6 @@ namespace CTRPluginFramework
         static constexpr u32 SLOT_VAR       = 0x71BA40;
         static constexpr u32 UI_OPEN_ADDR   = 0x41251C;   // bl 0x308888 (スロット選択UIを開く)
         static constexpr u32 UI_OPEN_ORIG   = 0xEBFBD8D9;
-        static constexpr u32 UI_INIT_ADDR   = 0x412F9C;   // bl 0x30aba8 (スロット選択UIの初期化)
-        static constexpr u32 UI_INIT_ORIG   = 0xEBFBDF01;
         static constexpr u32 ARM_NOP        = 0xE1A00000;
         static constexpr u32 MAX_FRAMES     = 60 * 90;
 
@@ -3557,7 +3560,7 @@ namespace CTRPluginFramework
         static u32           g_tick  = 0;
         static volatile bool g_sent  = false;
         static volatile s32  g_sendResult = 0;
-        static bool g_mgrInit = false, g_vtblPatched = false, g_uiAttached = false, g_uiHidden = false, g_uiInitHidden = false;
+        static bool g_mgrInit = false, g_vtblPatched = false, g_uiAttached = false, g_uiHidden = false;
         static int  g_lastSt = -1;
 
         static void Say(const std::string &m) { if (VERBOSE) OSD::Notify(m); }
@@ -3601,8 +3604,6 @@ namespace CTRPluginFramework
             if (!g_uiAttached)
             {
                 ((FnU32x2)FN_ATTACH)(self, UIMGR_OBJ);
-                if (HIDE_SELECT_UI)
-                    *(volatile u32 *)(self + 372) |= 3;   // UIの準備完了の印 (UIの初期化を止めたので手動で立てる)
                 g_uiAttached = true;
             }
             volatile u8 *nextSt = (volatile u8 *)(self + 0x91B8);
@@ -3627,11 +3628,6 @@ namespace CTRPluginFramework
             {
                 Process::Write32(UI_OPEN_ADDR, UI_OPEN_ORIG);
                 g_uiHidden = false;
-            }
-            if (g_uiInitHidden)
-            {
-                Process::Write32(UI_INIT_ADDR, UI_INIT_ORIG);
-                g_uiInitHidden = false;
             }
             if (g_mgrInit)
             {
@@ -3669,10 +3665,7 @@ namespace CTRPluginFramework
             ((FnU32)FN_MGR_INIT)(MGR_OBJ);
             g_mgrInit = true;
             if (HIDE_SELECT_UI)
-            {
                 g_uiHidden = Process::Write32(UI_OPEN_ADDR, ARM_NOP);
-                g_uiInitHidden = Process::Write32(UI_INIT_ADDR, ARM_NOP);
-            }
             g_vtblPatched = Process::Write32(VTBL_EXSEL_UPDATE, (u32)&ExSelUpdateWrapper);
             g_sendResult = ((SendFn)FN_SEND)(ROOT_TASK, DESC_EXSEL);
             g_sent = true;
@@ -3787,12 +3780,12 @@ namespace CTRPluginFramework
             Process::Read32(FLOW_OBJ + 48, cur);
             if (cur != STATE_FIELD)
             {
-                OSD::Notify("Field only");
+                OSD::Notify("Fieldでのみ使えます");
                 return;
             }
             if (g_phase != IDLE)
             {
-                OSD::Notify("Busy");
+                OSD::Notify("処理中です");
                 return;
             }
             Keyboard kb("プレイヤーを選択", { "プレイヤー 1", "プレイヤー 2", "プレイヤー 3" });
@@ -3814,7 +3807,6 @@ namespace CTRPluginFramework
             RequestState(STATE_IDLE);
         }
     }
-        
 
 
     // ------------------------------------------------------------
@@ -4043,6 +4035,20 @@ namespace CTRPluginFramework
         }
     }
 
+    // 手動の設定を、AR準拠の動きに近い値にまとめて切り替える
+    static void MagePresetEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        g_mageCool      = 0;      // 1回押すと1回だけ
+        g_mageTmax      = 100;    // Aスキル1回ぶんくらいの長さ
+        g_mageStep      = 1;      // 本来の速さ
+        g_mageCancelWin = 40;     // 通常攻撃を消す
+        g_mageBudget    = 48;     // 1フレームの処理の上限
+        g_mageUltTmax   = 300;    // 必殺技は約5秒
+        g_mageClear     = 1;      // 今動いているものは止める
+        OSD::Notify("Mage: preset (AR-like)");
+    }
+
     // 動いているゴーストを全部止める
     static void MageStopEntry(MenuEntry *entry)
     {
@@ -4173,6 +4179,8 @@ namespace CTRPluginFramework
                                 "自動発動で出す技を、1つずつON/OFFできます。"));
         f->Append(new MenuEntry("自動発動の設定 (距離・間隔)", nullptr, MageAutoSettingsEntry,
                                 "敵に近づいたと判定する距離と、自動発動の間隔を変えます。"));
+        f->Append(new MenuEntry("手動の設定をAR準拠に近い値にする", nullptr, MagePresetEntry,
+                                "手動発動の間隔、最大フレーム、速さなどを、おすすめの値にまとめて戻します。"));
         f->Append(new MenuEntry("動いている魔法を全部止める", nullptr, MageStopEntry,
                                 "降り続けている魔法を止めます。重いときに使います。"));
         f->Append(new MenuEntry("Xの必殺技のIDを設定 (16進)", nullptr, MageUltIdEntry,
