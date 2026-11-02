@@ -9,6 +9,10 @@
 //     0x301478: ldrb r8,[r0,#0x19]   必要個数を読み、持っている数(r11)と比べる      → mov r8,#0
 //     0x3015E0: ldrb r2,[r0,#0x19]   必要個数を読み直し、制作用の領域へ書き写す      → mov r2,#0
 //       → 素材を減らす個数、ミニゲーム中の「×0コ」の元
+//  [使う素材の確定]        0x301F38 の関数 (3つの素材の枠を順に、持っている数と比べて確定させる)
+//     0x302024: ldrb r6,[r0,#0x19]   必要個数を読む。持っている数(r9)が足りないと枠が空のまま  → mvn r6,#0 (-1)
+//       → 必要個数を-1にして、「0ではない」「持っている数 >= -1」を満たす。
+//         素材を持っていないとき、この枠が空欄(ハイフン)になって、制作が固まっていた原因
 //  [下画面の素材の欄]      0x3029C8 の関数 (3つの素材の ID と個数を配列へ書き写す)
 //     0x302C80: ldrb r2,[r0,#0x19]   ← 書き換えない。ここを0にすると、個数0の行が画面から隠れ、
 //                                      素材が空のまま制作が始まって固まる (実機で確認)。
@@ -35,11 +39,11 @@
 
 namespace CTRPluginFramework
 {
-    static constexpr int kMatCount = 3;
-    static const u32 kMatSite[kMatCount] = { 0x002FC224, 0x00301478, 0x003015E0 };
-    static const u32 kMatOrig[kMatCount] = { 0xE5D07019, 0xE5D08019, 0xE5D02019 };
-    static const u32 kMatNew [kMatCount] = { 0xE3A07000, 0xE3A08000, 0xE3A02000 };
-    // 0xE3A07000 = mov r7,#0 / 0xE3A08000 = mov r8,#0 / 0xE3A02000 = mov r2,#0
+    static constexpr int kMatCount = 4;
+    static const u32 kMatSite[kMatCount] = { 0x002FC224, 0x00301478, 0x003015E0, 0x00302024 };
+    static const u32 kMatOrig[kMatCount] = { 0xE5D07019, 0xE5D08019, 0xE5D02019, 0xE5D06019 };
+    static const u32 kMatNew [kMatCount] = { 0xE3A07000, 0xE3A08000, 0xE3A02000, 0xE3E06000 };
+    // 0xE3A07000 = mov r7,#0 / 0xE3A08000 = mov r8,#0 / 0xE3A02000 = mov r2,#0 / 0xE3E06000 = mvn r6,#0 (-1)
 
     static void MaterialZeroEntry(MenuEntry *entry)
     {
