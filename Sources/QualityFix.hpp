@@ -192,11 +192,29 @@ extern "C"
     // 0xFFFFFFFF = 固定しない
     volatile u32 g_forceQuality = 0xFFFFFFFF;
 
+    // 1 = 素材レシピのボーナスを確定にして、できる個数を99個にする
+    volatile u32 g_bonus99 = 0;
+
     // アイテム作成関数 0x3464B8 の入口で呼ばれる。req = 作成の依頼内容
     //   [req+0x00] できあがるID   [req+0x04] 元(通常)のID
     //   [req+0x10] 品質           [req+0x28] 極上フラグ(料理など)  [req+0x2C] 品質
+    //   素材レシピ(インゴットなど)では、[req+0x18]=作る個数 N、[req+0x28]=[req+0x2C]=ボーナス X、
+    //   できる個数 Y = N + X (アイテム作成関数が [req+0x28]+[req+0x18] を足して使う)。
     void QualityPrepare(u32 req)
     {
+        // 素材レシピのボーナス: X = 99 - N にして、Y が必ず99個になるようにする (Xは1以上なので、必ずボーナス扱い)
+        if (g_bonus99 && req >= 0x00100000 && req <= 0x20000000)
+        {
+            volatile u32 *rr = (volatile u32 *)req;
+            const u32 id = rr[0];
+            const u32 n  = rr[0x18 / 4];
+            if (id >= 0x0800 && id <= 0x09FE && n >= 1 && n < 99)   // 素材 (ブロンズインゴット 0x900 など)
+            {
+                rr[0x28 / 4] = 99 - n;
+                rr[0x2C / 4] = 99 - n;
+            }
+        }
+
         const u32 q = g_forceQuality;
         if (q > 4)
             return;
@@ -360,8 +378,37 @@ namespace CTRPluginFramework
             Process::Write32(ADDR_A, 0x23);
     }
 
+    // ------------------------------------------------------------
+    //  素材レシピのボーナス (いつもよりうまく作れた! X個多めにY個できた!) を確定で99個にする
+    // ------------------------------------------------------------
+    static void Bonus99Entry(MenuEntry *entry)
+    {
+        (void)entry;
+
+        if (!InstallQualityHook())
+            return;
+
+        std::vector<std::string> names;
+        names.push_back("ON (必ずボーナス・合計99個)");
+        names.push_back("OFF (通常)");
+
+        Keyboard kb("素材レシピのボーナス", names);
+        int sel = kb.Open();
+        if (sel < 0 || sel > 1)
+            return;
+
+        g_bonus99 = (sel == 0) ? 1 : 0;
+        OSD::Notify(sel == 0 ? "Bonus99: ON" : "Bonus99: OFF");
+    }
+
     static void AddQualityFix(PluginMenu *menu)
     {
+        menu->Append(new MenuEntry("素材レシピを必ず99個にする", nullptr, Bonus99Entry,
+                                   "素材レシピ(インゴットなど)で、ボーナスを必ず出して、できる個数を99個にします。\n"
+                                   "例えば1個作ると98個多めに99個、7個作ると92個多めに99個になります。\n"
+                                   "制作の前にONにして、終わったらOFFに戻してください。\n"
+                                   "実機未検証です。必ずバックアップを取ってから使ってください。"));
+
         menu->Append(new MenuEntry("制作を即完了", InstantCraftGame, nullptr,
                                    "ONにすると、制作ミニゲームが始まってすぐに完了します。\n"
                                    "工程アイコンが描かれたあとに書き込むので、表示は崩れません。\n"
