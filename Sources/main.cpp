@@ -1229,6 +1229,12 @@ namespace CTRPluginFramework
         MessageBox(Utils::Format("アドレス 0x%08X", base), s)();
     }
 
+    // 製作者名の読み書き (定義は後ろ。編集画面から使う)
+    static bool AskMakerName(std::vector<u16> &name);
+    static std::string Utf16ToUtf8(const std::vector<u16> &v);
+    static void ReadMakerName(u32 base, const Category &cat, std::vector<u16> &out);
+    static bool WriteMakerName(u32 base, const Category &cat, const std::vector<u16> &name, std::string &err);
+
     // ------------------------------------------------------------
     //  指定アドレスのアイテムを編集する共通UI
     //  slotMode=true のときは「別の枠を選ぶ」を出す
@@ -1248,12 +1254,19 @@ namespace CTRPluginFramework
             const Category *cat = FindCategory(id);
             std::vector<Field> fields = FieldsFor(cat, slotMode);   // 装備編集では個数を出さない
 
+            const bool hasName = (cat && cat->offName >= 0);
             std::vector<std::string> opts;
             for (const Field &f : fields)
             {
                 u32 v = 0;
                 ReadField(base, f, v);
                 opts.push_back(f.label + ": " + FmtValue(f, v));
+            }
+            if (hasName)
+            {
+                std::vector<u16> nm;
+                ReadMakerName(base, *cat, nm);
+                opts.push_back(std::string("製作者名(実験): ") + (nm.empty() ? std::string("なし") : "「" + Utf16ToUtf8(nm) + "」"));
             }
             opts.push_back("Hexダンプを表示");
             if (slotMode)
@@ -1276,7 +1289,18 @@ namespace CTRPluginFramework
                         MessageBox("エラー", "書き込みに失敗しました。")();
                 }
             }
-            else if ((size_t)sel == fields.size())
+            else if (hasName && (size_t)sel == fields.size())
+            {
+                std::vector<u16> nm;
+                ReadMakerName(base, *cat, nm);
+                if (AskMakerName(nm))
+                {
+                    std::string err;
+                    if (!WriteMakerName(base, *cat, nm, err))
+                        MessageBox("製作者名を書けません", err)();
+                }
+            }
+            else if ((size_t)sel == fields.size() + (hasName ? 1 : 0))
                 ShowDump(base);
             else
                 return true;
@@ -2064,6 +2088,104 @@ namespace CTRPluginFramework
         return def;
     }
 
+    // ------------------------------------------------------------
+    //  既存のアイテムの製作者名 (実験)
+    //  名前は行の決まった場所 (武器+0x20 / 防具+0x24 / ライフ道具・家具+0x10) に UTF-16LE で12バイト。
+    //  名前つきの行は +0xE が名前の印 (名前なしは 1)。
+    // ------------------------------------------------------------
+    static bool IsTemplateWord(u32 at, u32 v)
+    {
+        return (at == 0x28 && v == 1) || (at == 0x2C && v == 2) || (at == 0x30 && v == 3) || (at == 0x34 && v == 4);
+    }
+
+    static void ReadMakerName(u32 base, const Category &cat, std::vector<u16> &out)
+    {
+        out.clear();
+        if (cat.offName < 0)
+            return;
+        u16 flag = 0;
+        Process::Read16(base + 0x0E, flag);
+        if (flag == 1 || flag == 0)          // 名前なし
+            return;
+        for (u32 i = 0; i < NAME_CHARS; ++i)
+        {
+            u16 ch = 0;
+            Process::Read16(base + (u32)cat.offName + i * 2, ch);
+            if (ch == 0)
+                break;
+            out.push_back(ch);
+        }
+    }
+
+    // 名前の印の値: かばん・倉庫にある名前つきの実物から取る (なければ 0x16D7)
+    static u16 CurrentAuthorMark()
+    {
+        u16 mark = 0x16D7;
+        const Container *conts[2] = { &g_bag, &g_store };
+        for (const Container *ct : conts)
+        {
+            BagState b;
+            std::string err;
+            if (!LoadBag(b, *ct, err))
+                continue;
+            if (b.authorMark != 0x16D7)
+                return b.authorMark;
+            mark = b.authorMark;
+        }
+        return mark;
+    }
+
+    // 名前を書く (空なら名前を消す)。名前の場所に別のデータがありそうなときは書かずに false
+    static bool WriteMakerName(u32 base, const Category &cat, const std::vector<u16> &nm, std::string &err)
+    {
+        if (cat.offName < 0)
+        {
+            err = "この種類のアイテムには製作者名がありません。";
+            return false;
+        }
+        u16 flag = 0;
+        Process::Read16(base + 0x0E, flag);
+        const bool named = (flag != 1 && flag != 0);
+        const u32 off = (u32)cat.offName;
+
+        if (!named)
+        {
+            for (u32 o = 0; o < NAME_CHARS * 2; o += 4)
+            {
+                u32 v = 0;
+                Process::Read32(base + off + o, v);
+                if (v != 0 && !IsTemplateWord(off + o, v))
+                {
+                    err = "名前の場所に、別のデータが入っています。(何も書いていません)";
+                    return false;
+                }
+            }
+        }
+
+        if (nm.empty())
+        {
+            for (u32 o = 0; o < NAME_CHARS * 2; o += 2)
+                Process::Write16(base + off + o, 0);
+            Process::Write16(base + 0x0E, 0x0001);
+            return true;
+        }
+
+        // 買った直後などの目印 (1,2,3,4) が残っていれば消す (名前つきの実物の行に合わせる)
+        u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+        Process::Read32(base + 0x28, w0);
+        Process::Read32(base + 0x2C, w1);
+        Process::Read32(base + 0x30, w2);
+        Process::Read32(base + 0x34, w3);
+        if (w0 == 1 && w1 == 2 && w2 == 3 && w3 == 4)
+            for (u32 o = 0x28; o < 0x38; o += 4)
+                Process::Write32(base + o, 0);
+
+        for (u32 i = 0; i < NAME_CHARS; ++i)
+            Process::Write16(base + off + i * 2, i < nm.size() ? nm[i] : (u16)0);
+        Process::Write16(base + 0x0E, CurrentAuthorMark());
+        return true;
+    }
+
     // 追加項目を選ぶ画面 (一括変更の画面と同じ作り)。キャンセルなら false
     static bool AskGenSpec(const Category *cat, const std::string &title, GenSpec &sp, u32 &count)
     {
@@ -2165,6 +2287,38 @@ namespace CTRPluginFramework
     }
 
     static bool NameTableLoaded() { return g_itemNames[0].name != nullptr; }
+
+    // ------------------------------------------------------------
+    //  性別専用の防具 (男せんよう / 女せんよう)。ID順に並べてある。
+    // ------------------------------------------------------------
+    static const u16 MALE_ONLY_ARMOR[] =
+        {
+            0x009A, 0x009C, 0x009E, 0x00A0, 0x00A2, 0x00A4, 0x00A6, 0x00A9, 0x00B3, 0x00C1, 0x00C7, 0x00E9, 0x00EB,
+            0x00ED, 0x00EF, 0x00F1, 0x00F3, 0x00F5, 0x00FD, 0x0101, 0x0107, 0x010D, 0x0113, 0x0115, 0x0131, 0x0133,
+            0x0135, 0x0137, 0x0139, 0x013B, 0x013D, 0x0145, 0x0149, 0x014F, 0x0155, 0x015B, 0x015D, 0x0180, 0x0182,
+            0x0184, 0x0186, 0x0188, 0x01DD, 0x01E9, 0x0258, 0x0259, 0x025A, 0x027E, 0x027F, 0x0280, 0x0286, 0x0287,
+            0x0288, 0x029A, 0x029B, 0x029C, 0x02E3, 0x0301
+        };
+
+    static const u16 FEMALE_ONLY_ARMOR[] =
+        {
+            0x009B, 0x009D, 0x009F, 0x00A1, 0x00A3, 0x00A5, 0x00A7, 0x00AA, 0x00B4, 0x00C2, 0x00EA, 0x00EC, 0x00EE,
+            0x00F0, 0x00F2, 0x00F4, 0x00F6, 0x00FE, 0x0108, 0x010E, 0x0114, 0x0116, 0x0132, 0x0134, 0x0136, 0x0138,
+            0x013A, 0x013C, 0x013E, 0x0146, 0x0150, 0x0156, 0x015C, 0x015E, 0x0178, 0x0179, 0x017A, 0x017B, 0x017C,
+            0x017D, 0x017E, 0x017F, 0x0181, 0x0183, 0x0185, 0x0187, 0x0189, 0x018F, 0x01DE, 0x01EA, 0x01F0, 0x0253,
+            0x0254, 0x025C, 0x025D, 0x025E, 0x0266, 0x0267, 0x0268, 0x0270, 0x0271, 0x0272, 0x027A, 0x027B, 0x028A,
+            0x028B, 0x028C, 0x0296, 0x029E, 0x029F, 0x02A0, 0x02A8, 0x02A9, 0x02AA, 0x02E4, 0x0302
+        };
+
+    static bool IsMaleOnlyArmor(u32 id)
+    {
+        return std::binary_search(MALE_ONLY_ARMOR, MALE_ONLY_ARMOR + sizeof(MALE_ONLY_ARMOR) / sizeof(u16), (u16)id);
+    }
+
+    static bool IsFemaleOnlyArmor(u32 id)
+    {
+        return std::binary_search(FEMALE_ONLY_ARMOR, FEMALE_ONLY_ARMOR + sizeof(FEMALE_ONLY_ARMOR) / sizeof(u16), (u16)id);
+    }
 
     // 名前だけでは判定できない、未実装・イベント用アイテムのID (手作業の一覧)
     static const u16 EXTRA_UNIMPL[] =
@@ -2650,6 +2804,39 @@ namespace CTRPluginFramework
             }
         }
 
+        // 性別専用の防具の除外 (防具のカテゴリを一括生成するとき)
+        if (askUnimpl && !ids.empty() && CommonCategory(ids) == &g_cats[1])
+        {
+            u32 nm = 0, nf = 0;
+            for (u32 id : ids)
+            {
+                if (IsMaleOnlyArmor(id))
+                    ++nm;
+                else if (IsFemaleOnlyArmor(id))
+                    ++nf;
+            }
+            if (nm > 0 || nf > 0)
+            {
+                std::vector<std::string> go;
+                go.push_back("除外しない");
+                go.push_back(Utils::Format("男専用防具を除外 (%u件)", nm));
+                go.push_back(Utils::Format("女専用防具を除外 (%u件)", nf));
+                Keyboard kg(Utils::Format("性別専用の防具 (対象 %u 件中)", (u32)ids.size()), go);
+                const int gi = kg.Open();
+                if (gi < 0)
+                    return;                 // Bで中止 (まだ何も作っていない)
+                if (gi == 1 || gi == 2)
+                {
+                    std::vector<u32> keep;
+                    for (u32 id : ids)
+                        if (!(gi == 1 ? IsMaleOnlyArmor(id) : IsFemaleOnlyArmor(id)))
+                            keep.push_back(id);
+                    ids.swap(keep);
+                    what += (gi == 1) ? " (男専用を除外)" : " (女専用を除外)";
+                }
+            }
+        }
+
         if (ids.empty())
         {
             MessageBox("対象なし", "該当するアイテムがありません。")();
@@ -2816,6 +3003,12 @@ namespace CTRPluginFramework
         modes.push_back(all ? std::string("全てのアイテムを削除")
                             : Utils::Format("%sを全て削除", g_cats[ci].name));
         modes.push_back("未実装アイテムだけ削除");
+        const bool isArmor = (!all && &g_cats[ci] == &g_cats[1]);
+        if (isArmor)
+        {
+            modes.push_back("男専用防具だけ削除");
+            modes.push_back("女専用防具だけ削除");
+        }
         Keyboard kmo("削除する対象", modes);
         const int mo = kmo.Open();
         if (mo < 0)
@@ -2843,6 +3036,10 @@ namespace CTRPluginFramework
             bool hit = all || (id >= g_cats[ci].idMin && id <= g_cats[ci].idMax);
             if (hit && mo == 1 && !IsUnimplemented(id))
                 hit = false;
+            if (hit && mo == 2 && !IsMaleOnlyArmor(id))
+                hit = false;
+            if (hit && mo == 3 && !IsFemaleOnlyArmor(id))
+                hit = false;
             if (!hit)
                 continue;
             if (IsEquipped(b, s))
@@ -2860,7 +3057,9 @@ namespace CTRPluginFramework
 
         std::string msg = Utils::Format("%s / %s\n%s\n%u 件を削除します。(残り %u 件)\n",
                                         c->name, all ? "すべて" : g_cats[ci].name,
-                                        mo == 1 ? "未実装アイテムのみ" : "すべて",
+                                        mo == 1 ? "未実装アイテムのみ"
+                                        : mo == 2 ? "男専用防具のみ"
+                                        : mo == 3 ? "女専用防具のみ" : "すべて",
                                         (u32)del.size(), (u32)(b.order.size() - del.size()));
         if (protectedN)
             msg += Utils::Format("装備中の %u 件は残します。\n", protectedN);
