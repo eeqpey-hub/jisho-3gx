@@ -208,7 +208,7 @@ extern "C"
             volatile u32 *rr = (volatile u32 *)req;
             const u32 id = rr[0];
             const u32 n  = rr[0x18 / 4];
-            if (id >= 0x0000 && id <= 0x09FE && n >= 1 && n < 99)   // 素材 (ブロンズインゴット 0x900 など)
+            if (id >= 0x0666 && id <= 0x09FE && n >= 1 && n < 99)   // 料理・薬・爆弾 (0x666〜) と素材 (ブロンズインゴット 0x900 など)
             {
                 rr[0x28 / 4] = 99 - n;
                 rr[0x2C / 4] = 99 - n;
@@ -228,19 +228,18 @@ extern "C"
         const u32 superId = QualityFixData::FindSuper(baseId);
         if (superId != 0)
         {
+            // [req+0x28] = ボーナスX は書き換えない。[req+0x2C] は 極上=3 / 通常=X (ゲーム本来の値)
             if (q >= 3)
             {
                 r[0]    = superId;   // 極上のID
                 r[0x10 / 4] = 3;
-                r[0x28 / 4] = 1;
                 r[0x2C / 4] = 3;
             }
             else
             {
                 r[0]    = baseId;    // 通常のID
                 r[0x10 / 4] = 0;
-                r[0x28 / 4] = 0;
-                r[0x2C / 4] = 0;
+                r[0x2C / 4] = r[0x28 / 4];
             }
             return;
         }
@@ -403,8 +402,8 @@ namespace CTRPluginFramework
 
     static void AddQualityFix(PluginMenu *menu)
     {
-        menu->Append(new MenuEntry("素材レシピを必ず99個にする", nullptr, Bonus99Entry,
-                                   "素材レシピ(インゴットなど)で、ボーナスを必ず出して、できる個数を99個にします。\n"
+        menu->Append(new MenuEntry("レシピを必ず99個にする", nullptr, Bonus99Entry,
+                                   "素材・料理・薬・爆弾のレシピで、ボーナスを必ず出して、できる個数を99個にします。\n"
                                    "例えば1個作ると98個多めに99個、7個作ると92個多めに99個になります。\n"
                                    "制作の前にONにして、終わったらOFFに戻してください。\n"
                                    "実機未検証です。必ずバックアップを取ってから使ってください。"));
