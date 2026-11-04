@@ -328,6 +328,7 @@ extern "C"
     volatile u32 g_mageCntChan  = 0;      // 診断: 入力更新フックが呼ばれた回数
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
     volatile float g_mageRate   = 1.0f;   // ゴーストの時間の進み方 (1フレームあたりの時間の増え方。AR準拠の実測に合わせる)
+    volatile u32 g_mageArStagger = 0;     // AR準拠で、同時に出す技を何フレームずつ遅らせるか (0 = ARコードと同じ。全部同じ時間)
     volatile u32 g_mageStagger  = 1;      // 同時に選んだ技を、1つずつ何フレームずつ遅らせて出すか (0 = 全部同じフレーム)
     volatile u32 g_mageUltTmax  = 600;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
     volatile u32 g_mageBudget   = 48;     // 1フレームに魔法の判定を作る関数を呼ぶ回数の上限 (重くなりすぎないように)
@@ -729,7 +730,7 @@ extern "C"
                 // 全部を同じ時間で出すと、本物のAスキルが優先されて、ほかが出ないことがあるため。
                 const u32 savedTimeBits = *(volatile u32 *)(K + 0xC4);
                 const float tReal = *(volatile float *)(K + 0xC4);
-                const u32 stg = g_mageStagger;
+                const u32 stg = g_mageArStagger;
                 for (u32 d = 0; d < nd; ++d)
                 {
                     if (shifted)
@@ -4262,6 +4263,19 @@ namespace CTRPluginFramework
             g_mageDirD = (float)v;
     }
 
+    // AR準拠を、ARコードと同じ動きにする設定へ戻す
+    static void MageArPresetEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        g_mageArN       = 10;         // ARコードと同じ「押している扱い」のフレーム数
+        g_mageArStagger = 0;          // 全部同じ時間で出す (ARコードと同じ)
+        g_mageArMask    = 0x0FFFF;    // 表の16個だけ。必殺技は外す (ARコードにはない)
+        g_mageFwdF      = 0.0f;       // 位置はずらさない
+        g_mageDirs      = 1;          // 方向は1つ
+        g_mageClear     = 1;
+        OSD::Notify("Mage: AR style = AR code");
+    }
+
     // 手動の設定を、AR準拠の動きに近い値にまとめて切り替える
     static void MagePresetEntry(MenuEntry *entry)
     {
@@ -4415,6 +4429,9 @@ namespace CTRPluginFramework
         u32 v = g_mageArN;
         if (MageAskNumber("押している扱いにするフレーム数 (3〜60)\n溜めが足りず通常攻撃になるときは増やす。", v, 3, 60))
             g_mageArN = v;
+        v = g_mageArStagger;
+        if (MageAskNumber("AR準拠: 同時に出す技のずらし (0〜5フレーム)\n0 = ARコードと同じ(全部同じ時間)。全部選ぶと一部が出ないときだけ、1〜2にする。", v, 0, 5))
+            g_mageArStagger = v;
     }
 
     static void AddMageRapid(PluginMenu *menu)
@@ -4457,6 +4474,8 @@ namespace CTRPluginFramework
                                 "魔法使い連射・敵即死のARコードとは同時に使えません。"));
         f->Append(new MenuEntry("AR準拠の発動ボタン (A / X / B / Y / L / R)", nullptr, MageArKeyEntry,
                                 "AR準拠モードを発動するボタンを選びます。"));
+        f->Append(new MenuEntry("AR準拠を、ARコードと同じ設定に戻す", nullptr, MageArPresetEntry,
+                                "AR準拠の設定を、ARコードと同じ動きになる値に戻します。必殺技・位置のずらし・方向は外れます。"));
         f->Append(new MenuEntry("AR準拠で出す技を選ぶ", nullptr, MageArSkillEntry,
                                 "AR準拠モードで、同時に出す技を選びます。"));
         f->Append(new MenuEntry("AR準拠の設定 (押している扱いのフレーム数)", nullptr, MageArSettingsEntry,
