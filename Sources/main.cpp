@@ -327,6 +327,7 @@ extern "C"
     volatile u32 g_mageCntTick  = 0;      // 診断: アクション更新フックが、プレイヤーで呼ばれた回数
     volatile u32 g_mageCntChan  = 0;      // 診断: 入力更新フックが呼ばれた回数
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
+    volatile u32 g_mageStagger  = 1;      // 同時に選んだ技を、1つずつ何フレームずつ遅らせて出すか (0 = 全部同じフレーム)
     volatile u32 g_mageUltTmax  = 600;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
     volatile u32 g_mageBudget   = 48;     // 1フレームに魔法の判定を作る関数を呼ぶ回数の上限 (重くなりすぎないように)
     volatile u32 g_mageClear    = 0;      // 1にすると、動いているゴーストを全部止める
@@ -472,6 +473,22 @@ extern "C"
         }
     }
 
+    // 方向 d (0 〜 nd-1) のときの、座標のずらし量 (ox, oz)。前 = 向きの目安、右 = それを90度回した向き。
+    // nd = 1 のときは、前へずらす距離だけ。nd = 4 / 8 のときは、さらに方向ごとの距離を足す。
+    static void MageDirOffset(u32 nd, u32 d, float &ox, float &oz)
+    {
+        static const float cs[8][2] = { {1.0f, 0.0f}, {0.7071f, 0.7071f}, {0.0f, 1.0f}, {-0.7071f, 0.7071f},
+                                        {-1.0f, 0.0f}, {-0.7071f, -0.7071f}, {0.0f, -1.0f}, {0.7071f, -0.7071f} };
+        const float fx = g_mageFx, fz = g_mageFz;
+        const float rx = fz, rz = -fx;
+        const u32 ci = (nd == 8) ? d : d * 2;               // 4方向のときは、前・右・後ろ・左
+        const float a = (nd > 1) ? cs[ci][0] : 0.0f;        // 前方向の成分
+        const float b = (nd > 1) ? cs[ci][1] : 0.0f;        // 右方向の成分
+        const float dist = (nd > 1) ? g_mageDirD : 0.0f;
+        ox = fx * (g_mageFwdF + a * dist) + rx * (b * dist);
+        oz = fz * (g_mageFwdF + a * dist) + rz * (b * dist);
+    }
+
     // プレイヤーのユニット更新で、毎フレーム1回。ゴーストの進行と、通常攻撃の消去。
     static void MageTickCore(u32 K)
     {
@@ -530,6 +547,7 @@ extern "C"
 
         const u32 step = g_mageStep < 1 ? 1 : g_mageStep;
         u32 budget = g_mageBudget < 17 ? 17 : g_mageBudget;
+        const u32 budget0 = budget;
         for (int i = 0; i < MAGE_MAXG; ++i)
         {
             s32 t = g_mageT[i];
@@ -537,52 +555,66 @@ extern "C"
                 continue;
             const u32 mask = g_mageGM[i];
             // 必殺技を含むゴーストは、必殺技の最大フレームまで続ける (ほかの技は、従来の最大フレームで止める)
-            const u32 tmaxEff = (((mask >> 16) & 1) && g_mageUltId && g_mageUltTmax > g_mageTmax) ? g_mageUltTmax : g_mageTmax;
+            u32 nsel = 0;
+            for (int n = 0; n < 17; ++n)
+                if (((mask >> n) & 1) && MageIdAt(n))
+                    ++nsel;
+            const u32 baseTmax = (((mask >> 16) & 1) && g_mageUltId && g_mageUltTmax > g_mageTmax) ? g_mageUltTmax : g_mageTmax;
+            const u32 tmaxEff  = baseTmax + (nsel ? (nsel - 1) * g_mageStagger : 0);   // 遅らせた分だけ、続ける時間も延ばす
             const u32 savedId   = *(volatile u32 *)(K + 8);
             const u32 savedTime = *(volatile u32 *)(K + 0xC4);
             for (u32 sp = 0; sp < step; ++sp)              // 1フレームに step だけ時間を進める (飛ばさず全部呼ぶ)
             {
                 if ((u32)t > tmaxEff)
                     break;
+                // 選んだ技を順番に並べ、k 番目の技は k×g_mageStagger フレーム遅らせて出す。
+                // 全部を同じフレームで出すと、先に出した技 (Aの2段階目など) だけが優先され、
+                // 残りが出ないことがある (ゲーム側の同時に出せる数の上限のため)。
+                const u32 stg = g_mageStagger;
                 u32 need = 0;                                  // この時間で呼ぶ回数
-                for (int n = 0; n < 17; ++n)
-                    if (((mask >> n) & 1) && MageIdAt(n) && !(n < 16 && (u32)t > g_mageTmax))
-                        ++need;
+                {
+                    u32 rank = 0;
+                    for (int n = 0; n < 17; ++n)
+                    {
+                        if (!((mask >> n) & 1) || !MageIdAt(n))
+                            continue;
+                        const s32 tt = t - (s32)(rank * stg);
+                        const u32 lim = (n < 16) ? g_mageTmax : g_mageUltTmax;
+                        if (tt >= 0 && (u32)tt <= lim)
+                            ++need;
+                        ++rank;
+                    }
+                }
                 const u32 nd = (g_mageDirs >= 8) ? 8 : (g_mageDirs >= 4 ? 4 : 1);
                 need *= nd;
-                if (need > budget)
-                    break;                                     // 今フレームの上限を超えるので、続きは次のフレームへ
-                budget -= need;
+                if (need > budget && budget != budget0)
+                    break;                                     // 今フレームの上限を超えるので、続きは次のフレームへ (先頭のゴーストは必ず進める)
+                budget = (need > budget) ? 0 : budget - need;
 
                 const bool shifted = (nd > 1) || (g_mageFwdF != 0.0f);
                 const u32 pobj = K - 0x558;
                 if (shifted)
                     MageShiftSave(pobj);
-                // 方向 (前, 右, 後ろ, 左, ...): 前 = 向きの目安、右 = それを90度回した向き
-                static const float cs[8][2] = { {1.0f, 0.0f}, {0.7071f, 0.7071f}, {0.0f, 1.0f}, {-0.7071f, 0.7071f},
-                                                {-1.0f, 0.0f}, {-0.7071f, -0.7071f}, {0.0f, -1.0f}, {0.7071f, -0.7071f} };
-                const float fx = g_mageFx, fz = g_mageFz;      // 前
-                const float rx = fz, rz = -fx;                 // 右
                 for (u32 d = 0; d < nd; ++d)
                 {
                     if (shifted)
                     {
-                        const u32 ci = (nd == 8) ? d : d * 2;  // 4方向のときは、前・右・後ろ・左
-                        const float a = (nd > 1) ? cs[ci][0] : 0.0f;   // 前方向の成分
-                        const float b = (nd > 1) ? cs[ci][1] : 0.0f;   // 右方向の成分
-                        const float dist = (nd > 1) ? g_mageDirD : 0.0f;
-                        const float ox = fx * (g_mageFwdF + a * dist) + rx * (b * dist);
-                        const float oz = fz * (g_mageFwdF + a * dist) + rz * (b * dist);
+                        float ox, oz;
+                        MageDirOffset(nd, d, ox, oz);
                         MageShiftSet(pobj, ox, oz);
                     }
+                    u32 rank = 0;
                     for (int n = 0; n < 17; ++n)
                     {
                         if (!((mask >> n) & 1) || !MageIdAt(n))
                             continue;
-                        if (n < 16 && (u32)t > g_mageTmax)
+                        const s32 tt = t - (s32)(rank * stg);
+                        const u32 lim = (n < 16) ? g_mageTmax : g_mageUltTmax;
+                        ++rank;
+                        if (tt < 0 || (u32)tt > lim)
                             continue;
                         *(volatile u32 *)(K + 8)      = MageIdAt(n);
-                        *(volatile float *)(K + 0xC4) = (float)t;
+                        *(volatile float *)(K + 0xC4) = (float)tt;
                         jp_callBody(K);                    // 魔法の判定・エフェクトを作る本体
                     }
                 }
@@ -685,13 +717,45 @@ extern "C"
             if (id == g_mageIds[0] || id == g_mageIds[1] || id == g_mageIds[2] || id == g_mageIds[3])
             {
                 const u32 mask = g_mageArMask;
-                for (int n = 0; n < 16; ++n)                           // 表のスキル: Aスキルと同じ時間で判定を作る
+                // 位置の設定 (前へずらす・同時方向) をここにも反映する。
+                // 本物のAスキルは、このあとゲーム本体がそのままの位置で出す。
+                // 方向が複数のときだけ、Aスキル自身も、ずらした位置から追加で出す。
+                const u32 nd = (g_mageDirs >= 8) ? 8 : (g_mageDirs >= 4 ? 4 : 1);
+                const bool shifted = (nd > 1) || (g_mageFwdF != 0.0f);
+                if (shifted)
+                    MageShiftSave(C);
+                // 選んだ技を順番に並べ、k 番目の技は k×g_mageStagger フレーム遅らせた時間で出す。
+                // 全部を同じ時間で出すと、本物のAスキルが優先されて、ほかが出ないことがあるため。
+                const u32 savedTimeBits = *(volatile u32 *)(K + 0xC4);
+                const float tReal = *(volatile float *)(K + 0xC4);
+                const u32 stg = g_mageStagger;
+                for (u32 d = 0; d < nd; ++d)
                 {
-                    if (!((mask >> n) & 1) || g_mageIds[n] == id)
-                        continue;
-                    *(volatile u32 *)(K + 8) = g_mageIds[n];
-                    jp_callBody(K);
+                    if (shifted)
+                    {
+                        float ox, oz;
+                        MageDirOffset(nd, d, ox, oz);
+                        MageShiftSet(C, ox, oz);
+                    }
+                    u32 rank = 0;
+                    for (int n = 0; n < 16; ++n)                       // 表のスキル: Aスキルと同じ時間で判定を作る
+                    {
+                        if (!((mask >> n) & 1))
+                            continue;
+                        const u32 k = rank++;
+                        if (g_mageIds[n] == id && nd == 1)             // 1方向のときは、本物のAスキルがあるので省く
+                            continue;
+                        const float tt = tReal - (float)(k * stg);
+                        if (tt < 0.0f)
+                            continue;
+                        *(volatile u32 *)(K + 8)      = g_mageIds[n];
+                        *(volatile float *)(K + 0xC4) = tt;
+                        jp_callBody(K);
+                    }
                 }
+                *(volatile u32 *)(K + 0xC4) = savedTimeBits;           // 時間を元に戻す
+                if (shifted)
+                    MageShiftSet(C, 0.0f, 0.0f);                       // 元の座標に戻す (保存した値そのまま)
                 *(volatile u32 *)(K + 8) = id;
                 g_mageArCasts = g_mageArCasts + 1;
 
@@ -1101,6 +1165,28 @@ namespace CTRPluginFramework
         return true;
     }
 
+    // 数値の入力。最初は空欄 (0や1が入っていない)。そのまま決定すると 0 になる
+    static bool AskValueBlank(const std::string &msg, bool hex, u32 maxV, u32 &out)
+    {
+        Keyboard kb(msg);
+        kb.IsHexadecimal(hex);
+        int len = 4;
+        if (!hex)
+        {
+            len = 1;
+            for (u32 t = maxV; t >= 10; t /= 10)
+                ++len;
+        }
+        kb.SetMaxLength(len);
+        u32 v = 0;
+        if (kb.Open(v) != 0)
+            return false;
+        if (v > maxV)
+            v = maxV;
+        out = v;
+        return true;
+    }
+
     // 選択式の入力。キャンセルなら false
     static bool AskChoice(const std::string &msg, const std::vector<std::string> &choices, u32 &out)
     {
@@ -1172,7 +1258,7 @@ namespace CTRPluginFramework
     }
 
     // 項目ごとの入力方法をまとめたもの (装備編集・かばん編集・一括変更で共通)
-    static bool AskFieldValue(const Field &f, const Category *cat, u32 cur, u32 &out)
+    static bool AskFieldValue(const Field &f, const Category *cat, u32 cur, u32 &out, bool blank = false)
     {
         if (!f.choices.empty())
             return AskChoice(f.label, f.choices, out);
@@ -1188,6 +1274,8 @@ namespace CTRPluginFramework
         if (f.kind == K_EFFECT)
             return PickFromNames(f.label, g_effectNames, false, 0, 0xFFFF, cur, out);
 
+        if (blank)
+            return AskValueBlank(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, out);
         return AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, out);
     }
 
@@ -1204,6 +1292,12 @@ namespace CTRPluginFramework
         }
         MessageBox(Utils::Format("アドレス 0x%08X", base), s)();
     }
+
+    // 製作者名の読み書き (定義は後ろ。編集画面から使う)
+    static bool AskMakerName(std::vector<u16> &name);
+    static std::string Utf16ToUtf8(const std::vector<u16> &v);
+    static void ReadMakerName(u32 base, const Category &cat, std::vector<u16> &out);
+    static bool WriteMakerName(u32 base, const Category &cat, const std::vector<u16> &name, std::string &err);
 
     // ------------------------------------------------------------
     //  指定アドレスのアイテムを編集する共通UI
@@ -1224,12 +1318,19 @@ namespace CTRPluginFramework
             const Category *cat = FindCategory(id);
             std::vector<Field> fields = FieldsFor(cat, slotMode);   // 装備編集では個数を出さない
 
+            const bool hasName = (cat && cat->offName >= 0);
             std::vector<std::string> opts;
             for (const Field &f : fields)
             {
                 u32 v = 0;
                 ReadField(base, f, v);
                 opts.push_back(f.label + ": " + FmtValue(f, v));
+            }
+            if (hasName)
+            {
+                std::vector<u16> nm;
+                ReadMakerName(base, *cat, nm);
+                opts.push_back(std::string("製作者名(実験): ") + (nm.empty() ? std::string("なし") : "「" + Utf16ToUtf8(nm) + "」"));
             }
             opts.push_back("Hexダンプを表示");
             if (slotMode)
@@ -1252,7 +1353,18 @@ namespace CTRPluginFramework
                         MessageBox("エラー", "書き込みに失敗しました。")();
                 }
             }
-            else if ((size_t)sel == fields.size())
+            else if (hasName && (size_t)sel == fields.size())
+            {
+                std::vector<u16> nm;
+                ReadMakerName(base, *cat, nm);
+                if (AskMakerName(nm))
+                {
+                    std::string err;
+                    if (!WriteMakerName(base, *cat, nm, err))
+                        MessageBox("製作者名を書けません", err)();
+                }
+            }
+            else if ((size_t)sel == fields.size() + (hasName ? 1 : 0))
                 ShowDump(base);
             else
                 return true;
@@ -2040,6 +2152,104 @@ namespace CTRPluginFramework
         return def;
     }
 
+    // ------------------------------------------------------------
+    //  既存のアイテムの製作者名 (実験)
+    //  名前は行の決まった場所 (武器+0x20 / 防具+0x24 / ライフ道具・家具+0x10) に UTF-16LE で12バイト。
+    //  名前つきの行は +0xE が名前の印 (名前なしは 1)。
+    // ------------------------------------------------------------
+    static bool IsTemplateWord(u32 at, u32 v)
+    {
+        return (at == 0x28 && v == 1) || (at == 0x2C && v == 2) || (at == 0x30 && v == 3) || (at == 0x34 && v == 4);
+    }
+
+    static void ReadMakerName(u32 base, const Category &cat, std::vector<u16> &out)
+    {
+        out.clear();
+        if (cat.offName < 0)
+            return;
+        u16 flag = 0;
+        Process::Read16(base + 0x0E, flag);
+        if (flag == 1 || flag == 0)          // 名前なし
+            return;
+        for (u32 i = 0; i < NAME_CHARS; ++i)
+        {
+            u16 ch = 0;
+            Process::Read16(base + (u32)cat.offName + i * 2, ch);
+            if (ch == 0)
+                break;
+            out.push_back(ch);
+        }
+    }
+
+    // 名前の印の値: かばん・倉庫にある名前つきの実物から取る (なければ 0x16D7)
+    static u16 CurrentAuthorMark()
+    {
+        u16 mark = 0x16D7;
+        const Container *conts[2] = { &g_bag, &g_store };
+        for (const Container *ct : conts)
+        {
+            BagState b;
+            std::string err;
+            if (!LoadBag(b, *ct, err))
+                continue;
+            if (b.authorMark != 0x16D7)
+                return b.authorMark;
+            mark = b.authorMark;
+        }
+        return mark;
+    }
+
+    // 名前を書く (空なら名前を消す)。名前の場所に別のデータがありそうなときは書かずに false
+    static bool WriteMakerName(u32 base, const Category &cat, const std::vector<u16> &nm, std::string &err)
+    {
+        if (cat.offName < 0)
+        {
+            err = "この種類のアイテムには製作者名がありません。";
+            return false;
+        }
+        u16 flag = 0;
+        Process::Read16(base + 0x0E, flag);
+        const bool named = (flag != 1 && flag != 0);
+        const u32 off = (u32)cat.offName;
+
+        if (!named)
+        {
+            for (u32 o = 0; o < NAME_CHARS * 2; o += 4)
+            {
+                u32 v = 0;
+                Process::Read32(base + off + o, v);
+                if (v != 0 && !IsTemplateWord(off + o, v))
+                {
+                    err = "名前の場所に、別のデータが入っています。(何も書いていません)";
+                    return false;
+                }
+            }
+        }
+
+        if (nm.empty())
+        {
+            for (u32 o = 0; o < NAME_CHARS * 2; o += 2)
+                Process::Write16(base + off + o, 0);
+            Process::Write16(base + 0x0E, 0x0001);
+            return true;
+        }
+
+        // 買った直後などの目印 (1,2,3,4) が残っていれば消す (名前つきの実物の行に合わせる)
+        u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+        Process::Read32(base + 0x28, w0);
+        Process::Read32(base + 0x2C, w1);
+        Process::Read32(base + 0x30, w2);
+        Process::Read32(base + 0x34, w3);
+        if (w0 == 1 && w1 == 2 && w2 == 3 && w3 == 4)
+            for (u32 o = 0x28; o < 0x38; o += 4)
+                Process::Write32(base + o, 0);
+
+        for (u32 i = 0; i < NAME_CHARS; ++i)
+            Process::Write16(base + off + i * 2, i < nm.size() ? nm[i] : (u16)0);
+        Process::Write16(base + 0x0E, CurrentAuthorMark());
+        return true;
+    }
+
     // 追加項目を選ぶ画面 (一括変更の画面と同じ作り)。キャンセルなら false
     static bool AskGenSpec(const Category *cat, const std::string &title, GenSpec &sp, u32 &count)
     {
@@ -2094,10 +2304,15 @@ namespace CTRPluginFramework
                 continue;
             }
             u32 cur = sp.use[sel] ? sp.val[sel] : 0, v = 0;
-            if (AskFieldValue(sp.fields[sel], cat, cur, v))
+            if (AskFieldValue(sp.fields[sel], cat, cur, v, true))
             {
-                sp.use[sel] = true;
-                sp.val[sel] = v;
+                if (v == 0 && sp.fields[sel].off == OFF_COUNT)
+                    sp.use[sel] = false;          // 個数が空欄のまま決定 = 指定しない (1個)
+                else
+                {
+                    sp.use[sel] = true;
+                    sp.val[sel] = v;
+                }
             }
         }
         count = SpecValue(&sp, OFF_COUNT, 1);
@@ -2137,6 +2352,50 @@ namespace CTRPluginFramework
 
     static bool NameTableLoaded() { return g_itemNames[0].name != nullptr; }
 
+    // ------------------------------------------------------------
+    //  性別専用の防具 (男せんよう / 女せんよう)。ID順に並べてある。
+    // ------------------------------------------------------------
+    static const u16 MALE_ONLY_ARMOR[] =
+        {
+            0x009A, 0x009C, 0x009E, 0x00A0, 0x00A2, 0x00A4, 0x00A6, 0x00A9, 0x00B3, 0x00C1, 0x00C7, 0x00E9, 0x00EB,
+            0x00ED, 0x00EF, 0x00F1, 0x00F3, 0x00F5, 0x00FD, 0x0101, 0x0107, 0x010D, 0x0113, 0x0115, 0x0131, 0x0133,
+            0x0135, 0x0137, 0x0139, 0x013B, 0x013D, 0x0145, 0x0149, 0x014F, 0x0155, 0x015B, 0x015D, 0x0180, 0x0182,
+            0x0184, 0x0186, 0x0188, 0x01DD, 0x01E9, 0x0258, 0x0259, 0x025A, 0x027E, 0x027F, 0x0280, 0x0286, 0x0287,
+            0x0288, 0x029A, 0x029B, 0x029C, 0x02E3, 0x0301
+        };
+
+    static const u16 FEMALE_ONLY_ARMOR[] =
+        {
+            0x009B, 0x009D, 0x009F, 0x00A1, 0x00A3, 0x00A5, 0x00A7, 0x00AA, 0x00B4, 0x00C2, 0x00EA, 0x00EC, 0x00EE,
+            0x00F0, 0x00F2, 0x00F4, 0x00F6, 0x00FE, 0x0108, 0x010E, 0x0114, 0x0116, 0x0132, 0x0134, 0x0136, 0x0138,
+            0x013A, 0x013C, 0x013E, 0x0146, 0x0150, 0x0156, 0x015C, 0x015E, 0x0178, 0x0179, 0x017A, 0x017B, 0x017C,
+            0x017D, 0x017E, 0x017F, 0x0181, 0x0183, 0x0185, 0x0187, 0x0189, 0x018F, 0x01DE, 0x01EA, 0x01F0, 0x0253,
+            0x0254, 0x025C, 0x025D, 0x025E, 0x0266, 0x0267, 0x0268, 0x0270, 0x0271, 0x0272, 0x027A, 0x027B, 0x028A,
+            0x028B, 0x028C, 0x0296, 0x029E, 0x029F, 0x02A0, 0x02A8, 0x02A9, 0x02AA, 0x02E4, 0x0302
+        };
+
+    static bool IsMaleOnlyArmor(u32 id)
+    {
+        return std::binary_search(MALE_ONLY_ARMOR, MALE_ONLY_ARMOR + sizeof(MALE_ONLY_ARMOR) / sizeof(u16), (u16)id);
+    }
+
+    static bool IsFemaleOnlyArmor(u32 id)
+    {
+        return std::binary_search(FEMALE_ONLY_ARMOR, FEMALE_ONLY_ARMOR + sizeof(FEMALE_ONLY_ARMOR) / sizeof(u16), (u16)id);
+    }
+
+    // 名前だけでは判定できない、未実装・イベント用アイテムのID (手作業の一覧)
+    static const u16 EXTRA_UNIMPL[] =
+    {
+        0x637, 0x64B, 0x72D, 0x845, 0x865, 0x983, 0x984, 0x8D0, 0x9C7, 0x9C9, 0x9CA, 0x9CB, 0x910, 0x91F, 0x936,
+        0x5B0, 0x597, 0x596, 0x594, 0x534, 0x50E, 0x50D, 0x50C, 0x50B, 0x50A, 0x509, 0x508, 0x507, 0x4FF,
+        0x3DE, 0x3D3, 0x3C9, 0x3BE, 0x3B2, 0x3A7, 0x39C, 0x391,
+        0x2B5, 0x2B6, 0x2BA, 0x2C0, 0x2C6, 0x2D0, 0x2D6, 0x2DE, 0x2DF, 0x2E2, 0x2FE, 0x2FF, 0x300, 0x30C, 0x311,
+        0x315, 0x31C, 0x321, 0x323, 0x325, 0x329, 0x32B, 0x32E, 0x331, 0x334, 0x335, 0x367, 0x34A, 0x350, 0x344,
+        0x340, 0x233, 0x215, 0x130, 0x06C, 0x039, 0x02C, 0x01B, 0x010, 0x00F,
+        0x2CE, 0x31A, 0x339, 0x358, 0x37C
+    };
+
     static bool IsUnimplemented(u32 id)
     {
         static std::vector<char> tbl;
@@ -2162,6 +2421,9 @@ namespace CTRPluginFramework
                         tbl[v[k].second] = 1;
                 i = j;
             }
+            for (u16 x : EXTRA_UNIMPL)
+                if (x <= MAX_ID)
+                    tbl[x] = 1;
         }
         return id <= MAX_ID && tbl[id] != 0;
     }
@@ -2280,16 +2542,53 @@ namespace CTRPluginFramework
         return true;
     }
 
-    // カテゴリの中から1つ選ぶ (一覧の先頭に [ID入力] あり)。cat=nullptr のときはID入力だけ
+    static void PoolIds(u32 from, u32 to, std::vector<u32> &out);
+    static void BuildPool(const Category &cat, bool hideUnimpl, std::vector<u32> &pool);
+
+    static bool g_hideUnimpl = false;   // 「未実装を隠す」の状態 (生成の一覧どうしで共有)
+
+    // カテゴリの中から1つ選ぶ (一覧の先頭に [ID入力] と [未実装を隠す] あり)。
+    // cat=nullptr のときはID入力だけ
     static bool PickOne(const Category *cat, const std::string &title, u32 &id)
     {
-        if (cat)
-            return PickFromNames(Utils::Format("%s [%s]", title.c_str(), cat->name), g_itemNames,
-                                 true, cat->idMin, cat->idMax, cat->idMin, id);
-        return AskHexId(title + " (16進)", 0, false, 0, MAX_ID, id);
+        if (!cat)
+            return AskHexId(title + " (16進)", 0, false, 0, MAX_ID, id);
+
+        const std::string full = Utils::Format("%s [%s]", title.c_str(), cat->name);
+        std::vector<u32> pool;
+        for (;;)
+        {
+            BuildPool(*cat, g_hideUnimpl, pool);
+            std::vector<std::string> opts;
+            opts.push_back(Utils::Format("[ID入力] 現在 0x%04X", cat->idMin));
+            opts.push_back(!NameTableLoaded() ? std::string("(名前の表がないので未実装の判定なし)")
+                           : g_hideUnimpl ? std::string("[未実装を隠している → 表示する]")
+                                          : std::string("[未実装を隠す]"));
+            for (u32 v : pool)
+                opts.push_back(Utils::Format("%s (%X)", IdName(v).c_str(), v));
+
+            Keyboard kb(full, opts);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return false;
+            if (sel == 0)
+            {
+                if (AskHexId(full + " (16進)", cat->idMin, true, cat->idMin, cat->idMax, id))
+                    return true;
+                continue;
+            }
+            if (sel == 1)
+            {
+                if (NameTableLoaded())
+                    g_hideUnimpl = !g_hideUnimpl;
+                continue;
+            }
+            id = pool[(size_t)sel - 2];
+            return true;
+        }
     }
 
-    // 1つ生成する流れ (追加項目 → 確認 → 生成 → 続けて編集)
+    // 1つ生成する流れ (追加項目 → 確認 → 生成)
     static void CreateOneFlow(const Container &ct, u32 id)
     {
         if (id > MAX_ID)
@@ -2313,7 +2612,7 @@ namespace CTRPluginFramework
                                            "消耗品などとして追加しますか?", id),
                              DialogType::DialogYesNo))())
                 return;
-            if (!AskValue("個数", false, MAX_COUNT, 1, count) || count == 0)
+            if (!AskValueBlank("個数", false, MAX_COUNT, count) || count == 0)
                 return;
         }
 
@@ -2341,8 +2640,6 @@ namespace CTRPluginFramework
         MessageBox("完了", Utils::Format("%d枠目に追加しました。\n"
                                          "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", slot + 1))();
 
-        if (MessageBox("続けて編集", "個数や追加効果などを編集しますか?", DialogType::DialogYesNo)())
-            EditAt(RowOf(b, (u32)slot), "生成したアイテムの編集", true);
     }
 
     // アイテムを1つ生成: カテゴリを選ぶ → 一覧から選ぶ (ID入力も可)
@@ -2426,7 +2723,7 @@ namespace CTRPluginFramework
             if (!AskGenSpec(cat, Utils::Format("追加項目 [%s] (このあと選ぶ全部に適用)", cat->name), sp, count))
                 return;
         }
-        else if (!AskValue("個数 (このあと選ぶ全部に適用)", false, MAX_COUNT, 1, count) || count == 0)
+        else if (!AskValueBlank("個数 (このあと選ぶ全部に適用)", false, MAX_COUNT, count) || count == 0)
             return;
 
         std::string msg = Utils::Format("[%s / %s] 一覧から選ぶたびに、追加します。(Bで終了)\n",
@@ -2447,7 +2744,7 @@ namespace CTRPluginFramework
         static constexpr u32 PAGE = 20;
         static constexpr size_t HEAD = 5;     // 一覧の先頭の操作行の数
         std::vector<u32> pool;
-        bool hide = false;
+        bool hide = g_hideUnimpl;
         u32 page = 0, made = 0;
         if (cat)
             BuildPool(*cat, hide, pool);
@@ -2507,6 +2804,7 @@ namespace CTRPluginFramework
                     if (NameTableLoaded())
                     {
                         hide = !hide;
+                        g_hideUnimpl = hide;
                         BuildPool(*cat, hide, pool);
                         page = 0;
                     }
@@ -2566,6 +2864,39 @@ namespace CTRPluginFramework
                             keep.push_back(id);
                     ids.swap(keep);
                     what += " (未実装を除外)";
+                }
+            }
+        }
+
+        // 性別専用の防具の除外 (防具のカテゴリを一括生成するとき)
+        if (askUnimpl && !ids.empty() && CommonCategory(ids) == &g_cats[1])
+        {
+            u32 nm = 0, nf = 0;
+            for (u32 id : ids)
+            {
+                if (IsMaleOnlyArmor(id))
+                    ++nm;
+                else if (IsFemaleOnlyArmor(id))
+                    ++nf;
+            }
+            if (nm > 0 || nf > 0)
+            {
+                std::vector<std::string> go;
+                go.push_back("除外しない");
+                go.push_back(Utils::Format("男専用防具を除外 (%u件)", nm));
+                go.push_back(Utils::Format("女専用防具を除外 (%u件)", nf));
+                Keyboard kg(Utils::Format("性別専用の防具 (対象 %u 件中)", (u32)ids.size()), go);
+                const int gi = kg.Open();
+                if (gi < 0)
+                    return;                 // Bで中止 (まだ何も作っていない)
+                if (gi == 1 || gi == 2)
+                {
+                    std::vector<u32> keep;
+                    for (u32 id : ids)
+                        if (!(gi == 1 ? IsMaleOnlyArmor(id) : IsFemaleOnlyArmor(id)))
+                            keep.push_back(id);
+                    ids.swap(keep);
+                    what += (gi == 1) ? " (男専用を除外)" : " (女専用を除外)";
                 }
             }
         }
@@ -2658,7 +2989,7 @@ namespace CTRPluginFramework
             MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
             return;
         }
-        if (!AskValue("個数(枠の数)", false, ct->slots, 1, n) || n == 0)
+        if (!AskValueBlank("個数(枠の数)", false, ct->slots, n) || n == 0)
             return;
         std::vector<u32> ids(n, id);
         RunBulk(*ct, ids, Utils::Format("%s を %u 個", IdName(id).c_str(), n), false);
@@ -2736,6 +3067,12 @@ namespace CTRPluginFramework
         modes.push_back(all ? std::string("全てのアイテムを削除")
                             : Utils::Format("%sを全て削除", g_cats[ci].name));
         modes.push_back("未実装アイテムだけ削除");
+        const bool isArmor = (!all && &g_cats[ci] == &g_cats[1]);
+        if (isArmor)
+        {
+            modes.push_back("男専用防具だけ削除");
+            modes.push_back("女専用防具だけ削除");
+        }
         Keyboard kmo("削除する対象", modes);
         const int mo = kmo.Open();
         if (mo < 0)
@@ -2763,6 +3100,10 @@ namespace CTRPluginFramework
             bool hit = all || (id >= g_cats[ci].idMin && id <= g_cats[ci].idMax);
             if (hit && mo == 1 && !IsUnimplemented(id))
                 hit = false;
+            if (hit && mo == 2 && !IsMaleOnlyArmor(id))
+                hit = false;
+            if (hit && mo == 3 && !IsFemaleOnlyArmor(id))
+                hit = false;
             if (!hit)
                 continue;
             if (IsEquipped(b, s))
@@ -2780,7 +3121,9 @@ namespace CTRPluginFramework
 
         std::string msg = Utils::Format("%s / %s\n%s\n%u 件を削除します。(残り %u 件)\n",
                                         c->name, all ? "すべて" : g_cats[ci].name,
-                                        mo == 1 ? "未実装アイテムのみ" : "すべて",
+                                        mo == 1 ? "未実装アイテムのみ"
+                                        : mo == 2 ? "男専用防具のみ"
+                                        : mo == 3 ? "女専用防具のみ" : "すべて",
                                         (u32)del.size(), (u32)(b.order.size() - del.size()));
         if (protectedN)
             msg += Utils::Format("装備中の %u 件は残します。\n", protectedN);
@@ -3947,247 +4290,6 @@ namespace CTRPluginFramework
         }
     }
 
-    // ============================================================
-    //  最後のセーブ位置の記憶と復元
-    //  ・セーブ書き込み(cAppSaveTask_SaveWrite)の初期化の瞬間に、フィールドで確認の取れた最後の座標を、
-    //    スロットごとに記録する (セーブ画面が出ている間は、ゲームが座標の一部を別の用途に使うため、
-    //    その瞬間には読まず、0.1秒おきに覚えておいた値を使う)
-    //  ・起動してタイトルからフィールドが始まったとき、またはプレイヤー切り替えのあとに、
-    //    そのスロットの記録を、既存の「位置を書き込む仕組み」(PosTick) に渡して復元する
-    //  実機GDBで確認済み: SaveWrite 初期化の検出 (セーブ1回につき1回)、フィールドでの座標の読み取り
-    //  未確認: 復元のタイミング (既存の PosTick の動作に依存)
-    // ============================================================
-    namespace LastPos
-    {
-        static constexpr bool AUTO_RESTORE = true;
-        #define LASTPOS_FILE "/fll_lastpos.txt"
-
-        static constexpr u32 SAVEWRITE_INIT_SLOT = 0x66C670;   // cAppSaveTask_SaveWrite の vtable[2] (初期化)
-        static constexpr u32 FN_SAVEWRITE_INIT   = 0x3ADB74;
-        static constexpr u32 SLOT_VAR_ADDR       = 0x71BA40;   // 現在のスロット (0〜2)
-        static constexpr u32 FLOW_STATE_ADDR     = 0x7208DC + 48;
-        static constexpr u32 FLOW_IDLE           = 1;
-        static constexpr u32 FLOW_TITLE          = 8;
-        static constexpr u32 FLOW_FIELD          = 9;
-
-        struct Rec { u32 valid; u32 area; float x, y, z; };
-        static Rec g_rec[3] = { { 0, 0, 0.0f, 0.0f, 0.0f }, { 0, 0, 0.0f, 0.0f, 0.0f }, { 0, 0, 0.0f, 0.0f, 0.0f } };
-
-        // フィールドで確認の取れた最後の座標 (0.1秒おきに更新)
-        static volatile u32   g_lgValid = 0;
-        static volatile u32   g_lgArea  = 0;
-        static volatile float g_lg[3]   = { 0.0f, 0.0f, 0.0f };
-
-        // セーブの瞬間に確定した記録 (ゲームのスレッドで書き、プラグインのスレッドでファイルへ書く)
-        static volatile u32   g_pendValid = 0;
-        static volatile u32   g_pendSlot  = 0;
-        static volatile u32   g_pendArea  = 0;
-        static volatile float g_pend[3]   = { 0.0f, 0.0f, 0.0f };
-
-        static u32  g_tick = 0;
-        static bool g_sawTitleOrIdle = false;
-
-        static void LoadFile(void)
-        {
-        #if WARP_POINTS_TO_FILE
-            File f;
-            if (File::Open(f, LASTPOS_FILE, File::READ) != 0)
-                return;
-            const u32 size = (u32)f.GetSize();
-            if (size == 0 || size > 0x20000)
-            {
-                f.Close();
-                return;
-            }
-            std::string text(size, '\0');
-            f.Read(&text[0], size);
-            f.Close();
-
-            size_t pos = 0;
-            while (pos < text.size())
-            {
-                size_t end = text.find('\n', pos);
-                if (end == std::string::npos)
-                    end = text.size();
-                std::string line = text.substr(pos, end - pos);
-                pos = end + 1;
-                if (!line.empty() && line[line.size() - 1] == '\r')
-                    line.erase(line.size() - 1);
-
-                std::string col[5];
-                size_t s0 = 0;
-                int n = 0;
-                while (n < 4)
-                {
-                    const size_t t = line.find('\t', s0);
-                    if (t == std::string::npos)
-                        break;
-                    col[n++] = line.substr(s0, t - s0);
-                    s0 = t + 1;
-                }
-                if (n != 4)
-                    continue;
-                col[4] = line.substr(s0);
-
-                const u32 slot = (u32)strtoul(col[0].c_str(), nullptr, 10);
-                if (slot > 2)
-                    continue;
-                Rec &r = g_rec[slot];       // 後の行が、前の行を上書きする
-                r.valid = 1;
-                r.area  = (u32)strtoul(col[1].c_str(), nullptr, 10);
-                r.x     = BitsFloat((u32)strtoul(col[2].c_str(), nullptr, 16));
-                r.y     = BitsFloat((u32)strtoul(col[3].c_str(), nullptr, 16));
-                r.z     = BitsFloat((u32)strtoul(col[4].c_str(), nullptr, 16));
-            }
-        #endif
-        }
-
-        static void AppendFile(u32 slot, const Rec &r)
-        {
-        #if WARP_POINTS_TO_FILE
-            File f;
-            if (File::Open(f, LASTPOS_FILE, File::WRITE | File::CREATE | File::APPEND) == 0)
-            {
-                f.WriteLine(Utils::Format("%u\t%u\t%08X\t%08X\t%08X", slot, r.area,
-                                          FloatBits(r.x), FloatBits(r.y), FloatBits(r.z)));
-                f.Close();
-            }
-            else
-                OSD::Notify("lastpos: file open failed (memory only)");
-        #else
-            (void)slot; (void)r;
-        #endif
-        }
-
-        // セーブ書き込みの初期化の差し替え (ゲームのスレッドで、セーブのたびに1回呼ばれる)
-        static void SaveWriteInitWrapper(u32 self)
-        {
-            const int slot = (int)(s8)(*(volatile u8 *)SLOT_VAR_ADDR);
-            if (slot >= 0 && slot <= 2 && g_lgValid)
-            {
-                g_pendArea = g_lgArea;
-                g_pend[0]  = g_lg[0];
-                g_pend[1]  = g_lg[1];
-                g_pend[2]  = g_lg[2];
-                g_pendSlot = (u32)slot;
-                g_pendValid = 1;
-            }
-            ((void (*)(u32))FN_SAVEWRITE_INIT)(self);
-        }
-
-        // フィールドで確認の取れた座標を覚える
-        static void Sample(void)
-        {
-            if (g_warpTask == 0)
-                return;
-            const u32 obj = PosPlayerObj();
-            if (!obj)
-                return;
-            u16 area = 0;
-            if (!Process::Read16(g_warpTask + 0x6B2, area) || area == 0xFFFF)
-                return;
-            g_lgArea = area;
-            g_lg[0]  = *(volatile float *)(obj + 0x7C);
-            g_lg[1]  = *(volatile float *)(obj + 0x80);
-            g_lg[2]  = *(volatile float *)(obj + 0x84);
-            g_lgValid = 1;
-        }
-
-        // 既存の位置書き込みの仕組み (PosTick) に、復元を頼む。
-        // エリアの読み込みを待って、ゲームが初期位置に置いたあとに、座標を書く (ワープはしない)
-        static void RequestRestore(const Rec &r)
-        {
-            g_posMode     = 0;
-            g_posXYZ[0]   = r.x;
-            g_posXYZ[1]   = r.y;
-            g_posXYZ[2]   = r.z;
-            g_posArea     = r.area;
-            g_posOldObj   = 0;
-            g_posFrames   = 0;
-            g_posSawGap   = 0;
-            g_posHold     = 0;
-            PosResetDetect();
-            g_recN        = 0;
-            g_posMode     = 1;
-        }
-
-        static void Setup(void)
-        {
-            LoadFile();
-            if (AUTO_RESTORE)
-                Process::Write32(SAVEWRITE_INIT_SLOT, (u32)&SaveWriteInitWrapper);
-        }
-
-        // menu->Callback から呼ばれる (6フレームに1回だけ調べる)
-        static void OnFrame(void)
-        {
-            if (!AUTO_RESTORE)
-                return;
-            if ((++g_tick % 6) != 0)
-                return;
-
-            u32 flow = 0;
-            Process::Read32(FLOW_STATE_ADDR, flow);
-
-            // 1) フィールドの間、確認の取れた座標を覚えておく
-            if (flow == FLOW_FIELD)
-                Sample();
-
-            // 2) セーブの記録を、メモリとファイルに残す
-            if (g_pendValid)
-            {
-                const u32 slot = g_pendSlot;
-                Rec r;
-                r.valid = 1;
-                r.area  = g_pendArea;
-                r.x     = g_pend[0];
-                r.y     = g_pend[1];
-                r.z     = g_pend[2];
-                g_pendValid = 0;
-                if (slot <= 2)
-                {
-                    g_rec[slot] = r;
-                    AppendFile(slot, r);
-                }
-            }
-
-            // 3) タイトル(または切り替え中のIDLE)からフィールドが始まったら、そのスロットの位置を復元する
-            //    (エリアの移動では、フローの状態はタイトルやIDLEを通らないので、復元されない)
-            if (flow == FLOW_TITLE || flow == FLOW_IDLE)
-                g_sawTitleOrIdle = true;
-            else if (flow == FLOW_FIELD && g_sawTitleOrIdle)
-            {
-                g_sawTitleOrIdle = false;
-                g_lgValid = 0;      // 前のフィールドの座標は使わない
-                const int slot = (int)(s8)(*(volatile u8 *)SLOT_VAR_ADDR);
-                if (slot >= 0 && slot <= 2 && g_rec[slot].valid)
-                    RequestRestore(g_rec[slot]);
-            }
-        }
-
-        // メニューから、最後のセーブ位置へ手動で移動する (自動で戻らなかったときの保険)
-        static void RestoreEntry(MenuEntry *entry)
-        {
-            (void)entry;
-            const int slot = (int)(s8)(*(volatile u8 *)SLOT_VAR_ADDR);
-            if (slot < 0 || slot > 2 || !g_rec[slot].valid)
-            {
-                MessageBox("最後のセーブ位置", "このプレイヤーのセーブ位置の記録がありません。")();
-                return;
-            }
-            if (!InstallWarpHook())
-                return;
-            SavedPos p;
-            p.name = "last save";
-            p.area = g_rec[slot].area;
-            p.x = g_rec[slot].x;
-            p.y = g_rec[slot].y;
-            p.z = g_rec[slot].z;
-            RequestSavedPos(p);
-        }
-    }
-
-
 
     // ------------------------------------------------------------
     //  魔法使い: チャージ技をモーションなしで出す  【実験】
@@ -4340,6 +4442,9 @@ namespace CTRPluginFramework
         v = g_mageTmax;
         if (MageAskNumber("判定を作る最大フレーム (10〜600)\n魔法が途中で消えるなら増やす。", v, 10, 600))
             g_mageTmax = v;
+        v = g_mageStagger;
+        if (MageAskNumber("同時に出す技のずらし (0〜5フレーム)\n選んだ技を、1つずつ、このフレーム数ずつ遅らせて出す。\n0 = 全部同じフレーム。全部選ぶと一部が出ないときは、1〜2にする。", v, 0, 5))
+            g_mageStagger = v;
         v = g_mageUltTmax;
         if (MageAskNumber("必殺技の最大フレーム (10〜1800)\n隕石などが途中で止まるなら増やす。降りすぎるなら減らす。", v, 10, 1800))
             g_mageUltTmax = v;
@@ -4623,6 +4728,446 @@ namespace CTRPluginFramework
     }
 
     // ------------------------------------------------------------
+    //  固有効果を変更 (武器・防具・ライフ道具)
+    //  固有効果は、かばんの1つ1つのアイテムではなく、ゲームがメモリに読み込んでいる
+    //  「データ表」(1アイテム1行。行の決まった位置の2バイトが効果ID)で決まる。
+    //  この表をメモリ上で書き換える。同じIDのアイテムすべてに効き、自分のゲームの中だけで有効。
+    //  ゲームを終了すると元に戻る。表の場所は、メモリを検索して見つける。
+    //   武器: 行 = ID (0x0000-0x008F)、1行24バイト、行の+14
+    //   防具: 行 = ID - 0x99 (0x0099-0x0386)、1行48バイト、行の+38
+    //  ライフ道具: ゲームが持つ「表オブジェクト」から表の場所をたどる (メモリ検索は不要)。
+    //    行 = ID - 0x387 (0x0387-0x0435)、行の+2。
+    // ------------------------------------------------------------
+    static constexpr u32 INN_MAGIC      = 0x1D038013u;   // 表ファイルの先頭の目印
+    static constexpr u32 INN_ROWS_OFF_W = 0x110;
+    static constexpr u32 INN_ROWS_OFF_A = 0x14C;
+    static constexpr u32 INN_EFFECT_MAX = 0x240;         // 効果IDの最大
+    static constexpr int INN_CATS       = 3;
+    static constexpr u32 INN_MAX_ITEMS  = 0x400;         // 1カテゴリの最大アイテム数
+
+    // 照合用: 固有効果より前にある列の値 (効果を書き換えても変わらない)
+    static const u8 s_w_0[14] = { 0x06, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x65, 0x02, 0xE8, 0x03 };
+    static const u8 s_w_1[14] = { 0x0C, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x66, 0x02, 0xE8, 0x03 };
+    static const u8 s_w_81[14] = { 0x78, 0x00, 0x10, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2C, 0x04, 0xE8, 0x03 };
+    static const u8 s_w_143[14] = { 0x00, 0x00, 0x02, 0x00, 0x64, 0x00, 0x01, 0x00, 0x50, 0x00, 0x4C, 0x06, 0xE8, 0x03 };
+    static const u8 s_a_0[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_1[36] = { 0x00, 0x00, 0x80, 0x3F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_150[36] = { 0x00, 0x00, 0x80, 0x3F, 0x16, 0x00, 0x16, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_300[36] = { 0x00, 0x00, 0x80, 0x3F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_500[36] = { 0x00, 0x00, 0x80, 0x3F, 0x22, 0x00, 0x11, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+    static const u8 s_a_749[36] = { 0x00, 0x00, 0x80, 0x3F, 0x06, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00 };
+
+    struct InnateRow { u32 row; const u8 *bytes; };
+    static const InnateRow g_innSigW[] =
+    {
+        { 0, s_w_0 },
+        { 1, s_w_1 },
+        { 81, s_w_81 },
+        { 143, s_w_143 }
+    };
+    static const InnateRow g_innSigA[] =
+    {
+        { 0, s_a_0 },
+        { 1, s_a_1 },
+        { 150, s_a_150 },
+        { 300, s_a_300 },
+        { 500, s_a_500 },
+        { 749, s_a_749 }
+    };
+
+    struct InnateCat
+    {
+        const char       *name;
+        u32               idMin, idMax;      // アイテムIDの範囲 (行 = id - idMin)
+        u32               rowsOff;           // 表の先頭から最初の行まで
+        u32               rowSize;
+        u32               effOff;            // 行の中の固有効果の位置 (u16)
+        u32               sigLen;            // 照合するバイト数
+        const InnateRow  *sigs;
+        int               sigN;
+    };
+
+    static const InnateCat g_innCats[INN_CATS] =
+    {
+        { "武器", 0x0000, 0x008F, INN_ROWS_OFF_W, 24, 14, 14, g_innSigW, 4 },
+        { "防具", 0x0099, 0x0386, INN_ROWS_OFF_A, 48, 38, 36, g_innSigA, 6 },
+        { "ライフ道具", 0x0387, 0x0435, 0, 0, 2, 0, nullptr, 0 },   // 行サイズは実行中に読む
+    };
+
+    static u32  g_innTab[INN_CATS][8];                          // 見つかった表(コピー)の先頭アドレス
+    static int  g_innTabN[INN_CATS] = { 0, 0, 0 };
+    static u32  g_innDynRowSize = 0;                            // ライフ道具の表の行サイズ (実行中に読む)
+    static std::string g_innErr;                                // ライフ道具の表が見つからないときの理由
+    static u16  g_innOrig[INN_CATS][INN_MAX_ITEMS];             // 変更前の効果ID
+    static bool g_innHas[INN_CATS][INN_MAX_ITEMS];              // 変更済みか
+
+    static u32 InnCount(const InnateCat &c) { return c.idMax - c.idMin + 1; }
+
+    static u32 InnEffAddr(const InnateCat &c, u32 base, u32 id)
+    {
+        const u32 rs = c.rowSize ? c.rowSize : g_innDynRowSize;
+        return base + c.rowsOff + rs * (id - c.idMin) + c.effOff;
+    }
+
+    static bool InnIsTable(const InnateCat &c, u32 base)
+    {
+        u32 v = 0;
+        if (!Process::Read32(base, v) || v != INN_MAGIC)
+            return false;
+        for (int k = 0; k < c.sigN; ++k)
+        {
+            const u32 a = base + c.rowsOff + c.rowSize * c.sigs[k].row;
+            const u8 *want = c.sigs[k].bytes;
+            u32 i = 0;
+            for (; i + 4 <= c.sigLen; i += 4)
+            {
+                u32 x = 0;
+                if (!Process::Read32(a + i, x))
+                    return false;
+                const u32 w = (u32)want[i] | ((u32)want[i + 1] << 8) | ((u32)want[i + 2] << 16) | ((u32)want[i + 3] << 24);
+                if (x != w)
+                    return false;
+            }
+            if (i + 2 <= c.sigLen)
+            {
+                u16 x = 0;
+                if (!Process::Read16(a + i, x))
+                    return false;
+                const u16 w = (u16)((u32)want[i] | ((u32)want[i + 1] << 8));
+                if (x != w)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    static void InnAdd(int ci, u32 base)
+    {
+        for (int i = 0; i < g_innTabN[ci]; ++i)
+            if (g_innTab[ci][i] == base)
+                return;
+        if (g_innTabN[ci] < 8)
+            g_innTab[ci][g_innTabN[ci]++] = base;
+    }
+
+    // 読めない所はページ単位で飛ばしながら、16バイトおきに目印を探す
+    // 見つかった表は、武器・防具のどちらのものか調べて、それぞれに記録する
+    static void InnScanPass(u32 start, u32 end, u32 off)
+    {
+        u32 a = start + off;
+        while (a < end)
+        {
+            u32 v = 0;
+            if (!Process::Read32(a, v))
+            {
+                a = ((a | 0xFFFu) + 1) + off;
+                continue;
+            }
+            if (v == INN_MAGIC)
+                for (int ci = 0; ci < INN_CATS; ++ci)
+                    if (g_innCats[ci].sigN > 0 && InnIsTable(g_innCats[ci], a))
+                        InnAdd(ci, a);
+            a += 16;
+        }
+    }
+
+    // ライフ道具: ゲームの「データ管理」(0x6DCA1C) が、種類ごとの表オブジェクト(60バイト)を持つ。
+    // ライフ道具の種類は2で、表5 = 管理 + 60*5。ゲーム自身が固有効果を読むときと同じ経路でたどる。
+    static constexpr u32 INN_MGR        = 0x006DCA1Cu;
+    static constexpr u32 INN_TAB_STRIDE = 60;
+    static constexpr u32 INN_TYPEBASE   = 720;           // 管理 + 720 + 種類*4 = その種類の先頭ID
+    static constexpr u32 INN_VTABLE     = 0x031C6040u;   // 表オブジェクトの目印
+
+    static bool InnLocateTools(u32 &rowsBase, u32 &rowSize)
+    {
+        const InnateCat &c = g_innCats[2];
+        const u32 obj = INN_MGR + INN_TAB_STRIDE * 5;
+        u32 vt = 0, p = 0, cnt = 0, rs = 0, rb = 0, tb = 0;
+        u8 st = 0;
+        if (!Process::Read32(obj, vt) || vt != INN_VTABLE || !Process::Read8(obj + 20, st) || st != 2)
+        {
+            g_innErr = "表がまだ読み込まれていません。\nゲームの中で、ライフ道具を装備してから、もう一度開いてください。";
+            return false;
+        }
+        if (!Process::Read32(obj + 4, p) || p == 0 || !Process::Read32(p, cnt) || !Process::Read32(p + 4, rs) ||
+            !Process::Read32(p + 8, rb) || !Process::Read32(INN_MGR + INN_TYPEBASE + 2 * 4, tb))
+        {
+            g_innErr = "表の情報を読めませんでした。";
+            return false;
+        }
+        if (tb != c.idMin || rs < 4 || rs > 0x200 || cnt < InnCount(c) || rb == 0)
+        {
+            g_innErr = Utils::Format("表の形が想定と違います。\n先頭ID=0x%X (想定0x%X)\n行数=%u (想定%u以上)\n行サイズ=%u",
+                                     tb, c.idMin, cnt, InnCount(c), rs);
+            return false;
+        }
+        // 教えてもらった道具の固有効果と照合する (すでに変更した道具は照合しない)
+        static const struct { u32 id, eff; } chk[] =
+        {
+            { 0x038C, 0x00B1 }, { 0x03A6, 0x014F }, { 0x03F4, 0x01B0 },
+            { 0x03F6, 0x01AE }, { 0x03FD, 0x0198 }, { 0x040A, 0x0195 },
+        };
+        for (const auto &k : chk)
+        {
+            if (g_innHas[2][k.id - c.idMin])
+                continue;
+            u16 v = 0;
+            if (!Process::Read16(rb + rs * (k.id - c.idMin) + c.effOff, v) || v != k.eff)
+            {
+                g_innErr = Utils::Format("表の中身が想定と違います。\n%s: 想定0x%04X 実際0x%04X\n(行サイズ=%u)",
+                                         IdName(k.id).c_str(), k.eff, v, rs);
+                return false;
+            }
+        }
+        rowsBase = rb;
+        rowSize  = rs;
+        return true;
+    }
+
+    // 0=やめた 1=見つかった 2=見つからなかった
+    static int InnFind(int ci)
+    {
+        if (ci == 2)                         // ライフ道具: 検索は不要 (表オブジェクトからたどる)
+        {
+            u32 rb = 0, rs = 0;
+            if (!InnLocateTools(rb, rs))
+                return 2;
+            g_innTab[2][0]  = rb;
+            g_innTabN[2]    = 1;
+            g_innDynRowSize = rs;
+            return 1;
+        }
+        for (int c = 0; c < 2; ++c)            // 前回見つけた場所がまだ有効なものだけ残す
+        {
+            int k = 0;
+            for (int i = 0; i < g_innTabN[c]; ++i)
+                if (InnIsTable(g_innCats[c], g_innTab[c][i]))
+                    g_innTab[c][k++] = g_innTab[c][i];
+            g_innTabN[c] = k;
+        }
+        if (g_innTabN[ci] > 0)
+            return 1;
+
+        if (!(MessageBox("データの検索",
+                         "メモリから固有効果のデータ表を探します。\n数十秒かかることがあります。\n(最初の1回だけです)",
+                         DialogType::DialogYesNo))())
+            return 0;
+
+        static const u32 ranges[2][2] = { { 0x08000000u, 0x10000000u }, { 0x14000000u, 0x1C000000u } };
+        for (u32 off = 0; off < 16 && g_innTabN[ci] == 0; off += 4)
+            for (int r = 0; r < 2; ++r)
+                InnScanPass(ranges[r][0], ranges[r][1], off);
+        return g_innTabN[ci] > 0 ? 1 : 2;
+    }
+
+    static bool InnRead(int ci, u32 id, u16 &out)
+    {
+        return g_innTabN[ci] > 0 && Process::Read16(InnEffAddr(g_innCats[ci], g_innTab[ci][0], id), out);
+    }
+
+    static bool InnWrite(int ci, u32 id, u16 eff)
+    {
+        bool ok = false;
+        for (int i = 0; i < g_innTabN[ci]; ++i)
+        {
+            const u32 a = InnEffAddr(g_innCats[ci], g_innTab[ci][i], id);
+            u16 back = 0;
+            if (Process::Write16(a, eff) && Process::Read16(a, back) && back == eff)
+                ok = true;
+        }
+        return ok;
+    }
+
+    // 1件の効果を変える (元の値を保存しておく)。変更できたら true
+    static bool InnSet(int ci, u32 id, u16 eff)
+    {
+        const InnateCat &c = g_innCats[ci];
+        const u32 k = id - c.idMin;
+        u16 cur = 0;
+        InnRead(ci, id, cur);
+        if (!g_innHas[ci][k])
+        {
+            g_innOrig[ci][k] = cur;
+            g_innHas[ci][k]  = true;
+        }
+        if (!InnWrite(ci, id, eff))
+            return false;
+        if (eff == g_innOrig[ci][k])
+            g_innHas[ci][k] = false;
+        return true;
+    }
+
+    static std::string InnEffName(u32 id)
+    {
+        const char *n = LookupName(g_effectNames, id);
+        return n ? std::string(n) : Utils::Format("0x%04X", id);
+    }
+
+    // カテゴリ全体 / ID範囲を、同じ固有効果にまとめて変える
+    static void InnBulk(int ci)
+    {
+        const InnateCat &c = g_innCats[ci];
+        u32 from = c.idMin, to = c.idMax;
+
+        std::vector<std::string> sc;
+        sc.push_back(Utils::Format("%sすべて (%u件)", c.name, InnCount(c)));
+        sc.push_back("ID範囲を指定する");
+        Keyboard ks(Utils::Format("%sの固有効果を一括変更: 対象", c.name), sc);
+        const int s = ks.Open();
+        if (s < 0)
+            return;
+        if (s == 1)
+        {
+            if (!PickFromNames(Utils::Format("開始 [%s]", c.name), g_itemNames, true, c.idMin, c.idMax, c.idMin, from))
+                return;
+            if (!PickFromNames(Utils::Format("終了 [%s]", c.name), g_itemNames, true, from, c.idMax, c.idMax, to))
+                return;
+        }
+
+        std::vector<std::string> fl;
+        fl.push_back("すべて");
+        fl.push_back("今、固有効果が付いているものだけ");
+        fl.push_back("今、固有効果が「なし」のものだけ");
+        Keyboard kf("どれを変更しますか?", fl);
+        const int f = kf.Open();
+        if (f < 0)
+            return;
+
+        u32 eff = 0;
+        if (!PickFromNames(Utils::Format("固有効果 [%s 一括]", c.name), g_effectNames, false, 0, 0, 0, eff))
+            return;
+        if (eff > INN_EFFECT_MAX)
+        {
+            MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
+            return;
+        }
+
+        std::vector<u32> ids;
+        for (u32 id = from; id <= to; ++id)
+        {
+            u16 cur = 0;
+            if (!InnRead(ci, id, cur))
+                continue;
+            if (f == 1 && cur == 0)
+                continue;
+            if (f == 2 && cur != 0)
+                continue;
+            ids.push_back(id);
+        }
+        if (ids.empty())
+        {
+            MessageBox("対象なし", "条件に合うものがありません。")();
+            return;
+        }
+        if (!(MessageBox("確認",
+                         Utils::Format("%s %s から %s までのうち %u件の\n固有効果を\n%s\nにします。よろしいですか?",
+                                       c.name, IdName(from).c_str(), IdName(to).c_str(), (u32)ids.size(),
+                                       InnEffName(eff).c_str()),
+                         DialogType::DialogYesNo))())
+            return;
+
+        u32 n = 0;
+        for (u32 id : ids)
+            if (InnSet(ci, id, (u16)eff))
+                ++n;
+        MessageBox("変更しました",
+                   Utils::Format("%u 件の固有効果を\n%s\nにしました。\n装備を つけ直すと反映されます。", n,
+                                 InnEffName(eff).c_str()))();
+    }
+
+    static void InnateEditEntry(int ci)
+    {
+        const InnateCat &c = g_innCats[ci];
+        const int found = InnFind(ci);
+        if (found == 0)
+            return;
+        if (found == 2)
+        {
+            MessageBox("見つかりません",
+                       ci == 2 ? g_innErr : Utils::Format("%sのデータ表がメモリ上に見つかりませんでした。", c.name))();
+            return;
+        }
+
+        const u32 cnt = InnCount(c);
+        for (;;)
+        {
+            std::vector<std::string> rows;
+            rows.push_back("[カテゴリ全体を一括変更]");
+            rows.push_back("[変更をすべて元に戻す]");
+            for (u32 id = c.idMin; id <= c.idMax; ++id)
+            {
+                u16 e = 0;
+                InnRead(ci, id, e);
+                std::string s = IdName(id) + ": " + InnEffName(e);
+                if (g_innHas[ci][id - c.idMin])
+                    s += " *";
+                rows.push_back(s);
+            }
+            Keyboard kb(Utils::Format("%sの固有効果を変更 (*は変更済み。Bで戻る)", c.name), rows);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return;
+
+            if (sel == 0)
+            {
+                InnBulk(ci);
+                continue;
+            }
+            if (sel == 1)
+            {
+                u32 n = 0;
+                for (u32 k = 0; k < cnt; ++k)
+                    if (g_innHas[ci][k] && InnWrite(ci, c.idMin + k, g_innOrig[ci][k]))
+                    {
+                        g_innHas[ci][k] = false;
+                        ++n;
+                    }
+                MessageBox("元に戻しました", Utils::Format("%u 件を元に戻しました。", n))();
+                continue;
+            }
+
+            const u32 id = c.idMin + (u32)(sel - 2);
+            u16 cur = 0;
+            InnRead(ci, id, cur);
+            u32 pick = 0;
+            if (!PickFromNames(Utils::Format("固有効果 [%s]", IdName(id).c_str()), g_effectNames,
+                               false, 0, 0, cur, pick))
+                continue;
+            if (pick > INN_EFFECT_MAX)
+            {
+                MessageBox("範囲外", Utils::Format("効果IDは 0x%04X までです。", INN_EFFECT_MAX))();
+                continue;
+            }
+            if (!InnSet(ci, id, (u16)pick))
+            {
+                MessageBox("失敗", "書き込めませんでした。")();
+                continue;
+            }
+            MessageBox("変更しました",
+                       IdName(id) + " の固有効果を\n" + InnEffName(pick) +
+                       "\nにしました。\n装備をつけ直すと反映されます。")();
+        }
+    }
+
+    // メニューの項目は「固有効果変更」の1つだけ。押すと、武器 / 防具 / ライフ道具 を選ぶ。
+    // Bで、カテゴリの選択に戻る。カテゴリの選択でBを押すと終了。
+    static void InnateMainEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        for (;;)
+        {
+            std::vector<std::string> cats;
+            for (int i = 0; i < INN_CATS; ++i)
+                cats.push_back(g_innCats[i].name);
+            Keyboard kb("固有効果を変更するカテゴリを選択", cats);
+            const int sel = kb.Open();
+            if (sel < 0)
+                return;
+            InnateEditEntry(sel);
+        }
+    }
+
+    // ------------------------------------------------------------
     //  CTRPF 必須関数
     // ------------------------------------------------------------
     void PatchProcess(FwkSettings &settings)
@@ -4643,11 +5188,6 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-
-        // 最後のセーブ位置の記憶と復元 (位置を書き込む仕組みのフックも、ここで入れる)
-        if (LastPos::AUTO_RESTORE)
-            InstallWarpHook();
-        LastPos::Setup();
         
 menu->Append(new MenuEntry("エリアワープ", nullptr, WarpEntry,
                                    "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
@@ -4719,15 +5259,20 @@ menu->Append(new MenuEntry("位置ワープの記録を保存 (開発用)", null
         AddRecommended(menu);
         AddMageRapid(menu);
 
-        menu->Append(new MenuEntry("最後のセーブ位置へ移動", nullptr, LastPos::RestoreEntry,
-                                   "このプレイヤーが最後にセーブした位置へ移動します。\n"
-                                   "(起動時は自動で戻ります。戻らなかったときの保険です)"));
+        // 固有効果変更 (メニューの一番下。押すと 武器 / 防具 / ライフ道具 を選ぶ)
+        menu->Append(new MenuEntry("固有効果変更", nullptr, InnateMainEntry,
+                                   "武器・防具・ライフ道具の固有効果を、メモリ上のデータ表を書き換えて変更します。\n"
+                                   "押すと、カテゴリ(武器 / 防具 / ライフ道具)を選べます。\n"
+                                   "1つずつ変更するほか、カテゴリ全体 / ID範囲を同じ効果にまとめて変更できます。\n"
+                                   "同じIDのアイテムすべてに効きます。自分のゲームの中だけで有効で、ゲームを終了すると元に戻ります。\n"
+                                   "変更したあと、装備をつけ直すと反映されます。\n"
+                                   "ライフ道具は、ゲームの中で一度装備してから開いてください。"));
 
         // プレイヤー切り替えは、アクセスしやすいように一番下に置く
 menu->Append(new MenuEntry("プレイヤー切り替え", nullptr, PlayerSwitch::Entry,
                                    "フィールドで実行します。タイトルを経由せず、選んだプレイヤーのデータに切り替えます。\n"
                                    "使う前に、セーブのバックアップを取ってください。"));
-        menu->Callback(LastPos::OnFrame);
+
         menu->Callback(PlayerSwitch::OnFrame);
         menu->Callback(PosNotifyFrame);
         
