@@ -327,6 +327,7 @@ extern "C"
     volatile u32 g_mageCntTick  = 0;      // 診断: アクション更新フックが、プレイヤーで呼ばれた回数
     volatile u32 g_mageCntChan  = 0;      // 診断: 入力更新フックが呼ばれた回数
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
+    volatile float g_mageRate   = 1.0f;   // ゴーストの時間の進み方 (1フレームあたりの時間の増え方。AR準拠の実測に合わせる)
     volatile u32 g_mageStagger  = 1;      // 同時に選んだ技を、1つずつ何フレームずつ遅らせて出すか (0 = 全部同じフレーム)
     volatile u32 g_mageUltTmax  = 600;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
     volatile u32 g_mageBudget   = 48;     // 1フレームに魔法の判定を作る関数を呼ぶ回数の上限 (重くなりすぎないように)
@@ -614,7 +615,7 @@ extern "C"
                         if (tt < 0 || (u32)tt > lim)
                             continue;
                         *(volatile u32 *)(K + 8)      = MageIdAt(n);
-                        *(volatile float *)(K + 0xC4) = (float)tt;
+                        *(volatile float *)(K + 0xC4) = (float)tt * g_mageRate;
                         jp_callBody(K);                    // 魔法の判定・エフェクトを作る本体
                     }
                 }
@@ -4163,6 +4164,9 @@ namespace CTRPluginFramework
         v = g_mageTmax;
         if (MageAskNumber("判定を作る最大フレーム (10〜600)\n魔法が途中で消えるなら増やす。", v, 10, 600))
             g_mageTmax = v;
+        v = (u32)(g_mageRate * 100.0f + 0.5f);
+        if (MageAskNumber("ゴーストの時間の進み方 (10〜1000 = 0.1〜10倍。100 = 等速)\n「必殺技IDと長さを調べる」でAR準拠を撃って出る w/f の値を100倍して入れると、AR準拠に近づく。", v, 10, 1000))
+            g_mageRate = (float)v / 100.0f;
         v = g_mageStagger;
         if (MageAskNumber("同時に出す技のずらし (0〜5フレーム)\n選んだ技を、1つずつ、このフレーム数ずつ遅らせて出す。\n0 = 全部同じフレーム。全部選ぶと一部が出ないときは、1〜2にする。", v, 0, 5))
             g_mageStagger = v;
@@ -4300,24 +4304,36 @@ namespace CTRPluginFramework
         }
     }
 
-    // 動作が切り替わるたびに、直前のアクションのIDと「続いたフレーム数」を画面に出す
-    // (必殺技のIDと、本来の長さを調べるための補助。待機(ID 1)は出さない)
+    // 動作が切り替わるたびに、直前のアクションのIDと「続いたフレーム数」と、そのときの時間を画面に出す
+    // (必殺技のIDと本来の長さ、AR準拠の時間の進み方を調べるための補助。待機(ID 1)は出さない)
+    //   F = 続いたフレーム数, t = アクションの時間 (K+4), w = 魔法の判定用の時間 (K+0xC4) の増え方
     static void MageLearnEntry(MenuEntry *entry)
     {
         (void)entry;
         static u32 last = 0, frames = 0;
+        static float t4 = 0.0f, wStart = 0.0f, wLast = 0.0f;
         const u32 C = MageObj();
         if (!C)
             return;
-        const u32 id = *(volatile u32 *)(C + 0x558 + 8);
+        const u32 K = C + 0x558;
+        const u32 id = *(volatile u32 *)(K + 8);
+        const float cur4 = *(volatile float *)(K + 4);
+        const float curW = *(volatile float *)(K + 0xC4);
         if (id != last)
         {
             if (last && last != 1)
-                OSD::Notify(Utils::Format("Act %08X  %u f", (unsigned)last, (unsigned)frames));
+            {
+                const float rate = frames > 1 ? (wLast - wStart) / (float)(frames - 1) : 0.0f;
+                OSD::Notify(Utils::Format("Act %08X F=%u t=%d w/f=%d.%02d", (unsigned)last, (unsigned)frames, (int)t4,
+                                          (int)rate, (int)((rate < 0 ? -rate : rate) * 100.0f) % 100));
+            }
             last = id;
             frames = 0;
+            wStart = curW;
         }
         ++frames;
+        t4 = cur4;
+        wLast = curW;
     }
 
     // 診断: 1秒ごとに内部の数を画面に出す (T=進行の回数 Q=ボタン押下の数 G=動いている魔法 C=発動の数)
