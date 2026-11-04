@@ -327,6 +327,8 @@ extern "C"
     volatile u32 g_mageCntTick  = 0;      // 診断: アクション更新フックが、プレイヤーで呼ばれた回数
     volatile u32 g_mageCntChan  = 0;      // 診断: 入力更新フックが呼ばれた回数
     volatile u32 g_mageUltId    = 0;      // Xの必殺技のアクションID (0 = 未設定。ビット16が、この技)
+    volatile float g_mageRate   = 1.0f;   // ゴーストの時間の進み方 (1フレームあたりの時間の増え方。AR準拠の実測に合わせる)
+    volatile u32 g_mageArStagger = 0;     // AR準拠で、同時に出す技を何フレームずつ遅らせるか (0 = ARコードと同じ。全部同じ時間)
     volatile u32 g_mageStagger  = 1;      // 同時に選んだ技を、1つずつ何フレームずつ遅らせて出すか (0 = 全部同じフレーム)
     volatile u32 g_mageUltTmax  = 600;    // 必殺技だけの最大フレーム (隕石などを長く降らせるため、ほかより長い)
     volatile u32 g_mageBudget   = 48;     // 1フレームに魔法の判定を作る関数を呼ぶ回数の上限 (重くなりすぎないように)
@@ -337,7 +339,7 @@ extern "C"
     volatile u32 g_mageArWatch  = 0;
     volatile u32 g_mageArMask   = 0xFFFF;
     volatile u32 g_mageArKey    = 0;      // 0 = A / 1 = X / 2 = B / 3 = Y / 4 = L / 5 = R
-    volatile u32 g_mageArN      = 10;     // 「押している」扱いにするフレーム数
+    volatile u32 g_mageArN      = 30;     // 「押している」扱いにするフレーム数
     volatile u32 g_mageArReq    = 0;
     volatile u32 g_mageArReqSeen = 0;
     volatile s32 g_mageSim      = -1;     // 入力の再現中のフレーム (-1 = なし)
@@ -614,7 +616,7 @@ extern "C"
                         if (tt < 0 || (u32)tt > lim)
                             continue;
                         *(volatile u32 *)(K + 8)      = MageIdAt(n);
-                        *(volatile float *)(K + 0xC4) = (float)tt;
+                        *(volatile float *)(K + 0xC4) = (float)tt * g_mageRate;
                         jp_callBody(K);                    // 魔法の判定・エフェクトを作る本体
                     }
                 }
@@ -629,7 +631,7 @@ extern "C"
 
         // 手動で発動した直後に、ゲーム側が別経路で始める通常攻撃を、待機の強制予約で消す。
         // 通常攻撃は ID 0x01000005 だけ (歩きなどは消さない)。動きの最初の1〜2フレームだけ見える。
-        if (g_mageWatch && g_mageCancelWin && g_mageSince <= g_mageCancelWin)
+        if ((g_mageWatch || g_mageArWatch) && g_mageCancelWin && g_mageSince <= g_mageCancelWin)
         {
             const u32 cur = *(volatile u32 *)(K + 8);
             if (cur == 0x01000005)
@@ -728,7 +730,7 @@ extern "C"
                 // 全部を同じ時間で出すと、本物のAスキルが優先されて、ほかが出ないことがあるため。
                 const u32 savedTimeBits = *(volatile u32 *)(K + 0xC4);
                 const float tReal = *(volatile float *)(K + 0xC4);
-                const u32 stg = g_mageStagger;
+                const u32 stg = g_mageArStagger;
                 for (u32 d = 0; d < nd; ++d)
                 {
                     if (shifted)
@@ -812,11 +814,18 @@ extern "C"
                 start = true;
             }
             if (start)
+            {
                 g_mageSim = 0;
+                g_mageSince = 0;                                       // 通常攻撃を消す期間の起点 (AR準拠でも使う)
+            }
         }
         if (g_mageSim >= 0)
         {
-            if ((u32)g_mageSim < g_mageArN)
+            // Aスキル枠の状態機械が「2段階目まで溜まった」状態 (状態4) になったら、すぐ離した扱いにする。
+            // 固定のフレーム数 (g_mageArN) は、状態4にならなかったときの上限として使う。
+            const u32 st = *(volatile u8 *)(C + 0x888 + 0x24);
+            const bool ready = (st == 4) && g_mageSim >= 2;
+            if ((u32)g_mageSim < g_mageArN && !ready)
             {
                 g_mageChR2 = 1;
                 g_mageChR3 = (g_mageSim == 0) ? 1 : 0;
@@ -1165,28 +1174,6 @@ namespace CTRPluginFramework
         return true;
     }
 
-    // 数値の入力。最初は空欄 (0や1が入っていない)。そのまま決定すると 0 になる
-    static bool AskValueBlank(const std::string &msg, bool hex, u32 maxV, u32 &out)
-    {
-        Keyboard kb(msg);
-        kb.IsHexadecimal(hex);
-        int len = 4;
-        if (!hex)
-        {
-            len = 1;
-            for (u32 t = maxV; t >= 10; t /= 10)
-                ++len;
-        }
-        kb.SetMaxLength(len);
-        u32 v = 0;
-        if (kb.Open(v) != 0)
-            return false;
-        if (v > maxV)
-            v = maxV;
-        out = v;
-        return true;
-    }
-
     // 選択式の入力。キャンセルなら false
     static bool AskChoice(const std::string &msg, const std::vector<std::string> &choices, u32 &out)
     {
@@ -1258,7 +1245,7 @@ namespace CTRPluginFramework
     }
 
     // 項目ごとの入力方法をまとめたもの (装備編集・かばん編集・一括変更で共通)
-    static bool AskFieldValue(const Field &f, const Category *cat, u32 cur, u32 &out, bool blank = false)
+    static bool AskFieldValue(const Field &f, const Category *cat, u32 cur, u32 &out)
     {
         if (!f.choices.empty())
             return AskChoice(f.label, f.choices, out);
@@ -1274,8 +1261,6 @@ namespace CTRPluginFramework
         if (f.kind == K_EFFECT)
             return PickFromNames(f.label, g_effectNames, false, 0, 0xFFFF, cur, out);
 
-        if (blank)
-            return AskValueBlank(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, out);
         return AskValue(f.label + (f.hex ? " (16進)" : ""), f.hex, f.maxV, cur, out);
     }
 
@@ -1292,12 +1277,6 @@ namespace CTRPluginFramework
         }
         MessageBox(Utils::Format("アドレス 0x%08X", base), s)();
     }
-
-    // 製作者名の読み書き (定義は後ろ。編集画面から使う)
-    static bool AskMakerName(std::vector<u16> &name);
-    static std::string Utf16ToUtf8(const std::vector<u16> &v);
-    static void ReadMakerName(u32 base, const Category &cat, std::vector<u16> &out);
-    static bool WriteMakerName(u32 base, const Category &cat, const std::vector<u16> &name, std::string &err);
 
     // ------------------------------------------------------------
     //  指定アドレスのアイテムを編集する共通UI
@@ -1318,19 +1297,12 @@ namespace CTRPluginFramework
             const Category *cat = FindCategory(id);
             std::vector<Field> fields = FieldsFor(cat, slotMode);   // 装備編集では個数を出さない
 
-            const bool hasName = (cat && cat->offName >= 0);
             std::vector<std::string> opts;
             for (const Field &f : fields)
             {
                 u32 v = 0;
                 ReadField(base, f, v);
                 opts.push_back(f.label + ": " + FmtValue(f, v));
-            }
-            if (hasName)
-            {
-                std::vector<u16> nm;
-                ReadMakerName(base, *cat, nm);
-                opts.push_back(std::string("製作者名(実験): ") + (nm.empty() ? std::string("なし") : "「" + Utf16ToUtf8(nm) + "」"));
             }
             opts.push_back("Hexダンプを表示");
             if (slotMode)
@@ -1353,18 +1325,7 @@ namespace CTRPluginFramework
                         MessageBox("エラー", "書き込みに失敗しました。")();
                 }
             }
-            else if (hasName && (size_t)sel == fields.size())
-            {
-                std::vector<u16> nm;
-                ReadMakerName(base, *cat, nm);
-                if (AskMakerName(nm))
-                {
-                    std::string err;
-                    if (!WriteMakerName(base, *cat, nm, err))
-                        MessageBox("製作者名を書けません", err)();
-                }
-            }
-            else if ((size_t)sel == fields.size() + (hasName ? 1 : 0))
+            else if ((size_t)sel == fields.size())
                 ShowDump(base);
             else
                 return true;
@@ -2152,104 +2113,6 @@ namespace CTRPluginFramework
         return def;
     }
 
-    // ------------------------------------------------------------
-    //  既存のアイテムの製作者名 (実験)
-    //  名前は行の決まった場所 (武器+0x20 / 防具+0x24 / ライフ道具・家具+0x10) に UTF-16LE で12バイト。
-    //  名前つきの行は +0xE が名前の印 (名前なしは 1)。
-    // ------------------------------------------------------------
-    static bool IsTemplateWord(u32 at, u32 v)
-    {
-        return (at == 0x28 && v == 1) || (at == 0x2C && v == 2) || (at == 0x30 && v == 3) || (at == 0x34 && v == 4);
-    }
-
-    static void ReadMakerName(u32 base, const Category &cat, std::vector<u16> &out)
-    {
-        out.clear();
-        if (cat.offName < 0)
-            return;
-        u16 flag = 0;
-        Process::Read16(base + 0x0E, flag);
-        if (flag == 1 || flag == 0)          // 名前なし
-            return;
-        for (u32 i = 0; i < NAME_CHARS; ++i)
-        {
-            u16 ch = 0;
-            Process::Read16(base + (u32)cat.offName + i * 2, ch);
-            if (ch == 0)
-                break;
-            out.push_back(ch);
-        }
-    }
-
-    // 名前の印の値: かばん・倉庫にある名前つきの実物から取る (なければ 0x16D7)
-    static u16 CurrentAuthorMark()
-    {
-        u16 mark = 0x16D7;
-        const Container *conts[2] = { &g_bag, &g_store };
-        for (const Container *ct : conts)
-        {
-            BagState b;
-            std::string err;
-            if (!LoadBag(b, *ct, err))
-                continue;
-            if (b.authorMark != 0x16D7)
-                return b.authorMark;
-            mark = b.authorMark;
-        }
-        return mark;
-    }
-
-    // 名前を書く (空なら名前を消す)。名前の場所に別のデータがありそうなときは書かずに false
-    static bool WriteMakerName(u32 base, const Category &cat, const std::vector<u16> &nm, std::string &err)
-    {
-        if (cat.offName < 0)
-        {
-            err = "この種類のアイテムには製作者名がありません。";
-            return false;
-        }
-        u16 flag = 0;
-        Process::Read16(base + 0x0E, flag);
-        const bool named = (flag != 1 && flag != 0);
-        const u32 off = (u32)cat.offName;
-
-        if (!named)
-        {
-            for (u32 o = 0; o < NAME_CHARS * 2; o += 4)
-            {
-                u32 v = 0;
-                Process::Read32(base + off + o, v);
-                if (v != 0 && !IsTemplateWord(off + o, v))
-                {
-                    err = "名前の場所に、別のデータが入っています。(何も書いていません)";
-                    return false;
-                }
-            }
-        }
-
-        if (nm.empty())
-        {
-            for (u32 o = 0; o < NAME_CHARS * 2; o += 2)
-                Process::Write16(base + off + o, 0);
-            Process::Write16(base + 0x0E, 0x0001);
-            return true;
-        }
-
-        // 買った直後などの目印 (1,2,3,4) が残っていれば消す (名前つきの実物の行に合わせる)
-        u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
-        Process::Read32(base + 0x28, w0);
-        Process::Read32(base + 0x2C, w1);
-        Process::Read32(base + 0x30, w2);
-        Process::Read32(base + 0x34, w3);
-        if (w0 == 1 && w1 == 2 && w2 == 3 && w3 == 4)
-            for (u32 o = 0x28; o < 0x38; o += 4)
-                Process::Write32(base + o, 0);
-
-        for (u32 i = 0; i < NAME_CHARS; ++i)
-            Process::Write16(base + off + i * 2, i < nm.size() ? nm[i] : (u16)0);
-        Process::Write16(base + 0x0E, CurrentAuthorMark());
-        return true;
-    }
-
     // 追加項目を選ぶ画面 (一括変更の画面と同じ作り)。キャンセルなら false
     static bool AskGenSpec(const Category *cat, const std::string &title, GenSpec &sp, u32 &count)
     {
@@ -2304,15 +2167,10 @@ namespace CTRPluginFramework
                 continue;
             }
             u32 cur = sp.use[sel] ? sp.val[sel] : 0, v = 0;
-            if (AskFieldValue(sp.fields[sel], cat, cur, v, true))
+            if (AskFieldValue(sp.fields[sel], cat, cur, v))
             {
-                if (v == 0 && sp.fields[sel].off == OFF_COUNT)
-                    sp.use[sel] = false;          // 個数が空欄のまま決定 = 指定しない (1個)
-                else
-                {
-                    sp.use[sel] = true;
-                    sp.val[sel] = v;
-                }
+                sp.use[sel] = true;
+                sp.val[sel] = v;
             }
         }
         count = SpecValue(&sp, OFF_COUNT, 1);
@@ -2352,50 +2210,6 @@ namespace CTRPluginFramework
 
     static bool NameTableLoaded() { return g_itemNames[0].name != nullptr; }
 
-    // ------------------------------------------------------------
-    //  性別専用の防具 (男せんよう / 女せんよう)。ID順に並べてある。
-    // ------------------------------------------------------------
-    static const u16 MALE_ONLY_ARMOR[] =
-        {
-            0x009A, 0x009C, 0x009E, 0x00A0, 0x00A2, 0x00A4, 0x00A6, 0x00A9, 0x00B3, 0x00C1, 0x00C7, 0x00E9, 0x00EB,
-            0x00ED, 0x00EF, 0x00F1, 0x00F3, 0x00F5, 0x00FD, 0x0101, 0x0107, 0x010D, 0x0113, 0x0115, 0x0131, 0x0133,
-            0x0135, 0x0137, 0x0139, 0x013B, 0x013D, 0x0145, 0x0149, 0x014F, 0x0155, 0x015B, 0x015D, 0x0180, 0x0182,
-            0x0184, 0x0186, 0x0188, 0x01DD, 0x01E9, 0x0258, 0x0259, 0x025A, 0x027E, 0x027F, 0x0280, 0x0286, 0x0287,
-            0x0288, 0x029A, 0x029B, 0x029C, 0x02E3, 0x0301
-        };
-
-    static const u16 FEMALE_ONLY_ARMOR[] =
-        {
-            0x009B, 0x009D, 0x009F, 0x00A1, 0x00A3, 0x00A5, 0x00A7, 0x00AA, 0x00B4, 0x00C2, 0x00EA, 0x00EC, 0x00EE,
-            0x00F0, 0x00F2, 0x00F4, 0x00F6, 0x00FE, 0x0108, 0x010E, 0x0114, 0x0116, 0x0132, 0x0134, 0x0136, 0x0138,
-            0x013A, 0x013C, 0x013E, 0x0146, 0x0150, 0x0156, 0x015C, 0x015E, 0x0178, 0x0179, 0x017A, 0x017B, 0x017C,
-            0x017D, 0x017E, 0x017F, 0x0181, 0x0183, 0x0185, 0x0187, 0x0189, 0x018F, 0x01DE, 0x01EA, 0x01F0, 0x0253,
-            0x0254, 0x025C, 0x025D, 0x025E, 0x0266, 0x0267, 0x0268, 0x0270, 0x0271, 0x0272, 0x027A, 0x027B, 0x028A,
-            0x028B, 0x028C, 0x0296, 0x029E, 0x029F, 0x02A0, 0x02A8, 0x02A9, 0x02AA, 0x02E4, 0x0302
-        };
-
-    static bool IsMaleOnlyArmor(u32 id)
-    {
-        return std::binary_search(MALE_ONLY_ARMOR, MALE_ONLY_ARMOR + sizeof(MALE_ONLY_ARMOR) / sizeof(u16), (u16)id);
-    }
-
-    static bool IsFemaleOnlyArmor(u32 id)
-    {
-        return std::binary_search(FEMALE_ONLY_ARMOR, FEMALE_ONLY_ARMOR + sizeof(FEMALE_ONLY_ARMOR) / sizeof(u16), (u16)id);
-    }
-
-    // 名前だけでは判定できない、未実装・イベント用アイテムのID (手作業の一覧)
-    static const u16 EXTRA_UNIMPL[] =
-    {
-        0x637, 0x64B, 0x72D, 0x845, 0x865, 0x983, 0x984, 0x8D0, 0x9C7, 0x9C9, 0x9CA, 0x9CB, 0x910, 0x91F, 0x936,
-        0x5B0, 0x597, 0x596, 0x594, 0x534, 0x50E, 0x50D, 0x50C, 0x50B, 0x50A, 0x509, 0x508, 0x507, 0x4FF,
-        0x3DE, 0x3D3, 0x3C9, 0x3BE, 0x3B2, 0x3A7, 0x39C, 0x391,
-        0x2B5, 0x2B6, 0x2BA, 0x2C0, 0x2C6, 0x2D0, 0x2D6, 0x2DE, 0x2DF, 0x2E2, 0x2FE, 0x2FF, 0x300, 0x30C, 0x311,
-        0x315, 0x31C, 0x321, 0x323, 0x325, 0x329, 0x32B, 0x32E, 0x331, 0x334, 0x335, 0x367, 0x34A, 0x350, 0x344,
-        0x340, 0x233, 0x215, 0x130, 0x06C, 0x039, 0x02C, 0x01B, 0x010, 0x00F,
-        0x2CE, 0x31A, 0x339, 0x358, 0x37C
-    };
-
     static bool IsUnimplemented(u32 id)
     {
         static std::vector<char> tbl;
@@ -2421,9 +2235,6 @@ namespace CTRPluginFramework
                         tbl[v[k].second] = 1;
                 i = j;
             }
-            for (u16 x : EXTRA_UNIMPL)
-                if (x <= MAX_ID)
-                    tbl[x] = 1;
         }
         return id <= MAX_ID && tbl[id] != 0;
     }
@@ -2542,53 +2353,16 @@ namespace CTRPluginFramework
         return true;
     }
 
-    static void PoolIds(u32 from, u32 to, std::vector<u32> &out);
-    static void BuildPool(const Category &cat, bool hideUnimpl, std::vector<u32> &pool);
-
-    static bool g_hideUnimpl = false;   // 「未実装を隠す」の状態 (生成の一覧どうしで共有)
-
-    // カテゴリの中から1つ選ぶ (一覧の先頭に [ID入力] と [未実装を隠す] あり)。
-    // cat=nullptr のときはID入力だけ
+    // カテゴリの中から1つ選ぶ (一覧の先頭に [ID入力] あり)。cat=nullptr のときはID入力だけ
     static bool PickOne(const Category *cat, const std::string &title, u32 &id)
     {
-        if (!cat)
-            return AskHexId(title + " (16進)", 0, false, 0, MAX_ID, id);
-
-        const std::string full = Utils::Format("%s [%s]", title.c_str(), cat->name);
-        std::vector<u32> pool;
-        for (;;)
-        {
-            BuildPool(*cat, g_hideUnimpl, pool);
-            std::vector<std::string> opts;
-            opts.push_back(Utils::Format("[ID入力] 現在 0x%04X", cat->idMin));
-            opts.push_back(!NameTableLoaded() ? std::string("(名前の表がないので未実装の判定なし)")
-                           : g_hideUnimpl ? std::string("[未実装を隠している → 表示する]")
-                                          : std::string("[未実装を隠す]"));
-            for (u32 v : pool)
-                opts.push_back(Utils::Format("%s (%X)", IdName(v).c_str(), v));
-
-            Keyboard kb(full, opts);
-            const int sel = kb.Open();
-            if (sel < 0)
-                return false;
-            if (sel == 0)
-            {
-                if (AskHexId(full + " (16進)", cat->idMin, true, cat->idMin, cat->idMax, id))
-                    return true;
-                continue;
-            }
-            if (sel == 1)
-            {
-                if (NameTableLoaded())
-                    g_hideUnimpl = !g_hideUnimpl;
-                continue;
-            }
-            id = pool[(size_t)sel - 2];
-            return true;
-        }
+        if (cat)
+            return PickFromNames(Utils::Format("%s [%s]", title.c_str(), cat->name), g_itemNames,
+                                 true, cat->idMin, cat->idMax, cat->idMin, id);
+        return AskHexId(title + " (16進)", 0, false, 0, MAX_ID, id);
     }
 
-    // 1つ生成する流れ (追加項目 → 確認 → 生成)
+    // 1つ生成する流れ (追加項目 → 確認 → 生成 → 続けて編集)
     static void CreateOneFlow(const Container &ct, u32 id)
     {
         if (id > MAX_ID)
@@ -2612,7 +2386,7 @@ namespace CTRPluginFramework
                                            "消耗品などとして追加しますか?", id),
                              DialogType::DialogYesNo))())
                 return;
-            if (!AskValueBlank("個数", false, MAX_COUNT, count) || count == 0)
+            if (!AskValue("個数", false, MAX_COUNT, 1, count) || count == 0)
                 return;
         }
 
@@ -2640,6 +2414,8 @@ namespace CTRPluginFramework
         MessageBox("完了", Utils::Format("%d枠目に追加しました。\n"
                                          "かばん・倉庫の画面は、一度閉じて開き直すと反映されます。", slot + 1))();
 
+        if (MessageBox("続けて編集", "個数や追加効果などを編集しますか?", DialogType::DialogYesNo)())
+            EditAt(RowOf(b, (u32)slot), "生成したアイテムの編集", true);
     }
 
     // アイテムを1つ生成: カテゴリを選ぶ → 一覧から選ぶ (ID入力も可)
@@ -2723,7 +2499,7 @@ namespace CTRPluginFramework
             if (!AskGenSpec(cat, Utils::Format("追加項目 [%s] (このあと選ぶ全部に適用)", cat->name), sp, count))
                 return;
         }
-        else if (!AskValueBlank("個数 (このあと選ぶ全部に適用)", false, MAX_COUNT, count) || count == 0)
+        else if (!AskValue("個数 (このあと選ぶ全部に適用)", false, MAX_COUNT, 1, count) || count == 0)
             return;
 
         std::string msg = Utils::Format("[%s / %s] 一覧から選ぶたびに、追加します。(Bで終了)\n",
@@ -2744,7 +2520,7 @@ namespace CTRPluginFramework
         static constexpr u32 PAGE = 20;
         static constexpr size_t HEAD = 5;     // 一覧の先頭の操作行の数
         std::vector<u32> pool;
-        bool hide = g_hideUnimpl;
+        bool hide = false;
         u32 page = 0, made = 0;
         if (cat)
             BuildPool(*cat, hide, pool);
@@ -2804,7 +2580,6 @@ namespace CTRPluginFramework
                     if (NameTableLoaded())
                     {
                         hide = !hide;
-                        g_hideUnimpl = hide;
                         BuildPool(*cat, hide, pool);
                         page = 0;
                     }
@@ -2864,39 +2639,6 @@ namespace CTRPluginFramework
                             keep.push_back(id);
                     ids.swap(keep);
                     what += " (未実装を除外)";
-                }
-            }
-        }
-
-        // 性別専用の防具の除外 (防具のカテゴリを一括生成するとき)
-        if (askUnimpl && !ids.empty() && CommonCategory(ids) == &g_cats[1])
-        {
-            u32 nm = 0, nf = 0;
-            for (u32 id : ids)
-            {
-                if (IsMaleOnlyArmor(id))
-                    ++nm;
-                else if (IsFemaleOnlyArmor(id))
-                    ++nf;
-            }
-            if (nm > 0 || nf > 0)
-            {
-                std::vector<std::string> go;
-                go.push_back("除外しない");
-                go.push_back(Utils::Format("男専用防具を除外 (%u件)", nm));
-                go.push_back(Utils::Format("女専用防具を除外 (%u件)", nf));
-                Keyboard kg(Utils::Format("性別専用の防具 (対象 %u 件中)", (u32)ids.size()), go);
-                const int gi = kg.Open();
-                if (gi < 0)
-                    return;                 // Bで中止 (まだ何も作っていない)
-                if (gi == 1 || gi == 2)
-                {
-                    std::vector<u32> keep;
-                    for (u32 id : ids)
-                        if (!(gi == 1 ? IsMaleOnlyArmor(id) : IsFemaleOnlyArmor(id)))
-                            keep.push_back(id);
-                    ids.swap(keep);
-                    what += (gi == 1) ? " (男専用を除外)" : " (女専用を除外)";
                 }
             }
         }
@@ -2989,7 +2731,7 @@ namespace CTRPluginFramework
             MessageBox("範囲外のID", Utils::Format("IDは 0x%04X までです。", MAX_ID))();
             return;
         }
-        if (!AskValueBlank("個数(枠の数)", false, ct->slots, n) || n == 0)
+        if (!AskValue("個数(枠の数)", false, ct->slots, 1, n) || n == 0)
             return;
         std::vector<u32> ids(n, id);
         RunBulk(*ct, ids, Utils::Format("%s を %u 個", IdName(id).c_str(), n), false);
@@ -3067,12 +2809,6 @@ namespace CTRPluginFramework
         modes.push_back(all ? std::string("全てのアイテムを削除")
                             : Utils::Format("%sを全て削除", g_cats[ci].name));
         modes.push_back("未実装アイテムだけ削除");
-        const bool isArmor = (!all && &g_cats[ci] == &g_cats[1]);
-        if (isArmor)
-        {
-            modes.push_back("男専用防具だけ削除");
-            modes.push_back("女専用防具だけ削除");
-        }
         Keyboard kmo("削除する対象", modes);
         const int mo = kmo.Open();
         if (mo < 0)
@@ -3100,10 +2836,6 @@ namespace CTRPluginFramework
             bool hit = all || (id >= g_cats[ci].idMin && id <= g_cats[ci].idMax);
             if (hit && mo == 1 && !IsUnimplemented(id))
                 hit = false;
-            if (hit && mo == 2 && !IsMaleOnlyArmor(id))
-                hit = false;
-            if (hit && mo == 3 && !IsFemaleOnlyArmor(id))
-                hit = false;
             if (!hit)
                 continue;
             if (IsEquipped(b, s))
@@ -3121,9 +2853,7 @@ namespace CTRPluginFramework
 
         std::string msg = Utils::Format("%s / %s\n%s\n%u 件を削除します。(残り %u 件)\n",
                                         c->name, all ? "すべて" : g_cats[ci].name,
-                                        mo == 1 ? "未実装アイテムのみ"
-                                        : mo == 2 ? "男専用防具のみ"
-                                        : mo == 3 ? "女専用防具のみ" : "すべて",
+                                        mo == 1 ? "未実装アイテムのみ" : "すべて",
                                         (u32)del.size(), (u32)(b.order.size() - del.size()));
         if (protectedN)
             msg += Utils::Format("装備中の %u 件は残します。\n", protectedN);
@@ -4442,6 +4172,9 @@ namespace CTRPluginFramework
         v = g_mageTmax;
         if (MageAskNumber("判定を作る最大フレーム (10〜600)\n魔法が途中で消えるなら増やす。", v, 10, 600))
             g_mageTmax = v;
+        v = (u32)(g_mageRate * 100.0f + 0.5f);
+        if (MageAskNumber("ゴーストの時間の進み方 (10〜1000 = 0.1〜10倍。100 = 等速)\n「必殺技IDと長さを調べる」でAR準拠を撃って出る w/f の値を100倍して入れると、AR準拠に近づく。", v, 10, 1000))
+            g_mageRate = (float)v / 100.0f;
         v = g_mageStagger;
         if (MageAskNumber("同時に出す技のずらし (0〜5フレーム)\n選んだ技を、1つずつ、このフレーム数ずつ遅らせて出す。\n0 = 全部同じフレーム。全部選ぶと一部が出ないときは、1〜2にする。", v, 0, 5))
             g_mageStagger = v;
@@ -4537,6 +4270,19 @@ namespace CTRPluginFramework
             g_mageDirD = (float)v;
     }
 
+    // AR準拠を、ARコードと同じ動きにする設定へ戻す
+    static void MageArPresetEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        g_mageArN       = 30;         // 「押している扱い」の上限フレーム数 (状態4になれば、それより早く離す)
+        g_mageArStagger = 0;          // 全部同じ時間で出す (ARコードと同じ)
+        g_mageArMask    = 0x0FFFF;    // 表の16個だけ。必殺技は外す (ARコードにはない)
+        g_mageFwdF      = 0.0f;       // 位置はずらさない
+        g_mageDirs      = 1;          // 方向は1つ
+        g_mageClear     = 1;
+        OSD::Notify("Mage: AR style = AR code");
+    }
+
     // 手動の設定を、AR準拠の動きに近い値にまとめて切り替える
     static void MagePresetEntry(MenuEntry *entry)
     {
@@ -4579,24 +4325,36 @@ namespace CTRPluginFramework
         }
     }
 
-    // 動作が切り替わるたびに、直前のアクションのIDと「続いたフレーム数」を画面に出す
-    // (必殺技のIDと、本来の長さを調べるための補助。待機(ID 1)は出さない)
+    // 動作が切り替わるたびに、直前のアクションのIDと「続いたフレーム数」と、そのときの時間を画面に出す
+    // (必殺技のIDと本来の長さ、AR準拠の時間の進み方を調べるための補助。待機(ID 1)は出さない)
+    //   F = 続いたフレーム数, t = アクションの時間 (K+4), w = 魔法の判定用の時間 (K+0xC4) の増え方
     static void MageLearnEntry(MenuEntry *entry)
     {
         (void)entry;
         static u32 last = 0, frames = 0;
+        static float t4 = 0.0f, wStart = 0.0f, wLast = 0.0f;
         const u32 C = MageObj();
         if (!C)
             return;
-        const u32 id = *(volatile u32 *)(C + 0x558 + 8);
+        const u32 K = C + 0x558;
+        const u32 id = *(volatile u32 *)(K + 8);
+        const float cur4 = *(volatile float *)(K + 4);
+        const float curW = *(volatile float *)(K + 0xC4);
         if (id != last)
         {
             if (last && last != 1)
-                OSD::Notify(Utils::Format("Act %08X  %u f", (unsigned)last, (unsigned)frames));
+            {
+                const float rate = frames > 1 ? (wLast - wStart) / (float)(frames - 1) : 0.0f;
+                OSD::Notify(Utils::Format("Act %08X F=%u t=%d w/f=%d.%02d", (unsigned)last, (unsigned)frames, (int)t4,
+                                          (int)rate, (int)((rate < 0 ? -rate : rate) * 100.0f) % 100));
+            }
             last = id;
             frames = 0;
+            wStart = curW;
         }
         ++frames;
+        t4 = cur4;
+        wLast = curW;
     }
 
     // 診断: 1秒ごとに内部の数を画面に出す (T=進行の回数 Q=ボタン押下の数 G=動いている魔法 C=発動の数)
@@ -4678,6 +4436,9 @@ namespace CTRPluginFramework
         u32 v = g_mageArN;
         if (MageAskNumber("押している扱いにするフレーム数 (3〜60)\n溜めが足りず通常攻撃になるときは増やす。", v, 3, 60))
             g_mageArN = v;
+        v = g_mageArStagger;
+        if (MageAskNumber("AR準拠: 同時に出す技のずらし (0〜5フレーム)\n0 = ARコードと同じ(全部同じ時間)。全部選ぶと一部が出ないときだけ、1〜2にする。", v, 0, 5))
+            g_mageArStagger = v;
     }
 
     static void AddMageRapid(PluginMenu *menu)
@@ -4720,6 +4481,8 @@ namespace CTRPluginFramework
                                 "魔法使い連射・敵即死のARコードとは同時に使えません。"));
         f->Append(new MenuEntry("AR準拠の発動ボタン (A / X / B / Y / L / R)", nullptr, MageArKeyEntry,
                                 "AR準拠モードを発動するボタンを選びます。"));
+        f->Append(new MenuEntry("AR準拠を、ARコードと同じ設定に戻す", nullptr, MageArPresetEntry,
+                                "AR準拠の設定を、ARコードと同じ動きになる値に戻します。必殺技・位置のずらし・方向は外れます。"));
         f->Append(new MenuEntry("AR準拠で出す技を選ぶ", nullptr, MageArSkillEntry,
                                 "AR準拠モードで、同時に出す技を選びます。"));
         f->Append(new MenuEntry("AR準拠の設定 (押している扱いのフレーム数)", nullptr, MageArSettingsEntry,
