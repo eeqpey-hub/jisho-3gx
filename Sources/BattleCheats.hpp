@@ -309,4 +309,10 @@ namespace BattleCheats
         menu += folder;
     }
 
+    // menu がポインタ(PluginMenu *menu)の場合はこちらが呼ばれる
+    static void InitMenu(PluginMenu *menu)
+    {
+        InitMenu(*menu);
+    }
+
 } // namespace BattleCheats
