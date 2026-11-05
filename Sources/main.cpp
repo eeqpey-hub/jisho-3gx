@@ -46,6 +46,7 @@ static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #include "Life.hpp"
 #include "QualityFix.hpp"
 #include "MaterialZero.hpp"
+#include "BattleCheats.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -5031,6 +5032,8 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
+
+        BattleCheats::InitMenu(menu);
         
 menu->Append(new MenuEntry("エリアワープ", nullptr, WarpEntry,
                                    "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
