@@ -44,8 +44,7 @@ static const NameEntry g_itemNames[]   = { { 0xFFFF, nullptr } };
 static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #endif
 #include "Life.hpp"
-#include "QualityFix.hpp"
-#include "MaterialZero.hpp"
+#include "Craft.hpp"
 #include "Mage.hpp"      // 魔法使い関連はすべてこのファイル
 
 // ------------------------------------------------------------
@@ -1830,9 +1829,7 @@ menu->Append(new MenuEntry("エリアワープ", nullptr, WarpEntry,
 
         AddItemEditor(menu);   // アイテムエディタ (装備編集 / 生成 / 削除 / 一括変更)
 
-        // 制作まわり (このあと「制作」フォルダにまとめる)
-        AddMaterialZero(menu);
-        AddQualityFix(menu);
+        AddCraft(menu);   // 制作フォルダ (素材0個 / 99個 / 即完了 / 品質固定)
 
 menu->Append(new MenuEntry("現在位置を保存 (ワープ一覧に追加)", nullptr, SavePosEntry,
                                    "いま立っている位置に名前をつけて保存します。保存した位置は「エリアワープ」の一覧の末尾に並びます。\n"
