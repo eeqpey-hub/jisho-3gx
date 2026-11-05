@@ -88,7 +88,7 @@ extern "C"
     #define POS_SETTLE_FRAMES   20
     #define POS_FALLBACK_FRAMES 240
     #define POS_LONG_FRAMES     900
-    #define POS_REUSE_FRAMES    600      // プレイヤーのアドレスが変わらない場合の待ち
+    #define POS_REUSE_FRAMES    10      // プレイヤーのアドレスが変わらない場合の待ち
     #define POS_HOLD_FRAMES     120
     #define POS_TIMEOUT_FRAMES  (60 * 40)
     #define POS_REC_MAX         900      // 経過の記録 (「位置ワープの記録を保存」で書き出せる)
