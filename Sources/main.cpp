@@ -46,7 +46,6 @@ static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
 #include "Life.hpp"
 #include "QualityFix.hpp"
 #include "MaterialZero.hpp"
-#include "BattleCheats.hpp"
 
 // ------------------------------------------------------------
 //  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
@@ -319,6 +318,9 @@ extern "C"
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
     // --- 周りの敵の一覧 (ターゲットの調査・全敵への発動のため) ---
+    volatile u32 g_mageTgtAll   = 0;      // 1 = 周りの敵ぜんぶに向けて、同じ魔法を出す (ターゲットは変えない)
+    volatile u32 g_mageTgtMax   = 4;      // 向ける敵の最大数 (1〜8)
+    volatile float g_mageTgtRange2 = 400.0f; // 向ける敵の距離の2乗 (初期値 20 の2乗)
     volatile u32 g_mageTgtWatch = 0;      // ターゲット調査を有効にしている間、プラグイン側が補充
     volatile u32 g_mageEnemyN   = 0;      // 直前のフレームで見つかった敵の数
     volatile u32 g_mageEnemy[16];         // 敵のユニットのアドレス
@@ -484,6 +486,36 @@ extern "C"
         }
     }
 
+    // ターゲット (魔法が狙う敵) の場所: プレイヤーのデータの +0x684 と +0x688 に、敵のユニットのアドレスが入っている。
+    // (調査で、ターゲットを変えると、この2か所の値が同じ敵に切り替わることを確認した)
+    static const u32 MAGE_TGT_A = 0x684;
+    static const u32 MAGE_TGT_B = 0x688;
+
+    // 距離が近い順に、範囲内の敵を最大 maxN 体選ぶ。選んだ数を返す。
+    static u32 MagePickTargets(u32 *out, u32 maxN)
+    {
+        if (maxN > 8) maxN = 8;
+        bool used[16];
+        for (int i = 0; i < 16; ++i) used[i] = false;
+        const float lim = g_mageTgtRange2;
+        u32 cnt = 0;
+        for (u32 k = 0; k < maxN; ++k)
+        {
+            int best = -1;
+            float bd = 0.0f;
+            for (u32 j = 0; j < g_mageEnemyN && j < 16; ++j)
+            {
+                if (used[j]) continue;
+                const float d = g_mageEnemyD2[j];
+                if (d <= lim && (best < 0 || d < bd)) { best = (int)j; bd = d; }
+            }
+            if (best < 0) break;
+            used[best] = true;
+            out[cnt++] = g_mageEnemy[best];
+        }
+        return cnt;
+    }
+
     // 方向 d (0 〜 nd-1) のときの、座標のずらし量 (ox, oz)。前 = 向きの目安、右 = それを90度回した向き。
     // nd = 1 のときは、前へずらす距離だけ。nd = 4 / 8 のときは、さらに方向ごとの距離を足す。
     static void MageDirOffset(u32 nd, u32 d, float &ox, float &oz)
@@ -597,13 +629,20 @@ extern "C"
                     }
                 }
                 const u32 nd = (g_mageDirs >= 8) ? 8 : (g_mageDirs >= 4 ? 4 : 1);
-                need *= nd;
+                u32 tg[8];                                     // 全敵ターゲット: 周りの敵 (近い順)
+                u32 nT = 0;
+                if (g_mageTgtAll)
+                    nT = MagePickTargets(tg, g_mageTgtMax);
+                const u32 nE = nT ? nT : 1;
+                need *= nd * nE;
                 if (need > budget && budget != budget0)
                     break;                                     // 今フレームの上限を超えるので、続きは次のフレームへ (先頭のゴーストは必ず進める)
                 budget = (need > budget) ? 0 : budget - need;
 
                 const bool shifted = (nd > 1) || (g_mageFwdF != 0.0f);
                 const u32 pobj = K - 0x558;
+                const u32 origA = *(volatile u32 *)(pobj + MAGE_TGT_A);
+                const u32 origB = *(volatile u32 *)(pobj + MAGE_TGT_B);
                 if (shifted)
                     MageShiftSave(pobj);
                 for (u32 d = 0; d < nd; ++d)
@@ -614,20 +653,33 @@ extern "C"
                         MageDirOffset(nd, d, ox, oz);
                         MageShiftSet(pobj, ox, oz);
                     }
-                    u32 rank = 0;
-                    for (int n = 0; n < 17; ++n)
+                    for (u32 e = 0; e < nE; ++e)
                     {
-                        if (!((mask >> n) & 1) || !MageIdAt(n))
-                            continue;
-                        const s32 tt = t - (s32)(rank * stg);
-                        const u32 lim = (n < 16) ? g_mageTmax : g_mageUltTmax;
-                        ++rank;
-                        if (tt < 0 || (u32)tt > lim)
-                            continue;
-                        *(volatile u32 *)(K + 8)      = MageIdAt(n);
-                        *(volatile float *)(K + 0xC4) = (float)tt * g_mageRate;
-                        jp_callBody(K);                    // 魔法の判定・エフェクトを作る本体
+                        if (nT)                                // この敵に向けて出す (ターゲットを一時的に差し替える)
+                        {
+                            *(volatile u32 *)(pobj + MAGE_TGT_A) = tg[e];
+                            *(volatile u32 *)(pobj + MAGE_TGT_B) = tg[e];
+                        }
+                        u32 rank = 0;
+                        for (int n = 0; n < 17; ++n)
+                        {
+                            if (!((mask >> n) & 1) || !MageIdAt(n))
+                                continue;
+                            const s32 tt = t - (s32)(rank * stg);
+                            const u32 lim = (n < 16) ? g_mageTmax : g_mageUltTmax;
+                            ++rank;
+                            if (tt < 0 || (u32)tt > lim)
+                                continue;
+                            *(volatile u32 *)(K + 8)      = MageIdAt(n);
+                            *(volatile float *)(K + 0xC4) = (float)tt * g_mageRate;
+                            jp_callBody(K);                    // 魔法の判定・エフェクトを作る本体
+                        }
                     }
+                }
+                if (nT)
+                {
+                    *(volatile u32 *)(pobj + MAGE_TGT_A) = origA;  // 元のターゲットに戻す
+                    *(volatile u32 *)(pobj + MAGE_TGT_B) = origB;
                 }
                 if (shifted)
                     MageShiftSet(pobj, 0.0f, 0.0f);        // 元の座標に戻す (保存した値そのまま)
@@ -771,6 +823,14 @@ extern "C"
                 const u32 savedTimeBits = *(volatile u32 *)(K + 0xC4);
                 const float tReal = *(volatile float *)(K + 0xC4);
                 const u32 stg = g_mageArStagger;
+                // 全敵ターゲット: ほかの技を、周りの敵ぜんぶに向けて出す (本物のAスキルは、今のターゲットのまま)
+                u32 tg[8];
+                u32 nT = 0;
+                if (g_mageTgtAll)
+                    nT = MagePickTargets(tg, g_mageTgtMax);
+                const u32 nE = nT ? nT : 1;
+                const u32 origA = *(volatile u32 *)(C + MAGE_TGT_A);
+                const u32 origB = *(volatile u32 *)(C + MAGE_TGT_B);
                 for (u32 d = 0; d < nd; ++d)
                 {
                     if (shifted)
@@ -779,21 +839,34 @@ extern "C"
                         MageDirOffset(nd, d, ox, oz);
                         MageShiftSet(C, ox, oz);
                     }
-                    u32 rank = 0;
-                    for (int n = 0; n < 16; ++n)                       // 表のスキル: Aスキルと同じ時間で判定を作る
+                    for (u32 e = 0; e < nE; ++e)
                     {
-                        if (!((mask >> n) & 1))
-                            continue;
-                        const u32 k = rank++;
-                        if (g_mageIds[n] == id && nd == 1)             // 1方向のときは、本物のAスキルがあるので省く
-                            continue;
-                        const float tt = tReal - (float)(k * stg);
-                        if (tt < 0.0f)
-                            continue;
-                        *(volatile u32 *)(K + 8)      = g_mageIds[n];
-                        *(volatile float *)(K + 0xC4) = tt;
-                        jp_callBody(K);
+                        if (nT)
+                        {
+                            *(volatile u32 *)(C + MAGE_TGT_A) = tg[e];
+                            *(volatile u32 *)(C + MAGE_TGT_B) = tg[e];
+                        }
+                        u32 rank = 0;
+                        for (int n = 0; n < 16; ++n)                   // 表のスキル: Aスキルと同じ時間で判定を作る
+                        {
+                            if (!((mask >> n) & 1))
+                                continue;
+                            const u32 k = rank++;
+                            if (g_mageIds[n] == id && nd == 1 && !nT)  // 1方向・今のターゲットのみのときは、本物のAスキルがあるので省く
+                                continue;
+                            const float tt = tReal - (float)(k * stg);
+                            if (tt < 0.0f)
+                                continue;
+                            *(volatile u32 *)(K + 8)      = g_mageIds[n];
+                            *(volatile float *)(K + 0xC4) = tt;
+                            jp_callBody(K);
+                        }
                     }
+                }
+                if (nT)
+                {
+                    *(volatile u32 *)(C + MAGE_TGT_A) = origA;         // 元のターゲットに戻す
+                    *(volatile u32 *)(C + MAGE_TGT_B) = origB;
                 }
                 *(volatile u32 *)(K + 0xC4) = savedTimeBits;           // 時間を元に戻す
                 if (shifted)
@@ -4310,6 +4383,21 @@ namespace CTRPluginFramework
             g_mageDirD = (float)v;
     }
 
+    // 全敵ターゲットの設定
+    static void MageTargetEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        u32 v = g_mageTgtAll;
+        if (MageAskNumber("周りの敵ぜんぶに向けて魔法を出す (0 = オフ, 1 = オン)\nターゲットは変えず、近い順に敵ごとに同じ魔法を出す。\n敵の数だけ処理が増えて重くなります。", v, 0, 1))
+            g_mageTgtAll = v;
+        v = g_mageTgtMax;
+        if (MageAskNumber("向ける敵の最大数 (1〜8)\n近い順に、この数まで。", v, 1, 8))
+            g_mageTgtMax = v;
+        v = (u32)(__builtin_sqrtf(g_mageTgtRange2) + 0.5f);
+        if (MageAskNumber("向ける敵の距離 (5〜60)\nプレイヤーからこの距離の中にいる敵だけ。", v, 5, 60))
+            g_mageTgtRange2 = (float)(v * v);
+    }
+
     // AR準拠を、ARコードと同じ動きにする設定へ戻す
     static void MageArPresetEntry(MenuEntry *entry)
     {
@@ -4427,7 +4515,7 @@ namespace CTRPluginFramework
                     const int d = (int)__builtin_sqrtf(g_mageEnemyD2[j]);
                     sig = sig * 31 + off + (u32)d * 7919;
                     if (sig != lastSig || true)
-                        OSD::Notify(Utils::Format("TGT +%X d=%d (敵%u体)", (unsigned)off, d, (unsigned)g_mageEnemyN));
+                        OSD::Notify(Utils::Format("TGT +%X d=%d (enemies %u)", (unsigned)off, d, (unsigned)g_mageEnemyN));
                     ++shown;
                     break;
                 }
@@ -4553,6 +4641,8 @@ namespace CTRPluginFramework
                                 "Xの必殺技のアクションIDを入れます。入れると、技の選択で選べます。"));
         f->Append(new MenuEntry("必殺技IDと長さを調べる (画面に出す)", MageLearnEntry, nullptr,
                                 "ONにして、Xの必殺技を撃つと、動作のIDと続いたフレーム数が画面の上に出ます。"));
+        f->Append(new MenuEntry("全敵ターゲットの設定 (周りの敵ぜんぶへ)", nullptr, MageTargetEntry,
+                                "ターゲットを変えずに、周りの敵ぜんぶに向けて、同じ魔法を出します(実験)。"));
         f->Append(new MenuEntry("ターゲットの場所を調べる (画面に出す)", MageTgtEntry, nullptr,
                                 "戦闘モードでONにして、Yボタンでターゲットを変えると、画面の上に出る値が変わります。"));
         f->Append(new MenuEntry("診断 (1秒ごとに数を表示)", MageDiagEntry, nullptr,
@@ -5032,8 +5122,6 @@ namespace CTRPluginFramework
         PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
                                           "日本語版用。海外版PLGのItemEditorと同じ方式です。");
         menu->SynchronizeWithFrame(true);
-
-        BattleCheats::InitMenu(menu);
         
 menu->Append(new MenuEntry("エリアワープ", nullptr, WarpEntry,
                                    "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
