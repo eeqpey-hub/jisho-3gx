@@ -86,7 +86,7 @@ extern "C"
     //  書き始めたら、POS_HOLD_FRAMES フレームの間、毎フレーム書き続ける (あとからの上書きを直す)。
     #define POS_JUMP_DIST       2.0f     // 1フレームでこれ以上動いたら「配置された」とみなす
     #define POS_SETTLE_FRAMES   20
-    #define POS_FALLBACK_FRAMES 10
+    #define POS_FALLBACK_FRAMES 240
     #define POS_LONG_FRAMES     900
     #define POS_REUSE_FRAMES    600      // プレイヤーのアドレスが変わらない場合の待ち
     #define POS_HOLD_FRAMES     120
