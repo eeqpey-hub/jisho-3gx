@@ -1184,7 +1184,7 @@ namespace CTRPluginFramework
     }
 
     // 保存した位置へ移動する (同じエリアならそのまま、別のエリアなら入ってから)
-    static void RequestSavedPos(const SavedPos &p)
+    static void RequestSavedPos(const SavedPos &p, bool forceReload = false)
     {
         u16 cur = 0;
         if (g_warpTask != 0)
@@ -1203,7 +1203,7 @@ namespace CTRPluginFramework
         PosResetDetect();
         g_recN        = 0;
 
-        if (g_warpTask != 0 && obj && cur == p.area)
+         if (!forceReload && g_warpTask != 0 && obj && cur == p.area)
         {
             g_posMode = 2;                 // 同じエリア: そのまま移動
             OSD::Notify("Teleport requested.");
@@ -1217,6 +1217,39 @@ namespace CTRPluginFramework
             g_warpPending = 1;
             OSD::Notify("Warp + teleport requested.");
         }
+    }
+
+    // いまのエリアに入り直して(ロード)、いまの位置に戻る
+    static void ReloadHereEntry(MenuEntry *entry)
+    {
+        (void)entry;
+
+        if (!InstallWarpHook())
+            return;
+
+        u16 area16 = 0;
+        if (g_warpTask == 0 || !Process::Read16(g_warpTask + 0x6B2, area16))
+        {
+            MessageBox("準備中です",
+                       "位置を読む準備をしています。\nメニューを閉じて、ゲームを1秒ほど動かしてから、もう一度実行してください。")();
+            return;
+        }
+        const u32 obj = PosPlayerObj();
+        if (!obj)
+        {
+            MessageBox("実行できません",
+                       "プレイヤーのデータを取得できません。\n操作できる状態で、もう一度実行してください。")();
+            return;
+        }
+
+        SavedPos p;
+        p.area = area16;
+        p.x = *(volatile float *)(obj + 0x7C);
+        p.y = *(volatile float *)(obj + 0x80);
+        p.z = *(volatile float *)(obj + 0x84);
+
+        RequestSavedPos(p, true);   // true = 同じエリアでも、入り直す
+        OSD::Notify("Reload here requested.");
     }
 
     static void SavePosEntry(MenuEntry *entry)
@@ -2875,6 +2908,9 @@ menu->Append(new MenuEntry("現在位置を保存 (ワープ一覧に追加)", n
                                    "いま立っている位置に名前をつけて保存します。保存した位置は「エリアワープ」の一覧の末尾に並びます。\n"
                                    "別のエリアの位置を選ぶと、そのエリアへ入ってから、保存した位置へ移動します。\n"
                                    "保存先は SD直下の fll_warp_points.txt です。"));
+menu->Append(new MenuEntry("その場でロード (現在位置に戻る)", nullptr, ReloadHereEntry,
+                                   "いまのエリアを読み込み直して、いまの位置に戻ります。\n"
+                                   "モンスターやボスの再出現に使えます。"));
 menu->Append(new MenuEntry("探索ワープ (開発用)", nullptr, ExploreEntry,
                                    "出たいエリアIDと入口番号を数字で指定して移動します(そのエリアの、その入口の前に出ます)。\n"
                                    "入口番号の反対側のエリアが未登録のときは、確認が出ます。「扉の自動記録」で扉を通ると登録されます。\n"
