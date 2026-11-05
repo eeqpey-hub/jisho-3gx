@@ -317,6 +317,14 @@ extern "C"
     volatile u32 g_mageAutoCasts = 0;
     volatile u32 g_mageTicks    = 0;
     volatile u32 g_mageCtrl     = 0;
+    // --- 周りの敵の一覧 (ターゲットの調査・全敵への発動のため) ---
+    volatile u32 g_mageTgtWatch = 0;      // ターゲット調査を有効にしている間、プラグイン側が補充
+    volatile u32 g_mageEnemyN   = 0;      // 直前のフレームで見つかった敵の数
+    volatile u32 g_mageEnemy[16];         // 敵のユニットのアドレス
+    volatile float g_mageEnemyD2[16];     // プレイヤーからの距離の2乗
+    static u32 g_mageEnemyBuildN = 0;
+    static u32 g_mageEnemyBuild[16];
+    static float g_mageEnemyBuildD2[16];
     // --- 位置の調整 (実験): 魔法を出す瞬間だけ、プレイヤーの座標をずらして、本体を呼ぶ ---
     volatile float g_mageFwdF   = 0.0f;   // 前方へずらす距離 (正 = 前、負 = 後ろ)
     volatile u32   g_mageDirs   = 1;      // 同時に出す方向の数: 1 / 4 / 8
@@ -645,7 +653,8 @@ extern "C"
     }
 
     // 敵が近いか (敵即死のコードと同じ条件)
-    static bool MageEnemyNear(u32 C, u32 unit)
+    // 敵か (敵即死のコードと同じ条件)
+    static bool MageIsEnemy(u32 unit)
     {
         if (*(volatile u8 *)(unit + 0x554) != 1)
             return false;
@@ -654,13 +663,24 @@ extern "C"
             return false;
         if (((u32 (*)(u32))0x5AF9EC)(unit + 0xD4) != 0)    // 体力が0 (倒れている)
             return false;
+        return true;
+    }
+
+    // プレイヤーからの距離の2乗
+    static float MageDist2(u32 C, u32 unit)
+    {
         typedef const float *(*PosFn)(u32);
         const PosFn fe = (PosFn)(*(volatile u32 *)(*(volatile u32 *)unit + 0x18));
         const PosFn fp = (PosFn)(*(volatile u32 *)(*(volatile u32 *)C + 0x18));
         const float *pe = fe(unit);
         const float *pp = fp(C);
         const float dx = pe[0] - pp[0], dy = pe[1] - pp[1], dz = pe[2] - pp[2];
-        return (dx * dx + dy * dy + dz * dz) <= g_mageAutoDist2;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    static bool MageEnemyNear(u32 C, u32 unit)
+    {
+        return MageIsEnemy(unit) && MageDist2(C, unit) <= g_mageAutoDist2;
     }
 
     // 1フレームに1回だけ、ゴーストの進行を行う (ユニット更新とアクション更新の両方から呼ばれる)。
@@ -681,20 +701,39 @@ extern "C"
     // ユニット更新 (0x1A63FC) の入口で、全ユニットについて毎フレーム呼ばれる。
     void MageUnitCheck(u32 unit)
     {
-        if (!MageAnyWatch())
+        const bool any = MageAnyWatch();
+        if (!any && !g_mageTgtWatch)
             return;
         const u32 C = MageObj();
         if (!C)
             return;
         if (unit == C)
         {
-            g_mageCntUnit = g_mageCntUnit + 1;
-            MageDrive(C + 0x558);
+            // 敵の一覧を確定する (直前のフレームぶん)
+            g_mageEnemyN = g_mageEnemyBuildN;
+            for (u32 i = 0; i < g_mageEnemyBuildN; ++i)
+            {
+                g_mageEnemy[i]   = g_mageEnemyBuild[i];
+                g_mageEnemyD2[i] = g_mageEnemyBuildD2[i];
+            }
+            g_mageEnemyBuildN = 0;
+            if (any)
+            {
+                g_mageCntUnit = g_mageCntUnit + 1;
+                MageDrive(C + 0x558);
+            }
             return;
+        }
+        const bool isEnemy = MageIsEnemy(unit);
+        if (isEnemy && g_mageEnemyBuildN < 16)
+        {
+            g_mageEnemyBuild[g_mageEnemyBuildN]   = unit;
+            g_mageEnemyBuildD2[g_mageEnemyBuildN] = MageDist2(C, unit);
+            g_mageEnemyBuildN = g_mageEnemyBuildN + 1;
         }
         if (!g_mageAutoWatch || g_mageAutoLeft || !g_mageCtrl)
             return;
-        if (MageEnemyNear(C, unit))
+        if (isEnemy && MageDist2(C, unit) <= g_mageAutoDist2)
         {
             g_mageAutoLeft = g_mageAutoCool;
             MageStart(g_mageAutoMask, false);
@@ -4357,6 +4396,45 @@ namespace CTRPluginFramework
         wLast = curW;
     }
 
+    // ターゲットの場所を調べる: プレイヤーのデータの中から、「周りの敵のアドレスと同じ値」が入っている場所を探して、
+    // 画面に出す。戦闘モードでYボタンを押してターゲットを変えると、出る距離 d が変わる場所が、ターゲットの場所。
+    static void MageTgtEntry(MenuEntry *entry)
+    {
+        if (!InstallMageHooks())
+        {
+            entry->Disable();
+            return;
+        }
+        g_mageTgtWatch = 6;
+        static u32 n = 0;
+        static u32 lastSig = 0;
+        if (++n % 20)
+            return;
+        const u32 C = MageObj();
+        if (!C || !g_mageEnemyN)
+            return;
+        u32 sig = 0, shown = 0;
+        for (u32 off = 0; off < 0x1800 && shown < 3; off += 4)
+        {
+            u32 v = 0;
+            if (!Process::Read32(C + off, v) || v < 0x08000000u || v >= 0x1F000000u)
+                continue;
+            for (u32 j = 0; j < g_mageEnemyN; ++j)
+            {
+                if (v == g_mageEnemy[j])
+                {
+                    const int d = (int)__builtin_sqrtf(g_mageEnemyD2[j]);
+                    sig = sig * 31 + off + (u32)d * 7919;
+                    if (sig != lastSig || true)
+                        OSD::Notify(Utils::Format("TGT +%X d=%d (敵%u体)", (unsigned)off, d, (unsigned)g_mageEnemyN));
+                    ++shown;
+                    break;
+                }
+            }
+        }
+        lastSig = sig;
+    }
+
     // 診断: 1秒ごとに内部の数を画面に出す (T=進行の回数 Q=ボタン押下の数 G=動いている魔法 C=発動の数)
     static void MageDiagEntry(MenuEntry *entry)
     {
@@ -4474,6 +4552,8 @@ namespace CTRPluginFramework
                                 "Xの必殺技のアクションIDを入れます。入れると、技の選択で選べます。"));
         f->Append(new MenuEntry("必殺技IDと長さを調べる (画面に出す)", MageLearnEntry, nullptr,
                                 "ONにして、Xの必殺技を撃つと、動作のIDと続いたフレーム数が画面の上に出ます。"));
+        f->Append(new MenuEntry("ターゲットの場所を調べる (画面に出す)", MageTgtEntry, nullptr,
+                                "戦闘モードでONにして、Yボタンでターゲットを変えると、画面の上に出る値が変わります。"));
         f->Append(new MenuEntry("診断 (1秒ごとに数を表示)", MageDiagEntry, nullptr,
                                 "内部の数を1秒ごとに画面に出します。動作がおかしいときの調査用です。"));
         f->Append(new MenuEntry("AR準拠: Aスキル+全属性 (モーションあり)", MageArEntry, nullptr,
