@@ -288,6 +288,92 @@ namespace BattleCheats
     }
 
     // ---------------------------------------------------------------
+    //  3. HP減らない / SP減らない (プレイヤー)
+    //     ヒープの固定アドレスは使わず、ゲーム自身がプレイヤーを探す方法
+    //     (0x00460968 の関数と同じ手順)でアドレスを毎回求める。
+    //       manager = *(u32*)0x0068BBB8
+    //       player  = *(u32*)(manager + 0x7828)
+    //       HP = *(float*)(player + 0xD4 + 0x80)
+    //       SP = *(float*)(player + 0xD4 + 0x84)   ※SPがHPの隣という推定
+    // ---------------------------------------------------------------
+    static bool PlayerStatusBase(u32 &base)
+    {
+        u32 mgr = 0, player = 0;
+        if (!Process::Read32(0x0068BBB8, mgr) || mgr == 0)
+            return false;
+        if (!Process::CheckAddress(mgr + 0x7828))
+            return false;
+        if (!Process::Read32(mgr + 0x7828, player) || player == 0)
+            return false;
+        base = player + 0xD4;
+        return Process::CheckAddress(base + 0x80) && Process::CheckAddress(base + 0x84);
+    }
+
+    // 減ったら、直前の最大値(回復で増えた値は更新)に戻す
+    static void KeepNoDecrease(MenuEntry *entry, u32 offset, float &held, u32 &lastBase)
+    {
+        if (!entry->IsActivated())
+        {
+            held = 0.0f;
+            lastBase = 0;
+            return;
+        }
+
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
+            return;
+
+        if (base != lastBase) // プレイヤーのデータが入れ替わったらリセット
+        {
+            lastBase = base;
+            held = 0.0f;
+        }
+
+        float cur = 0.0f;
+        if (!Process::ReadFloat(base + offset, cur))
+            return;
+        if (!(cur >= 0.0f && cur < 10000000.0f)) // NaN・異常値には触らない
+            return;
+
+        if (cur >= held)
+            held = cur;
+        else
+            Process::WriteFloat(base + offset, held);
+    }
+
+    static void HpNoDecreaseGame(MenuEntry *entry)
+    {
+        static float held = 0.0f;
+        static u32 lastBase = 0;
+        KeepNoDecrease(entry, 0x80, held, lastBase);
+    }
+
+    static void SpNoDecreaseGame(MenuEntry *entry)
+    {
+        static float held = 0.0f;
+        static u32 lastBase = 0;
+        KeepNoDecrease(entry, 0x84, held, lastBase);
+    }
+
+    // 確認用: HP/SPのアドレスを表示する (既存の固定アドレスと比べる用)
+    static void ShowStatusAddr(MenuEntry *entry)
+    {
+        (void)entry;
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
+        {
+            OSD::Notify("プレイヤーが見つかりません");
+            return;
+        }
+        float hp = 0.0f, sp = 0.0f;
+        Process::ReadFloat(base + 0x80, hp);
+        Process::ReadFloat(base + 0x84, sp);
+        MessageBox("HP/SPアドレス",
+                   Utils::Format("HP: %08X (%.1f)\nSP: %08X (%.1f)",
+                                 base + 0x80, hp, base + 0x84, sp))();
+    }
+
+    // ---------------------------------------------------------------
     //  メニュー登録
     // ---------------------------------------------------------------
     static void InitMenu(PluginMenu &menu)
@@ -305,6 +391,19 @@ namespace BattleCheats
             "近くの敵にダメージ判定を出します(倍率は等倍)。\n"
             "固定ダメージと併用すると、近くの敵に固定ダメージが入ります。\n"
             "設定で範囲を 1~200 で指定できます。"));
+
+        folder->Append(new MenuEntry(
+            "HP減らない", HpNoDecreaseGame, nullptr,
+            "プレイヤーのHPが減ったら、直前の値に戻します。\n"
+            "回復やレベルアップで増えた値は、新しい上限として覚えます。"));
+
+        folder->Append(new MenuEntry(
+            "SP減らない", SpNoDecreaseGame, nullptr,
+            "プレイヤーのSPが減ったら、直前の値に戻します。"));
+
+        folder->Append(new MenuEntry(
+            "HP/SPアドレス確認 (開発用)", nullptr, ShowStatusAddr,
+            "プレイヤーのHP/SPのアドレスと現在値を表示します。"));
 
         menu += folder;
     }
