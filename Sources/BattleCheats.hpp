@@ -539,14 +539,18 @@ namespace BattleCheats
     //     1段階目 = 50.0 (42480000) / 2段階目 = 100.0 (42C80000)
     //
     //     モード:
-    //       0 自動   : 通常は 100.0 で待機 → 技を使ってゲージが減ったら
-    //                  「2段階目が発動した」とみなし、効果時間のあいだ 50.0 に固定
-    //                  (1段階目のダメージ技を連打できる)。時間が過ぎたら 100.0 に戻る。
+    //       0 自動(フラグ判定) : 2段階目の効果中フラグ (player+0xA10) を読み、
+    //                  効果中は 50.0 固定 (1段階目のダメージ技を連打できる)、
+    //                  効果中でなければ 100.0 で待機 (すぐ2段階目を撃てる)。
+    //                  装備による効果時間の違いにも自動で追従する。
     //       1 段階1固定 : 常に 50.0
     //       2 段階2固定 : 常に 100.0
-    //     ※2段階目の効果が終わったかどうかはゲームから読めていないため、
-    //       「効果時間(秒)」を設定値で指定します。
+    //       3 自動(時間指定) : フラグを使わず、ゲージが減ったら発動とみなして
+    //                  設定した「効果時間(秒)」だけ 50.0 固定 (予備)
     // ---------------------------------------------------------------
+    // 2段階目の効果中フラグ (調査結果: player+0xA10 が 通常=0 / 効果中=1)
+    static const u32 TENSION_EFFECT_FLAG_OFF = 0x0A10;
+
     static u32 &TensionMode()
     {
         static u32 m = 0;
@@ -564,15 +568,16 @@ namespace BattleCheats
         (void)entry;
         std::vector<std::string> top;
         top.push_back("モード");
-        top.push_back("段階2の効果時間(秒)");
+        top.push_back("段階2の効果時間(秒) ※時間指定モード用");
         Keyboard kbTop("テンションゲージの設定", top);
         const int c = kbTop.Open();
         if (c == 0)
         {
             std::vector<std::string> modes;
-            modes.push_back("自動(段階2発動→効果中は段階1固定)");
+            modes.push_back("自動(効果中フラグで判定)");
             modes.push_back("段階1固定(50.0)");
             modes.push_back("段階2固定(100.0)");
+            modes.push_back("自動(効果時間を設定で指定)");
             Keyboard kbMode("モード", modes);
             const int m = kbMode.Open();
             if (m >= 0)
@@ -643,7 +648,21 @@ namespace BattleCheats
             return;
         }
 
-        // 自動モード
+        if (mode == 0)
+        {
+            // 自動(フラグ判定): 効果中 = 50.0 / 効果中でない = 100.0
+            u32 flag = 0;
+            if (!Process::Read32(base - 0xD4 + TENSION_EFFECT_FLAG_OFF, flag))
+                return;
+            if (flag > 1) // 想定外の値のときは触らない
+                return;
+            const float target = (flag == 1) ? 50.0f : 100.0f;
+            if (cur != target)
+                Process::WriteFloat(addr, target);
+            return;
+        }
+
+        // モード3: 自動(効果時間を設定で指定)
         if (!buff)
         {
             if (primed && cur < 99.0f) // 100.0 で待機中に減った = 段階2が発動した
@@ -815,7 +834,7 @@ namespace BattleCheats
         folder->Append(new MenuEntry(
             "テンションゲージ", TensionGame, TensionSettings,
             "テンションゲージを自動で管理します(設定でモードと効果時間を指定)。\n"
-            "自動: 通常は100.0で待機→段階2が発動したら効果時間のあいだ50.0固定。\n"
+            "自動: 効果中フラグを読んで、効果中は50.0固定、そうでなければ100.0で待機。\n"
             "段階1だけ解放済みの場合は、設定で「段階1固定」にしてください。"));
 
         folder->Append(new MenuEntry(
