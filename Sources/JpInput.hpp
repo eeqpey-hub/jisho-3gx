@@ -7,14 +7,14 @@
 //  Jp::AskJapanese(title, out)   日本語の文字列を1つ入力する。決定したら true (out は UTF-8)
 //  Jp::KanaVariants(text)        検索用: ひらがなならカタカナも、カタカナならひらがなも返す
 //
-// 漢字変換は libctru の httpc を直接使う。次のときは、メッセージを出して使えない。
+// 漢字変換は、初期状態では「無効」。使うときは、ItemEditor.hpp を include する前に
+//   #define JPINPUT_USE_GOOGLE 1
+// と書く。(libctru の httpc を直接使うので、ツールチェーンによってはビルドが通らないことがある。
+//  無効のままでも、ひらがな・カタカナ・英数字の入力は、そのまま使える。)
+// 有効にしたとき、次の場合は、メッセージを出して漢字変換だけ使えない。
 //   ・Wi-Fi につながっていない
 //   ・このゲームのプロセスに、HTTP サービスへのアクセス権が無い (httpcInit が失敗)
 //   ・Google 側と、3DS の TLS が合わない (https が失敗 → http を試す)
-// 漢字変換が使えなくても、ひらがな・カタカナ・英数字の入力は、そのまま使える。
-// 漢字変換を完全に切りたいときは、ItemEditor.hpp を include する前に
-//   #define JPINPUT_NO_GOOGLE 1
-// と書く。
 #pragma once
 
 namespace CTRPluginFramework
@@ -316,7 +316,7 @@ namespace Jp
         std::vector<std::string> cands;    // 変換候補
     };
 
-#ifndef JPINPUT_NO_GOOGLE
+#ifdef JPINPUT_USE_GOOGLE
     static std::string PercentEncode(const std::string &s)
     {
         static const char *HEX = "0123456789ABCDEF";
@@ -575,7 +575,7 @@ namespace Jp
         }
         return ParseGoogle(body, segs, err);
     }
-#endif  // JPINPUT_NO_GOOGLE
+#endif  // JPINPUT_USE_GOOGLE
 
     // ---------------- 入力の画面 ----------------
     // 日本語を1つ入力する。
@@ -599,10 +599,10 @@ namespace Jp
             std::vector<std::string> rows;
             rows.push_back("ひらがな: " + hira);
             rows.push_back("カタカナ: " + kata);
-#ifndef JPINPUT_NO_GOOGLE
+#ifdef JPINPUT_USE_GOOGLE
             rows.push_back("漢字に変換 (Google・ネット接続が必要)");
 #else
-            rows.push_back("(漢字変換は無効です)");
+            rows.push_back("(漢字変換は無効です。JpInput.hpp の先頭を参照)");
 #endif
             rows.push_back("英数字のまま: " + romaji);
             rows.push_back("入力し直す");
@@ -628,7 +628,7 @@ namespace Jp
             if (sel == 4)
                 continue;
 
-#ifndef JPINPUT_NO_GOOGLE
+#ifdef JPINPUT_USE_GOOGLE
             // 漢字変換
             std::vector<Segment> segs;
             std::string err;
