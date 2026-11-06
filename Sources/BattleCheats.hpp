@@ -3,25 +3,30 @@
 //  BattleCheats.hpp  (CTRPluginFramework / 3GX)
 //  対象: FLLINK (code.bin の 0x00100000 ベースのアドレス)
 //
+//  ★ゲーム側の「空き番地」は一切使いません。★
+//    割り込み処理(アセンブリ)はプラグイン自身のコード領域に置き、
+//    ゲーム側は下記の「フック位置」の2命令だけを書き換えます。
+//
+//  フック位置 (ほかのコードが同じ場所を書き換えていると使えません)
+//    固定ダメージ        : 0x003F4280, 0x003F4284
+//    ダメージ表示9999    : 0x001F9AFC, 0x001F9B00
+//    近づいたら判定      : 0x001A6404, 0x001A6408
+//  フック位置が他のコードに使われている場合は、書き込まずに通知して OFF にします。
+//
 //  収録:
-//    1. 固定ダメージ(プレイヤーのみ)  値 0〜2147483647 (デフォルト 0x7FFFFFFF)
-//       - 値が 10000 以上のときは「ダメージ表示9999固定」を自動で併用
-//    2. 近づいたらダメージ判定(倍率は等倍固定・範囲指定可)
+//    1. 固定ダメージ(プレイヤーのみ) 値 0〜2147483647 (既定 0x7FFFFFFF)
+//       - 値が 10000 以上のときは、ダメージ表示9999固定を自動で併用
+//    2. 近づいたらダメージ判定 (倍率は等倍固定・範囲指定可)
+//    3. HP減らない / SP減らない (プレイヤー)
 //
 //  使い方 (main.cpp など):
 //      #include "BattleCheats.hpp"
-//      ...
-//      BattleCheats::InitMenu(menu);   // PluginMenu &menu
+//      BattleCheats::InitMenu(menu);   // PluginMenu * でも & でも可
 //
-//  ※未検証のコードです。コード領域への書き込みは Process::Patch を使います。
-//    Process::Patch(u32, u32) がビルドエラーになる場合は、Patch32() の中身を
-//    Process::Write32(addr, v) に置き換えてください。
-//
-//  使用する空きアドレス(ゲーム側に何も入っていない領域)
-//    0x0061F950-0x0061F9FF / 0x0061FAC0-0x0061FAF3 / 0x0061FB80-0x0061FBEB
-//    0x0061FD00-0x0061FD5B / 0x0061FEC8-0x0061FED3 / 0x0061FF40-0x0061FFD7
-//  フック書き換え先
-//    0x001A6404 / 0x001F9AFC-0x001F9B03 / 0x003F4280-0x003F4287
+//  ※未検証のコードです。
+//    - コード領域への書き込みは Process::Patch(u32, u32) を使います。
+//      ビルドエラーなら Patch32() の中身を Process::Write32(addr, v) に変えてください。
+//    - アセンブリ部分は ARM モード(devkitARM 既定)前提です。
 // =====================================================================
 
 #include <CTRPluginFramework.hpp>
@@ -32,12 +37,6 @@ namespace BattleCheats
 {
     using namespace CTRPluginFramework;
 
-    struct Word
-    {
-        u32 addr;
-        u32 val;
-    };
-
     // ---------------------------------------------------------------
     //  共通
     // ---------------------------------------------------------------
@@ -46,54 +45,265 @@ namespace BattleCheats
         return Process::Patch(addr, v);
     }
 
-    template <size_t N>
-    static inline void WriteList(const Word (&list)[N])
-    {
-        for (size_t i = 0; i < N; ++i)
-            Patch32(list[i].addr, list[i].val);
-    }
+    static const u32 LDR_PC_NEXT = 0xE51FF004; // ldr pc, [pc, #-4] (次の1語が飛び先)
 
-    // 元の命令(code.bin より)
+    // 元の命令 (code.bin より)
     static const u32 ORG_DMG_80 = 0xEE000A10; // 0x003F4280  vmov s0, r0
     static const u32 ORG_DMG_84 = 0xEDDFBAA3; // 0x003F4284  vldr s23, [pc, #...]
     static const u32 ORG_DSP_FC = 0xE1A08001; // 0x001F9AFC  mov r8, r1
     static const u32 ORG_DSP_00 = 0xE1A07002; // 0x001F9B00  mov r7, r2
     static const u32 ORG_PRX_04 = 0xED2D8B02; // 0x001A6404  vpush {d8}
+    static const u32 ORG_PRX_08 = 0xEEB08A40; // 0x001A6408  vmov.f32 s16, s0
+
+    static inline u32 FnAddr(void (*f)())
+    {
+        return reinterpret_cast<u32>(f);
+    }
+
+    // フック位置が「元のまま」または「自分のフック」なら true
+    static bool HookIsFree(u32 addr, u32 org0, u32 org1, u32 fn)
+    {
+        u32 a = 0, b = 0;
+        if (!Process::Read32(addr, a) || !Process::Read32(addr + 4, b))
+            return false;
+        if (a == org0 && b == org1)
+            return true;
+        if (a == LDR_PC_NEXT && b == fn)
+            return true;
+        return false;
+    }
+
+    static void InstallHook(u32 addr, u32 fn)
+    {
+        Patch32(addr, LDR_PC_NEXT);
+        Patch32(addr + 4, fn);
+    }
+
+    static void RestoreHook(u32 addr, u32 org0, u32 org1)
+    {
+        Patch32(addr, org0);
+        Patch32(addr + 4, org1);
+    }
+
+    // ---------------------------------------------------------------
+    //  アセンブリから読む設定値 (asm からシンボル名で参照する)
+    // ---------------------------------------------------------------
+    static volatile u32 g_fixedDamage __asm__("BC_FixedDamage") __attribute__((used)) = 0x7FFFFFFF;
+    static volatile u32 g_proxRange   __asm__("BC_ProxRange")   __attribute__((used)) = 0x41800000; // 距離の2乗(float)
+
+    // ---------------------------------------------------------------
+    //  フック本体 (プラグイン内のアセンブリ)
+    //  プレイヤー = *( *(0x0068BBB8) + 0x7828 )   (ゲームの 0x00460968 と同じ手順)
+    // ---------------------------------------------------------------
+
+    // 0x003F4280 から飛んでくる。
+    //   r0 = ダメージ, r5 = 攻撃した側, r6 = 受けた側
+    //   プレイヤーが攻撃し、受けた側が敵のとき、ダメージを固定値にする。
+    static void __attribute__((naked, used, noinline)) FixedDamageHook()
+    {
+        asm volatile(
+            ".arm\n"
+            "ldr   r12, =0x0068BBB8\n"
+            "ldr   r12, [r12]\n"
+            "cmp   r12, #0\n"
+            "beq   .Lfd_end\n"
+            "add   r12, r12, #0x7800\n"
+            "ldr   r12, [r12, #0x28]\n"
+            "cmp   r12, #0\n"
+            "beq   .Lfd_end\n"
+            "cmp   r5, r12\n"            // 攻撃した側がプレイヤー?
+            "bne   .Lfd_end\n"
+            "ldrb  r12, [r6, #0x554]\n"  // 受けた側が敵?
+            "cmp   r12, #1\n"
+            "bne   .Lfd_end\n"
+            "ldrb  r12, [r6, #0x3BC]\n"
+            "cmp   r12, #2\n"
+            "cmpne r12, #0xE\n"
+            "bne   .Lfd_end\n"
+            "ldr   r0, =BC_FixedDamage\n"
+            "ldr   r0, [r0]\n"
+            ".Lfd_end:\n"
+            "vmov  s0, r0\n"             // 元の命令 (0x3F4280)
+            "vldr  s23, .Lfd_half\n"     // 元の命令 (0x3F4284)
+            "ldr   pc, =0x003F4288\n"
+            ".ltorg\n"
+            ".align 2\n"
+            ".Lfd_half: .float 0.5\n"
+        );
+    }
+
+    // 0x001F9AFC から飛んでくる。
+    //   r1 = ダメージ(表示用), r5 = 受けた側
+    //   受けた側がプレイヤー以外で、ダメージが0でなければ 9999 にする。
+    static void __attribute__((naked, used, noinline)) DisplayHook()
+    {
+        asm volatile(
+            ".arm\n"
+            "mov   r8, r1\n"             // 元の命令 (0x1F9AFC)
+            "mov   r7, r2\n"             // 元の命令 (0x1F9B00)
+            "ldr   r12, =0x0068BBB8\n"
+            "ldr   r12, [r12]\n"
+            "cmp   r12, #0\n"
+            "addne r12, r12, #0x7800\n"
+            "ldrne r12, [r12, #0x28]\n"
+            "cmp   r5, r12\n"
+            "cmpne r8, #0\n"
+            "movne r8, #0x2700\n"
+            "addne r8, r8, #0xF\n"       // 0x270F = 9999
+            "ldr   pc, =0x001F9B04\n"
+            ".ltorg\n"
+        );
+    }
+
+    // 0x001A6404 から飛んでくる (敵ごとの更新処理の入口)。
+    //   r5 = 敵。プレイヤーに近い敵に対して、ダメージ処理(0x003F4160)を呼ぶ。
+    //   倍率は 1.0 (等倍)。
+    static void __attribute__((naked, used, noinline)) ProximityHook()
+    {
+        asm volatile(
+            ".arm\n"
+            "push  {r0-r7, r12, lr}\n"
+            "vpush {d0-d3}\n"
+            // r4 = プレイヤー
+            "ldr   r12, =0x0068BBB8\n"
+            "ldr   r12, [r12]\n"
+            "mov   r4, #0\n"
+            "cmp   r12, #0\n"
+            "addne r12, r12, #0x7800\n"
+            "ldrne r4, [r12, #0x28]\n"
+            "cmp   r4, #0\n"
+            "beq   .Lpx_exit\n"
+            "cmp   r4, r5\n"
+            "beq   .Lpx_exit\n"
+            // 敵かどうか
+            "ldrb  r0, [r5, #0x554]\n"
+            "cmp   r0, #1\n"
+            "bne   .Lpx_exit\n"
+            "ldrb  r0, [r5, #0x3BC]\n"
+            "cmp   r0, #2\n"
+            "cmpne r0, #0xE\n"
+            "bne   .Lpx_exit\n"
+            "add   r0, r5, #0xD4\n"
+            "ldr   r12, =0x005AF9EC\n"
+            "blx   r12\n"
+            "cmp   r0, #0\n"
+            "bne   .Lpx_exit\n"
+            // 敵の座標 -> s0,s1,s2
+            "mov   r0, r5\n"
+            "ldr   r1, [r0]\n"
+            "ldr   r1, [r1, #0x18]\n"
+            "blx   r1\n"
+            "vldr  s0, [r0]\n"
+            "vldr  s1, [r0, #4]\n"
+            "vldr  s2, [r0, #8]\n"
+            // プレイヤーの座標 -> s3,s4,s5
+            "mov   r0, r4\n"
+            "ldr   r1, [r0]\n"
+            "ldr   r1, [r1, #0x18]\n"
+            "blx   r1\n"
+            "vldr  s3, [r0]\n"
+            "vldr  s4, [r0, #4]\n"
+            "vldr  s5, [r0, #8]\n"
+            // 距離の2乗
+            "vsub.f32 s0, s0, s3\n"
+            "vsub.f32 s1, s1, s4\n"
+            "vsub.f32 s2, s2, s5\n"
+            "vmul.f32 s0, s0, s0\n"
+            "vmla.f32 s0, s1, s1\n"
+            "vmla.f32 s0, s2, s2\n"
+            "ldr   r0, =BC_ProxRange\n"
+            "vldr  s1, [r0]\n"
+            "vcmpe.f32 s0, s1\n"
+            "vmrs  APSR_nzcv, fpscr\n"
+            "bgt   .Lpx_exit\n"          // 範囲外
+            // 範囲内: ダメージ処理を呼ぶ
+            "ldr   r0, [r4, #0x544]\n"
+            "str   r0, [r5, #0x548]\n"
+            "mov   r0, r5\n"
+            "bl    .Lpx_find\n"
+            "mov   r6, r0\n"
+            "mov   r0, r4\n"
+            "bl    .Lpx_find\n"
+            "mov   r7, r0\n"
+            "cmp   r6, #0\n"
+            "cmpne r7, #0\n"
+            "beq   .Lpx_exit\n"
+            "sub   sp, sp, #0x144\n"
+            "mov   r0, #0\n"
+            "mov   r1, sp\n"
+            "mov   r2, #0x44\n"
+            ".Lpx_clr:\n"
+            "str   r0, [r1], #4\n"
+            "subs  r2, r2, #1\n"
+            "bne   .Lpx_clr\n"
+            "str   r6, [sp, #8]\n"
+            "str   r7, [sp, #0x58]\n"
+            "add   r0, sp, #0xF0\n"
+            "str   r0, [sp, #0x70]\n"
+            "ldr   r0, =0x47C35000\n"
+            "str   r0, [sp, #0xBC]\n"
+            "vldr  s0, .Lpx_one\n"       // 倍率 1.0 (等倍固定)
+            "vldr  s1, .Lpx_one\n"
+            "vsub.f32 s2, s0, s0\n"
+            "mov   r0, sp\n"
+            "add   r1, sp, #0x50\n"
+            "mvn   r2, #0\n"
+            "mov   r3, #1\n"
+            "ldr   r12, =0x003F4160\n"
+            "blx   r12\n"
+            "add   sp, sp, #0x144\n"
+            ".Lpx_exit:\n"
+            "vpop  {d0-d3}\n"
+            "pop   {r0-r7, r12, lr}\n"
+            "vpush {d8}\n"               // 元の命令 (0x1A6404)
+            "vmov.f32 s16, s0\n"         // 元の命令 (0x1A6408)
+            "ldr   pc, =0x001A640C\n"
+            ".ltorg\n"
+            ".align 2\n"
+            ".Lpx_one: .float 1.0\n"
+            // r0 = 敵/プレイヤーのポインタ -> r0 = ゲーム内ハンドル (0 なら見つからない)
+            ".Lpx_find:\n"
+            "ldr   r1, =0x0068BBB8\n"
+            "ldr   r1, [r1]\n"
+            "add   r1, r1, #4\n"
+            "add   r1, r1, #0x7800\n"
+            "add   r1, r1, #0x16C\n"
+            "ldr   r2, [r1, #0x1C]\n"
+            "cmp   r2, #0\n"
+            "moveq r0, #0\n"
+            "bxeq  lr\n"
+            "ldr   r3, [r1, #0x20]\n"
+            "add   r2, r2, #0x10\n"
+            ".Lpx_fa:\n"
+            "cmp   r3, #0\n"
+            "moveq r0, #0\n"
+            "bxeq  lr\n"
+            "ldr   r12, [r2]\n"
+            ".Lpx_fb:\n"
+            "cmp   r12, #0\n"
+            "beq   .Lpx_fc\n"
+            "ldr   r1, [r12, #8]\n"
+            "cmp   r1, r0\n"
+            "ldreq r0, [r12, #4]\n"
+            "bxeq  lr\n"
+            "ldr   r12, [r12, #0x10]\n"
+            "b     .Lpx_fb\n"
+            ".Lpx_fc:\n"
+            "add   r2, r2, #0x14\n"
+            "sub   r3, r3, #1\n"
+            "b     .Lpx_fa\n"
+            ".ltorg\n"
+        );
+    }
 
     // ---------------------------------------------------------------
     //  1. 固定ダメージ (プレイヤーのみ)
     // ---------------------------------------------------------------
-    static const u32 FIX_VALUE_ADDR = 0x0061FD54;
-
-    static const Word FIX_CAVE[] =
-    {
-        {0x0061FD00, 0xE92D400F}, {0x0061FD04, 0xE3E01063}, {0x0061FD08, 0xEBF90316},
-        {0x0061FD0C, 0xE1A0C000}, {0x0061FD10, 0xE8BD400F}, {0x0061FD14, 0xE35C0000},
-        {0x0061FD18, 0x0A000009}, {0x0061FD1C, 0xE155000C}, {0x0061FD20, 0x1A000007},
-        {0x0061FD24, 0xE5D6C554}, {0x0061FD28, 0xE35C0001}, {0x0061FD2C, 0x1A000004},
-        {0x0061FD30, 0xE5D6C3BC}, {0x0061FD34, 0xE35C0002}, {0x0061FD38, 0x135C000E},
-        {0x0061FD3C, 0x1A000000}, {0x0061FD40, 0xE59F000C}, {0x0061FD44, 0xEE000A10},
-        {0x0061FD48, 0xEDDFBA02}, {0x0061FD4C, 0xE51FF004}, {0x0061FD50, 0x003F4288},
-        /* 0x0061FD54 は固定ダメージ値(実行時に書き込み) */
-        {0x0061FD58, 0x3F000000},
-    };
-
-    // ダメージ表示9999固定 (10000以上のときだけ自動で有効)
-    static const Word DSP_CAVE[] =
-    {
-        {0x0061FAC0, 0xE1A08001}, {0x0061FAC4, 0xE1A07002}, {0x0061FAC8, 0xE92D400F},
-        {0x0061FACC, 0xE3E01063}, {0x0061FAD0, 0xEBF903A4}, {0x0061FAD4, 0xE1A0C000},
-        {0x0061FAD8, 0xE8BD400F}, {0x0061FADC, 0xE155000C}, {0x0061FAE0, 0x13580000},
-        {0x0061FAE4, 0x13A08C27}, {0x0061FAE8, 0x1288800F}, {0x0061FAEC, 0xE51FF004},
-        {0x0061FAF0, 0x001F9B04},
-    };
-
     static const u32 DISPLAY_LIMIT = 10000; // これ以上は表示9999固定を併用
 
-    static u32 &FixedDamageValue()
+    static u32 FixedDamageValue()
     {
-        static u32 v = 0x7FFFFFFF;
-        return v;
+        return g_fixedDamage;
     }
 
     static void FixedDamageSettings(MenuEntry *entry)
@@ -107,7 +317,7 @@ namespace BattleCheats
         {
             if (v > 0x7FFFFFFF)
                 v = 0x7FFFFFFF;
-            FixedDamageValue() = v;
+            g_fixedDamage = v;
         }
     }
 
@@ -115,21 +325,18 @@ namespace BattleCheats
     {
         static bool fixApplied = false;
         static bool dspApplied = false;
-        static u32  lastValue = 0;
 
         if (!entry->IsActivated())
         {
             // OFF: 元に戻す
             if (dspApplied)
             {
-                Patch32(0x001F9AFC, ORG_DSP_FC);
-                Patch32(0x001F9B00, ORG_DSP_00);
+                RestoreHook(0x001F9AFC, ORG_DSP_FC, ORG_DSP_00);
                 dspApplied = false;
             }
             if (fixApplied)
             {
-                Patch32(0x003F4280, ORG_DMG_80);
-                Patch32(0x003F4284, ORG_DMG_84);
+                RestoreHook(0x003F4280, ORG_DMG_80, ORG_DMG_84);
                 fixApplied = false;
             }
             return;
@@ -137,20 +344,16 @@ namespace BattleCheats
 
         const u32 value = FixedDamageValue();
 
-        // 固定ダメージ本体 (コードの穴 → 最後にフック)
         if (!fixApplied)
         {
-            WriteList(FIX_CAVE);
-            Patch32(FIX_VALUE_ADDR, value);
-            lastValue = value;
-            Patch32(0x003F4280, 0xE51FF004);
-            Patch32(0x003F4284, 0x0061FD00);
+            if (!HookIsFree(0x003F4280, ORG_DMG_80, ORG_DMG_84, FnAddr(FixedDamageHook)))
+            {
+                OSD::Notify("固定ダメージ: フック位置が他のコードに使われています");
+                entry->Disable();
+                return;
+            }
+            InstallHook(0x003F4280, FnAddr(FixedDamageHook));
             fixApplied = true;
-        }
-        else if (value != lastValue)
-        {
-            Patch32(FIX_VALUE_ADDR, value);
-            lastValue = value;
         }
 
         // ダメージ表示9999固定 (値に応じて自動 ON/OFF)
@@ -158,16 +361,19 @@ namespace BattleCheats
         {
             if (!dspApplied)
             {
-                WriteList(DSP_CAVE);
-                Patch32(0x001F9AFC, 0xE51FF004);
-                Patch32(0x001F9B00, 0x0061FAC0);
+                if (!HookIsFree(0x001F9AFC, ORG_DSP_FC, ORG_DSP_00, FnAddr(DisplayHook)))
+                {
+                    OSD::Notify("ダメージ表示9999: フック位置が他のコードに使われています");
+                    entry->Disable();
+                    return;
+                }
+                InstallHook(0x001F9AFC, FnAddr(DisplayHook));
                 dspApplied = true;
             }
         }
         else if (dspApplied)
         {
-            Patch32(0x001F9AFC, ORG_DSP_FC);
-            Patch32(0x001F9B00, ORG_DSP_00);
+            RestoreHook(0x001F9AFC, ORG_DSP_FC, ORG_DSP_00);
             dspApplied = false;
         }
     }
@@ -177,54 +383,8 @@ namespace BattleCheats
     //     ダメージは通常の攻撃計算を通るので、固定ダメージと併用すると
     //     近くの敵に固定ダメージが入ります。
     // ---------------------------------------------------------------
-    static const u32 PRX_RANGE_ADDR = 0x0061F9FC; // 距離の2乗(float)
-
-    static const Word PRX_CAVE[] =
-    {
-        {0x0061F950, 0xE92D50FF}, {0x0061F954, 0xED2D0B08}, {0x0061F958, 0xE3E01063},
-        {0x0061F95C, 0xEBF90401}, {0x0061F960, 0xE1A04000}, {0x0061F964, 0xE1540005},
-        {0x0061F968, 0x0A000193}, {0x0061F96C, 0xE5D50554}, {0x0061F970, 0xE3500001},
-        {0x0061F974, 0x1A000190}, {0x0061F978, 0xE5D503BC}, {0x0061F97C, 0xE3500002},
-        {0x0061F980, 0x1350000E}, {0x0061F984, 0x1A00018C}, {0x0061F988, 0xE28500D4},
-        {0x0061F98C, 0xEBFE4016}, {0x0061F990, 0xE3500000}, {0x0061F994, 0x1A000188},
-        {0x0061F998, 0xE1A00005}, {0x0061F99C, 0xE5901000}, {0x0061F9A0, 0xE5911018},
-        {0x0061F9A4, 0xE12FFF31}, {0x0061F9A8, 0xED900A00}, {0x0061F9AC, 0xEDD00A01},
-        {0x0061F9B0, 0xED901A02}, {0x0061F9B4, 0xE1A00004}, {0x0061F9B8, 0xE5901000},
-        {0x0061F9BC, 0xE5911018}, {0x0061F9C0, 0xE12FFF31}, {0x0061F9C4, 0xEDD01A00},
-        {0x0061F9C8, 0xED902A01}, {0x0061F9CC, 0xEDD02A02}, {0x0061F9D0, 0xEE300A61},
-        {0x0061F9D4, 0xEE700AC2}, {0x0061F9D8, 0xEE311A62}, {0x0061F9DC, 0xEE200A00},
-        {0x0061F9E0, 0xEE000AA0}, {0x0061F9E4, 0xEE010A01}, {0x0061F9E8, 0xEDDF0A03},
-        {0x0061F9EC, 0xEEB40AE0}, {0x0061F9F0, 0xEEF1FA10}, {0x0061F9F4, 0xCA000170},
-        {0x0061F9F8, 0xEA000132},
-        /* 0x0061F9FC は範囲(実行時に書き込み) */
-        {0x0061FB80, 0xE59F1060}, {0x0061FB84, 0xE5911000}, {0x0061FB88, 0xE2811004},
-        {0x0061FB8C, 0xE2811C78}, {0x0061FB90, 0xE2811F5B}, {0x0061FB94, 0xE591201C},
-        {0x0061FB98, 0xE3520000}, {0x0061FB9C, 0x03A00000}, {0x0061FBA0, 0x012FFF1E},
-        {0x0061FBA4, 0xE5913020}, {0x0061FBA8, 0xE2822010}, {0x0061FBAC, 0xE3530000},
-        {0x0061FBB0, 0x03A00000}, {0x0061FBB4, 0x012FFF1E}, {0x0061FBB8, 0xE592C000},
-        {0x0061FBBC, 0xE35C0000}, {0x0061FBC0, 0x0A000005}, {0x0061FBC4, 0xE59C1008},
-        {0x0061FBC8, 0xE1510000}, {0x0061FBCC, 0x059C0004}, {0x0061FBD0, 0x012FFF1E},
-        {0x0061FBD4, 0xE59CC010}, {0x0061FBD8, 0xEAFFFFF7}, {0x0061FBDC, 0xE2822014},
-        {0x0061FBE0, 0xE2433001}, {0x0061FBE4, 0xEAFFFFF0}, {0x0061FBE8, 0x0068BBB8},
-        {0x0061FEC8, 0xE5940544}, {0x0061FECC, 0xE5850548}, {0x0061FED0, 0xEA00001A},
-        {0x0061FF40, 0xE1A00005}, {0x0061FF44, 0xEBFFFF0D}, {0x0061FF48, 0xE1A06000},
-        {0x0061FF4C, 0xE1A00004}, {0x0061FF50, 0xEBFFFF0A}, {0x0061FF54, 0xE1A07000},
-        {0x0061FF58, 0xE3560000}, {0x0061FF5C, 0x13570000}, {0x0061FF60, 0x0A000015},
-        {0x0061FF64, 0xE24DDF44}, {0x0061FF68, 0xE3A00000}, {0x0061FF6C, 0xE1A0100D},
-        {0x0061FF70, 0xE3A02044}, {0x0061FF74, 0xE4810004}, {0x0061FF78, 0xE2522001},
-        {0x0061FF7C, 0x1AFFFFFC}, {0x0061FF80, 0xE58D6008}, {0x0061FF84, 0xE58D7058},
-        {0x0061FF88, 0xE28D00F0}, {0x0061FF8C, 0xE58D0070}, {0x0061FF90, 0xE59F0034},
-        {0x0061FF94, 0xE58D00BC}, {0x0061FF98, 0xED9F0A0C}, {0x0061FF9C, 0xEDDF0A0C},
-        {0x0061FFA0, 0xEE301A40}, {0x0061FFA4, 0xE1A0000D}, {0x0061FFA8, 0xE28D1050},
-        {0x0061FFAC, 0xE3E02000}, {0x0061FFB0, 0xE3A03001}, {0x0061FFB4, 0xEBF75069},
-        {0x0061FFB8, 0xE28DDF44}, {0x0061FFBC, 0xECBD0B08}, {0x0061FFC0, 0xE8BD50FF},
-        {0x0061FFC4, 0xED2D8B02}, {0x0061FFC8, 0xEAEE190E}, {0x0061FFCC, 0x47C35000},
-        {0x0061FFD0, 0x3F800000}, /* 倍率 1.0 (等倍固定) */
-        {0x0061FFD4, 0x3F800000},
-    };
-
-    // 範囲 (距離の整数値)。内部では距離の2乗(float)を書き込む。
-    // 既定値 4 → 4*4 = 16.0 (元コードの 0x41800000 と同じ)
+    // 範囲 (距離の整数値)。内部では距離の2乗(float)を使う。
+    // 既定値 4 → 4*4 = 16.0 (従来の 0x41800000 と同じ)
     static u32 &ProximityRadius()
     {
         static u32 r = 4;
@@ -258,39 +418,34 @@ namespace BattleCheats
     static void ProximityGame(MenuEntry *entry)
     {
         static bool applied = false;
-        static u32  lastRadius = 0;
 
         if (!entry->IsActivated())
         {
             if (applied)
             {
-                Patch32(0x001A6404, ORG_PRX_04);
+                RestoreHook(0x001A6404, ORG_PRX_04, ORG_PRX_08);
                 applied = false;
             }
             return;
         }
 
-        const u32 r = ProximityRadius();
+        g_proxRange = RadiusToBits(ProximityRadius()); // 範囲の変更をすぐ反映
 
         if (!applied)
         {
-            WriteList(PRX_CAVE);
-            Patch32(PRX_RANGE_ADDR, RadiusToBits(r));
-            lastRadius = r;
-            Patch32(0x001A6404, 0xEA11E551); // フックは最後に書く
+            if (!HookIsFree(0x001A6404, ORG_PRX_04, ORG_PRX_08, FnAddr(ProximityHook)))
+            {
+                OSD::Notify("近づいたら判定: フック位置が他のコードに使われています");
+                entry->Disable();
+                return;
+            }
+            InstallHook(0x001A6404, FnAddr(ProximityHook));
             applied = true;
-        }
-        else if (r != lastRadius)
-        {
-            Patch32(PRX_RANGE_ADDR, RadiusToBits(r));
-            lastRadius = r;
         }
     }
 
     // ---------------------------------------------------------------
     //  3. HP減らない / SP減らない (プレイヤー)
-    //     ヒープの固定アドレスは使わず、ゲーム自身がプレイヤーを探す方法
-    //     (0x00460968 の関数と同じ手順)でアドレスを毎回求める。
     //       manager = *(u32*)0x0068BBB8
     //       player  = *(u32*)(manager + 0x7828)
     //       HP = *(float*)(player + 0xD4 + 0x80)
@@ -355,7 +510,7 @@ namespace BattleCheats
         KeepNoDecrease(entry, 0x84, held, lastBase);
     }
 
-    // 確認用: HP/SPのアドレスを表示する (既存の固定アドレスと比べる用)
+    // 確認用: HP/SPのアドレスを表示する
     static void ShowStatusAddr(MenuEntry *entry)
     {
         (void)entry;
