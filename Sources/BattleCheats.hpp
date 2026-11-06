@@ -539,7 +539,7 @@ namespace BattleCheats
     //     1段階目 = 50.0 (42480000) / 2段階目 = 100.0 (42C80000)
     //
     //     モード:
-    //       0 自動(フラグ判定) : 2段階目の効果中フラグ (player+0xA10) を読み、
+    //       0 自動(フラグ判定) : 2段階目の効果中フラグ (player+0xFBC の最上位ビット) を読み、
     //                  効果中は 50.0 固定 (1段階目のダメージ技を連打できる)、
     //                  効果中でなければ 100.0 で待機 (すぐ2段階目を撃てる)。
     //                  装備による効果時間の違いにも自動で追従する。
@@ -548,14 +548,15 @@ namespace BattleCheats
     //       3 自動(時間指定) : フラグを使わず、ゲージが減ったら発動とみなして
     //                  設定した「効果時間(秒)」だけ 50.0 固定 (予備)
     // ---------------------------------------------------------------
-    // ※ player+0xA10 は「武器を構えている(戦闘モード)」フラグで、効果中フラグではなかった。
-    //   モード0は効果中フラグが見つかるまで使えない(下の定数を差し替えて使う)。
-    // 2段階目の効果中フラグ (未特定: 調査で見つけたオフセットに置き換える)
-    static const u32 TENSION_EFFECT_FLAG_OFF = 0x0A10;
+    // 2段階目の効果中フラグ (調査結果): player+0xFBC
+    //   効果中 = 最上位ビット(0x80000000)が立つ (例 8000000A / 8000000F)
+    //   効果なし = 0   ※武器を構えただけでは変わらない
+    //   (player+0xA10 は「武器を構えている」フラグで、効果中フラグではない)
+    static const u32 TENSION_EFFECT_FLAG_OFF = 0x0FBC;
 
     static u32 &TensionMode()
     {
-        static u32 m = 3; // フラグ判定(0)は未完成のため、既定は時間指定(3)
+        static u32 m = 0; // 既定: フラグ判定
         return m;
     }
 
@@ -576,7 +577,7 @@ namespace BattleCheats
         if (c == 0)
         {
             std::vector<std::string> modes;
-            modes.push_back("自動(効果中フラグで判定) ※未完成");
+            modes.push_back("自動(効果中フラグで判定)");
             modes.push_back("段階1固定(50.0)");
             modes.push_back("段階2固定(100.0)");
             modes.push_back("自動(効果時間を設定で指定)");
@@ -656,9 +657,8 @@ namespace BattleCheats
             u32 flag = 0;
             if (!Process::Read32(base - 0xD4 + TENSION_EFFECT_FLAG_OFF, flag))
                 return;
-            if (flag > 1) // 想定外の値のときは触らない
-                return;
-            const float target = (flag == 1) ? 50.0f : 100.0f;
+            const bool effect = (flag & 0x80000000u) != 0;
+            const float target = effect ? 50.0f : 100.0f;
             if (cur != target)
                 Process::WriteFloat(addr, target);
             return;
