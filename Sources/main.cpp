@@ -1,1432 +1,884 @@
-// ファンタジーライフ(日本語版) アイテムエディタ  (CTRPluginFramework / .3gx)
+#pragma once
+// =====================================================================
+//  BattleCheats.hpp  (CTRPluginFramework / 3GX)
+//  対象: FLLINK (code.bin の 0x00100000 ベースのアドレス)
 //
-// 海外版PLGのItemEditorと同じ仕組み:
-//   1) ゲームの装備処理2か所にフックを入れ、装備したアイテムの構造体アドレスを取得
-//   2) Yボタンでエディタを開く
-//   3) 構造体を書き換え、「外して装備し直す」と反映される
+//  ★ゲーム側の「空き番地」は一切使いません。★
+//    割り込み処理(アセンブリ)はプラグイン自身のコード領域に置き、
+//    ゲーム側は下記の「フック位置」の2命令だけを書き換えます。
 //
-// 日本語版のフック位置は、海外版コードとの命令列照合で求めたもの。
-// 位置の命令列が違う場合は、フックを入れずに警告を出す。
-// フックは A(0x2D33F8) のみ。ライフ道具もAで同じレコードが取れる(gdb確認済み)。
-// フックB(0x2BA928)は、ライフ道具の装備でクラッシュしたため削除した。
+//  フック位置 (ほかのコードが同じ場所を書き換えていると使えません)
+//    固定ダメージ        : 0x003F4280, 0x003F4284
+//    ダメージ表示9999    : 0x001F9AFC, 0x001F9B00
+//    近づいたら判定      : 0x001A6404, 0x001A6408
+//  フック位置が他のコードに使われている場合は、書き込まずに通知して OFF にします。
 //
-// 構造体のオフセットは、ユーザー提供のARコード(かばん 0x6DDF2C から 0x3C 刻み)と
-// PLGのエディタが使う位置(+0x1E, +0x20 など)に一致している。
+//  収録:
+//    1. 固定ダメージ(プレイヤーのみ) 値 0〜2147483647 (既定 0x7FFFFFFF)
+//       - 値が 10000 以上のときは、ダメージ表示9999固定を自動で併用
+//    2. 近づいたらダメージ判定 (倍率は等倍固定・範囲指定可)
+//    3. HP減らない / SP減らない (プレイヤー)
+//    4. テンションゲージ (自動 / 段階1固定 / 段階2固定)
+//
+//  使い方 (main.cpp など):
+//      #include "BattleCheats.hpp"
+//      BattleCheats::InitMenu(menu);   // PluginMenu * でも & でも可
+//
+//  ※未検証のコードです。
+//    - コード領域への書き込みは Process::Patch(u32, u32) を使います。
+//      ビルドエラーなら Patch32() の中身を Process::Write32(addr, v) に変えてください。
+//    - アセンブリ部分は ARM モード(devkitARM 既定)前提です。
+// =====================================================================
 
-#include <3ds.h>
-#include "csvc.h"
 #include <CTRPluginFramework.hpp>
-#include <algorithm>
-#include <cstdlib>
 #include <cstring>
+#include <cstddef>
 #include <string>
 #include <vector>
 
-// ------------------------------------------------------------
-//  名前の表 (ID → 表示名)。末尾は name == nullptr。
-//  ItemNames.hpp があれば、その中の g_itemNames / g_effectNames を使う。
-//  無ければ空の表になり、IDの直接入力だけになる。
-// ------------------------------------------------------------
-struct NameEntry
+namespace BattleCheats
 {
-    u16         id;
-    const char *name;
-};
+    using namespace CTRPluginFramework;
 
-#if defined(__has_include)
-#  if __has_include("ItemNames.hpp")
-#    include "ItemNames.hpp"
-#    define HAVE_NAME_TABLES 1
-#  endif
-#endif
-#ifndef HAVE_NAME_TABLES
-static const NameEntry g_itemNames[]   = { { 0xFFFF, nullptr } };
-static const NameEntry g_effectNames[] = { { 0xFFFF, nullptr } };
-#endif
-#include "Life.hpp"
-#include "Craft.hpp"
-#include "Mage.hpp"      // 魔法使い関連はすべてこのファイル
-#include "BattleCheats.hpp"
-
-// ------------------------------------------------------------
-//  フック本体 (アセンブラ)  ※PLGのコールバックと同じ動作
-//  呼び出し側で「found-4」に str pc,[sp,#-4]! を書いてあるので、
-//  スタックには (found+4) が積まれている。置き換えた3命令をここで再実行して、
-//  found+8 に戻る。
-// ------------------------------------------------------------
-extern "C"
-{
-    void jp_hookA(void);
-    void jp_hookB2(void);
-
-    volatile u32 g_capPtr   = 0;
-    volatile u32 g_capCount = 0;
-
-    void jp_captureA(u32 r3) { g_capPtr = r3 + 4; g_capCount = g_capCount + 1; }
-    void jp_captureB(u32 r4) { g_capPtr = r4 + 4; g_capCount = g_capCount + 1; }
-
-    // ---- エリアワープ用 (実機未検証) ----
-    void jp_hookWarp(void);
-    volatile u32 g_warpPending = 0;
-    volatile u32 g_warpArea    = 0;
-    volatile u32 g_warpLink    = 0;
-    volatile u32 g_warpUseLink = 1;   // 1 = 入口番号を渡す (0 も指定できる) / 0 = 渡さない (標準の入口)
-    volatile u32 g_warpTask    = 0;   // 毎フレーム更新される。エリアID = g_warpTask + 0x6B2
-
-
-    // ---- 保存した位置へ置く (到着後) ----
-    // プレイヤーのデータ: [[0x68BBB8] + 0x7828] (クラス cAppUnit, vptr 0x671EB8)。
-    // エリアを移るたびにアドレスが変わるので、毎回この経路で取り直す。
-    // 座標 (x,y,z) は同じ値が複数の場所にある。GDBで、全部に書くと即座に移動し、
-    // +0x7C だけだと、スティック操作のあとに反映されることを確認した。
-    // 各コピーには「基準の座標との差」を足して書く (コピーごとに高さのずれがあるため)。
-    // 「ゲームが初期位置に置く」ことを検出してから書く。タイミングが分からないので、
-    //  ・新しいプレイヤーのデータが出来て、位置が大きく動いたあと (= 配置された)、
-    //  ・位置が POS_SETTLE_FRAMES フレーム止まったら、書き始める。
-    //  配置が見えなかった場合は、POS_FALLBACK_FRAMES 待ってから書く。
-    //  書き始めたら、POS_HOLD_FRAMES フレームの間、毎フレーム書き続ける (あとからの上書きを直す)。
-    #define POS_JUMP_DIST       2.0f     // 1フレームでこれ以上動いたら「配置された」とみなす
-    #define POS_SETTLE_FRAMES   20
-    #define POS_FALLBACK_FRAMES 240
-    #define POS_LONG_FRAMES     900
-    #define POS_REUSE_FRAMES    10      // プレイヤーのアドレスが変わらない場合の待ち
-    #define POS_HOLD_FRAMES     120
-    #define POS_TIMEOUT_FRAMES  (60 * 40)
-    #define POS_REC_MAX         900      // 経過の記録 (「位置ワープの記録を保存」で書き出せる)
-
-    volatile u32 g_posMode     = 0;      // 0 = なし / 1 = エリアの読み込み待ち / 2 = 書き込み中
-    volatile u32 g_posArea     = 0;
-    volatile u32 g_posOldObj   = 0;
-    volatile u32 g_posFrames   = 0;
-    volatile u32 g_posSince    = 0;
-    volatile u32 g_posSettle   = 0;
-    volatile u32 g_posJumps    = 0;
-    volatile u32 g_posSawGap   = 0;
-    volatile u32 g_posHold     = 0;
-    volatile u32 g_posHaveLast = 0;
-    volatile float g_posLast[3] = { 0.0f, 0.0f, 0.0f };
-    volatile float g_posXYZ[3]  = { 0.0f, 0.0f, 0.0f };
-
-    volatile u32 g_recN = 0;
-    static u8    g_recMode[POS_REC_MAX];
-    static u16   g_recArea[POS_REC_MAX];
-    static u8    g_recState[POS_REC_MAX];
-    static u32   g_recObj[POS_REC_MAX];
-    static float g_recPos[POS_REC_MAX][3];
-
-    static float PosAbs(float v) { return v < 0.0f ? -v : v; }
-    static bool  PosSane(float v) { return v > -20000.0f && v < 20000.0f; }
-
-    // プレイヤーのデータを取る。クラスの種類 (vptr) では見分けず、
-    // 座標のコピー同士 (+0x7C と +0x40) が一致していることで確かめる。
-    static u32 PosPlayerObj(void)
+    // ---------------------------------------------------------------
+    //  共通
+    // ---------------------------------------------------------------
+    static inline bool Patch32(u32 addr, u32 v)
     {
-        const u32 mgr = *(volatile u32 *)0x68BBB8;
-        if (mgr < 0x08000000u || mgr >= 0x1F000000u || (mgr & 3))
-            return 0;
-        const u32 obj = *(volatile u32 *)(mgr + 0x7828);
-        if (obj < 0x08000000u || obj >= 0x1F000000u || (obj & 3))
-            return 0;
-        const float x = *(volatile float *)(obj + 0x7C), y = *(volatile float *)(obj + 0x80), z = *(volatile float *)(obj + 0x84);
-        const float x2 = *(volatile float *)(obj + 0x40), z2 = *(volatile float *)(obj + 0x60);
-        if (!PosSane(x) || !PosSane(y) || !PosSane(z) || !PosSane(x2) || !PosSane(z2))
-            return 0;
-        if (PosAbs(x - x2) > 1.0f || PosAbs(z - z2) > 1.0f)
-            return 0;
-        return obj;
+        return Process::Patch(addr, v);
     }
 
-    static void PosApply(u32 obj, float tx, float ty, float tz)
+    static const u32 LDR_PC_NEXT = 0xE51FF004; // ldr pc, [pc, #-4] (次の1語が飛び先)
+
+    // 元の命令 (code.bin より)
+    static const u32 ORG_DMG_80 = 0xEE000A10; // 0x003F4280  vmov s0, r0
+    static const u32 ORG_DMG_84 = 0xEDDFBAA3; // 0x003F4284  vldr s23, [pc, #...]
+    static const u32 ORG_DSP_FC = 0xE1A08001; // 0x001F9AFC  mov r8, r1
+    static const u32 ORG_DSP_00 = 0xE1A07002; // 0x001F9B00  mov r7, r2
+    static const u32 ORG_PRX_04 = 0xED2D8B02; // 0x001A6404  vpush {d8}
+    static const u32 ORG_PRX_08 = 0xEEB08A40; // 0x001A6408  vmov.f32 s16, s0
+
+    static inline u32 FnAddr(void (*f)())
     {
-        static const u16 offX[] = { 0x7C, 0x40, 0x10, 0x20C, 0x218 };
-        static const u16 offY[] = { 0x80, 0x50, 0x20, 0x210, 0x21C };
-        static const u16 offZ[] = { 0x84, 0x60, 0x30, 0x214, 0x220 };
-
-        const float cx = *(volatile float *)(obj + 0x7C);
-        const float cy = *(volatile float *)(obj + 0x80);
-        const float cz = *(volatile float *)(obj + 0x84);
-        if (!PosSane(cx) || !PosSane(cy) || !PosSane(cz))
-            return;                                  // 変な値 (NaNなど) のときは書かない
-
-        const float dx = tx - cx, dy = ty - cy, dz = tz - cz;
-        if (dx == 0.0f && dy == 0.0f && dz == 0.0f)
-            return;
-        for (unsigned i = 0; i < sizeof(offX) / sizeof(offX[0]); ++i) *(volatile float *)(obj + offX[i]) += dx;
-        for (unsigned i = 0; i < sizeof(offY) / sizeof(offY[0]); ++i) *(volatile float *)(obj + offY[i]) += dy;
-        for (unsigned i = 0; i < sizeof(offZ) / sizeof(offZ[0]); ++i) *(volatile float *)(obj + offZ[i]) += dz;
+        return reinterpret_cast<u32>(f);
     }
 
-    static void PosResetDetect(void)
+    // フック位置が「元のまま」または「自分のフック」なら true
+    static bool HookIsFree(u32 addr, u32 org0, u32 org1, u32 fn)
     {
-        g_posSince    = 0;
-        g_posSettle   = 0;
-        g_posJumps    = 0;
-        g_posHaveLast = 0;
-    }
-
-    // ゲーム本体のスレッドから、毎フレーム呼ばれる。
-    static void PosTick(u32 task)
-    {
-        if (!g_posMode)
-            return;
-
-        const u32 obj   = PosPlayerObj();
-        const u32 area  = *(volatile u16 *)(task + 0x6B2);
-        const u32 state = *(volatile u8 *)(task + 624);
-        float p[3] = { 0.0f, 0.0f, 0.0f };
-        if (obj)
-        {
-            p[0] = *(volatile float *)(obj + 0x7C);
-            p[1] = *(volatile float *)(obj + 0x80);
-            p[2] = *(volatile float *)(obj + 0x84);
-        }
-
-        g_posFrames = g_posFrames + 1;
-
-        const u32 n = g_recN;                        // 経過の記録
-        if (n < POS_REC_MAX)
-        {
-            g_recMode[n]   = (u8)g_posMode;
-            g_recArea[n]   = (u16)area;
-            g_recState[n]  = (u8)state;
-            g_recObj[n]    = obj;
-            g_recPos[n][0] = p[0];
-            g_recPos[n][1] = p[1];
-            g_recPos[n][2] = p[2];
-            g_recN         = n + 1;
-        }
-
-        if (g_posMode == 1)                          // エリアの読み込み待ち
-        {
-            if (g_posFrames > POS_TIMEOUT_FRAMES)
-            {
-                g_posMode = 0;                       // 間に合わなかったので、あきらめる
-                return;
-            }
-            if (!obj)
-            {
-                g_posSawGap = 1;                     // 読み込み中は、プレイヤーのデータが一時的になくなる
-                PosResetDetect();
-                return;
-            }
-            bool fresh = (obj != g_posOldObj) || g_posSawGap;
-            if (!fresh && g_posFrames > POS_REUSE_FRAMES)
-                fresh = true;
-            if (area != g_posArea || !fresh)
-            {
-                PosResetDetect();
-                return;
-            }
-
-            g_posSince = g_posSince + 1;
-            if (g_posHaveLast)
-            {
-                float m = PosAbs(p[0] - g_posLast[0]);
-                const float my = PosAbs(p[1] - g_posLast[1]);
-                const float mz = PosAbs(p[2] - g_posLast[2]);
-                if (my > m) m = my;
-                if (mz > m) m = mz;
-                if (m > POS_JUMP_DIST)
-                {
-                    g_posJumps  = g_posJumps + 1;    // ゲームが位置を置いた
-                    g_posSettle = 0;
-                }
-                else if (m == 0.0f)
-                    g_posSettle = g_posSettle + 1;
-                else
-                    g_posSettle = 0;
-            }
-            g_posLast[0] = p[0];
-            g_posLast[1] = p[1];
-            g_posLast[2] = p[2];
-            g_posHaveLast = 1;
-
-            const bool settled = g_posSettle >= POS_SETTLE_FRAMES;
-            if ((settled && (g_posJumps >= 1 || g_posSince >= POS_FALLBACK_FRAMES)) || g_posSince >= POS_LONG_FRAMES)
-            {
-                g_posHold = 0;
-                g_posMode = 2;
-            }
-            return;
-        }
-
-        // g_posMode == 2: 書き込み中
-        if (obj)
-            PosApply(obj, g_posXYZ[0], g_posXYZ[1], g_posXYZ[2]);
-        g_posHold = g_posHold + 1;
-        if (g_posHold >= POS_HOLD_FRAMES)
-            g_posMode = 0;
-    }
-
-    // ゲーム本体のスレッドから、毎フレーム呼ばれる (task = フィールドタスク)。
-    // 予約があれば 0x21EDCC(入口番号) を呼び、「エリアID+1」を返す(0 = 何もしない)。
-    // g_warpUseLink が 0 のときは 0x21EDCC を呼ばない (GDBで確認した「標準の入口」に出る動作)。
-    // 入口番号 0 も、エリアID 0 も、普通の値として扱う。
-    u32 WarpPrepare(u32 task)
-    {
-        g_warpTask = task;
-        PosTick(task);
-        if (!g_warpPending)
-            return 0;
-        g_warpPending = 0;
-        if (g_warpUseLink)
-        {
-            typedef void (*SetArrivalLinkFn)(u32);
-            ((SetArrivalLinkFn)0x21EDCC)(g_warpLink);
-        }
-        return g_warpArea + 1;   // エリアID+1 (0 = ワープなし と区別するため)
-    }
-
-}
-
-asm(R"(
-    .arm
-    .text
-    .align 2
-
-    .global jp_hookA
-    .type jp_hookA, %function
-jp_hookA:
-    ldr   r6, [sp], #4
-    sub   sp, sp, #0xC
-    mov   r7, r0
-    mvn   r0, #0
-    push  {r0-r6}
-    mov   r0, r3
-    bl    jp_captureA
-    pop   {r0-r6}
-    add   r6, r6, #4
-    mov   pc, r6
-
-    @ ---- ライフ道具用(実験): 0x2BA9AC に入れる関数の途中フック ----
-    @ 置き換えた3命令 (0x2BA9A8/AC/B0) を再現し、0x2BA9B4 に戻る。
-    @ この時点で r4 = 装備されるレコード。レジスタは全部保存する。
-    .global jp_hookB2
-    .type jp_hookB2, %function
-jp_hookB2:
-    push  {r0-r3, r12, lr}
-    ldr   r0, [sp, #24]          @ 積まれている戻り先 (X+4)
-    add   r0, r0, #4             @ X+8 に直す
-    str   r0, [sp, #24]
-    mov   r0, r4
-    bl    jp_captureB
-    pop   {r0-r3, r12, lr}
-    str   r4, [r5, r6, lsl #2]   @ 0x2BA9A8 の元命令
-    ldr   r0, [r4, #0xc]         @ 0x2BA9AC
-    orr   r0, r0, #1             @ 0x2BA9B0
-    ldr   pc, [sp], #4           @ X+8 へ戻りつつスタックを戻す
-
-    @ ---- エリアワープ用: 0x5A2AB8 (フィールドタスクの毎フレーム更新) ----
-    @ CTRPFのHookクラスは使わず、プラグイン側で2語だけ直接書き換える:
-    @     0x5A2AB8: ldr pc, [pc, #-4]
-    @     0x5A2ABC: .word jp_hookWarp
-    @ 置き換わった2命令 (0x5A2AB8 push {r4-r11,lr} / 0x5A2ABC mov r4,r0) をここで再現し、
-    @ 0x5A2AC0 (元の ldr r6,[pc,#3016]。書き換えていない) へ戻る。
-    @ ldr pc は lr を変えないので、入口の状態 (r0=タスク, lr=呼び出し元, s0=経過時間) が
-    @ そのまま届く。C関数 (WarpPrepare) は s0〜s15 を壊すので d0-d7 を退避してから呼ぶ。
-    .global jp_hookWarp
-    .type jp_hookWarp, %function
-jp_hookWarp:
-    push  {r0-r3, r12, lr}       @ 24バイト: 8バイト境界を保つ
-    vpush {d0-d7}                @ 元の関数は s0 (float引数) を使うので退避
-    bl    WarpPrepare            @ r0 = エリアID+1 (0 = ワープなし)
-    vpop  {d0-d7}                @ s0〜s15 を元に戻す
-    str   r0, [sp, #16]          @ 保存した r12 の位置に結果を入れる
-    pop   {r0-r3, r12, lr}       @ r12 = エリアID, r0 = タスク, lr = 元のlr
-    cmp   r12, #0
-    beq   1f
-    sub   r12, r12, #1           @ エリアID+1 → エリアID (0 も有効)
-    mov   r1, r12                @ GDBで成功したのと同じ設定
-    mov   r2, #0
-    mov   r3, r12
-    ldr   pc, =0x5A4854          @ 末尾ジャンプ: 元の呼び出し元へ戻る
-1:  push  {r4-r11, lr}           @ 0x5A2AB8 の元命令
-    mov   r4, r0                 @ 0x5A2ABC の元命令
-    ldr   pc, =0x5A2AC0          @ 続きの元コードへ
-
-    .ltorg
-)");
-
-namespace CTRPluginFramework
-{
-    static constexpr u32 HOOK_WARP = 0x005A2AB8; // エリアワープ: フィールドタスク更新関数の入口
-}
-
-// アイテムエディタ (編集・生成・削除・一括変更)。ここより後ろの機能も、この中の関数を使う。
-#include "ItemEditor.hpp"
-
-namespace CTRPluginFramework
-{
-    // ------------------------------------------------------------
-    //  エリアワープ (実機未検証)
-    //  移動先 = {表示名, エリアID, 出入口の接続番号}
-    //  (エリアID, 接続番号) は実際の扉の記録から取った組み合わせ。
-    //  ★ は GDB で実際に移動を確認したもの。それ以外は未確認。
-    //  場所名は通った順番からの推定。
-    // ------------------------------------------------------------
-    struct WarpDest { const char *label; u16 area; u16 link; };
-
-    // 規則 (ユーザーの実機テストで判明):
-    //   ワープの組 (area, link) は「その行き先 area へ向かう、番号 link の扉」の前に出る。
-    //   出る場所は、その扉があるエリア (= 行き先の隣のエリア) になる。
-    //   例: (25,39) = 郊外南の、パーテル大平原東へ向かう扉の前
-    //       ( 3,39) = パーテル大平原東の、郊外南へ向かう扉の前
-    //   ★ はこの規則で実機確認したもの。他は規則からの推測 (場所名は通った順番からの推定)。
-    //   エリアXの出入口に出たいときは、Xの中でその扉を通ったときの記録 (行き先, 番号) を使う。
-    static const WarpDest g_warpDests[] =
-    {
-        { "パーテル大平原 東", 3, 39 },
-        { "クルブルク城 謁見の間",143,27 },
-        { "王国兵士の詰所",2,15 },
-        { "バラード酒場",251,2 },
-        { "ククの家",33,36 },
-        { "イムカの家",33,37 },
-        { "王立クルブルク工房",1,21 },
-        { "コンガス食堂",152,5 },
-        { "王立クルブルク図書館",2,16 },
-        { "ヘイホフの家",33,38 },
-        { "アイザックの家",32,34 },
-        { "いにしえの塔 試練の間",97,136 },
-        { "太古の試練その1",98,139 },
-        { "闇の試練その1",98,140 },
-        { "光の試練その1",98,141 },
-        { "→クルブルク大通り へ向かう扉の前 (2/7)", 2, 7 },
-        { "★郊外南: パーテル大平原東へ向かう扉の前 (25/39)", 25, 39 },
-        { "→パーテル大平原東 ハニワ洞窟前 へ向かう扉の前 (25/128)", 25, 128 },
-        { "→パーテル西 へ向かう扉の前 (24/125)", 24, 125 },
-        { "→パーテル大平原東 へ向かう扉の前 (25/121)", 25, 121 },
-        { "→ハーベスの大農園 へ向かう扉の前 (209/127)", 209, 127 },
-        { "→始まりの島温泉街 へ向かう扉の前 (84/137)", 84, 137 },
-        { "→中心街 へ向かう扉の前 (82/131)", 82, 131 },
-        { "→太鼓の砂浜 へ向かう扉の前 (83/133)", 83, 133 },
-        { "→ギガガビトのほら穴 へ向かう扉の前 (86/142)", 86, 142 },
-        { "→崖の神殿 へ向かう扉の前 (85/132)", 85, 132 },
-        { "→いにしえの塔 へ向かう扉の前 (97/134)", 97, 134 },
-        { "→試練の間 へ向かう扉の前 (98/136)", 98, 136 },
-        { "→ポルトポルト宮殿街 へ向かう扉の前 (7/71)", 7, 71 },
-        { "→玄関街 へ向かう扉の前 (8/56)", 8, 56 },
-        { "→郊外 宮殿街側 へ向かう扉の前 (10/55)", 10, 55 },
-        { "→マバラッパ諸島 へ向かう扉の前 (15/74)", 15, 74 },
-        { "→ダルスモルス魔王街 へ向かう扉の前 (17/104)", 17, 104 },
-        { "→砂漠街 へ向かう扉の前 (16/89)", 16, 89 },
-        { "→郊外 砂漠側 へ向かう扉の前 (19/88)", 19, 88 },
-        { "→サンサン砂漠 へ向かう扉の前 (20/106)", 20, 106 },
-        { "→着ぐるみキャンプ場 へ向かう扉の前 (11/197)", 11, 197 },
-        { "→空島東 へ向かう扉の前 (31/83)", 31, 83 },
-        { "→空島中央 へ向かう扉の前 (13/82)", 13, 82 },
-        { "→空島西 へ向かう扉の前 (30/81)", 30, 81 },
-        { "→コモレヴィ へ向かう扉の前 (36/196)", 36, 196 },
-        { "→森の洞穴 へ向かう扉の前 (185/115)", 185, 115 },
-        { "→森の奥地 へ向かう扉の前 (28/119)", 28, 119 },
-        { "→森 へ向かう扉の前 (23/122)", 23, 122 },
-    };
-    static constexpr int WARP_COUNT = sizeof(g_warpDests) / sizeof(g_warpDests[0]);
-
-    static bool g_warpHooked = false;
-
-    static bool InstallWarpHook(void)
-    {
-        if (g_warpHooked)
-            return true;
-
-        // 入口の2命令が想定どおりか確認 (違うバージョンなら入れない)
-        //   push {r4-r11,lr} / mov r4,r0
-        static const u32 expectW[2] = { 0xE92D4FF0, 0xE1A04000 };
-        if (!CheckWords(HOOK_WARP, expectW, 2))
-        {
-            MessageBox("エラー",
-                       "ワープ用のフック位置の命令が想定と違います。\nゲームのバージョンが異なる可能性があるため、機能を有効にできません。")();
+        u32 a = 0, b = 0;
+        if (!Process::Read32(addr, a) || !Process::Read32(addr + 4, b))
             return false;
-        }
-
-        // CTRPFのHookクラスは使わず、2語を直接書く。
-        // 先にジャンプ先の値(2語目)を書き、そのあとで ldr pc 命令(1語目)を書く。
-        Process::Write32(HOOK_WARP + 4, (u32)(uintptr_t)jp_hookWarp);
-        Process::Write32(HOOK_WARP,     0xE51FF004);   // ldr pc, [pc, #-4]
-
-        g_warpHooked = true;
-        return true;
+        if (a == org0 && b == org1)
+            return true;
+        if (a == LDR_PC_NEXT && b == fn)
+            return true;
+        return false;
     }
 
-    // ------------------------------------------------------------
-    //  保存した位置 (名前つき) をワープの一覧に足す (実機未検証)
-    //   ・「現在位置を保存」: いまのエリアIDと座標 (x,y,z) に、名前をつけて保存する
-    //   ・保存した位置は、「エリアワープ」の一覧の末尾に [保存] として並ぶ
-    //   ・選ぶと、同じエリアならそのまま移動、別のエリアなら、そのエリアへ
-    //     「標準の入口」で入ってから、読み込みが終わるのを待って、座標を書き込む
-    //  保存先: SD 直下の fll_warp_points.txt (1行 = エリアID / x / y / z / 名前)
-    //  ※ x,y,z は float のビット列 (16進) で保存する。ファイルを直接編集するときは注意。
-    // ------------------------------------------------------------
-    #ifndef WARP_POINTS_TO_FILE
-    #define WARP_POINTS_TO_FILE 1   // ビルドが通らないときは 0 にするとファイルの読み書きを外せる (再起動で消える)
-    #endif
-    #define WARP_POINTS_FILE "/fll_warp_points.txt"
-
-    struct SavedPos { std::string name; u32 area; float x, y, z; };
-    static std::vector<SavedPos> g_savedPos;
-    static bool g_savedLoaded = false;
-
-    static u32 FloatBits(float v) { u32 b = 0; memcpy(&b, &v, 4); return b; }
-    static float BitsFloat(u32 b) { float v = 0.0f; memcpy(&v, &b, 4); return v; }
-
-    // 小数2桁の文字にする (printf の %f が使えない環境でも動く)
-    static std::string Fmt2(float v)
+    static void InstallHook(u32 addr, u32 fn)
     {
-        const bool neg = v < 0.0f;
-        long n = (long)((neg ? -v : v) * 100.0f + 0.5f);
-        return Utils::Format("%s%ld.%02ld", neg ? "-" : "", n / 100, n % 100);
+        Patch32(addr, LDR_PC_NEXT);
+        Patch32(addr + 4, fn);
     }
 
-    static void LoadSavedPos(void)
+    static void RestoreHook(u32 addr, u32 org0, u32 org1)
     {
-        if (g_savedLoaded)
-            return;
-        g_savedLoaded = true;
-    #if WARP_POINTS_TO_FILE
-        File f;
-        if (File::Open(f, WARP_POINTS_FILE, File::READ) != 0)
-            return;
-        const u32 size = (u32)f.GetSize();
-        if (size == 0 || size > 0x20000)
+        Patch32(addr, org0);
+        Patch32(addr + 4, org1);
+    }
+
+    // ---------------------------------------------------------------
+    //  アセンブリから読む設定値 (asm からシンボル名で参照する)
+    // ---------------------------------------------------------------
+    static volatile u32 g_fixedDamage __asm__("BC_FixedDamage") __attribute__((used)) = 0x7FFFFFFF;
+    static volatile u32 g_proxRange   __asm__("BC_ProxRange")   __attribute__((used)) = 0x41800000; // 距離の2乗(float)
+
+    // ---------------------------------------------------------------
+    //  フック本体 (プラグイン内のアセンブリ)
+    //  プレイヤー = *( *(0x0068BBB8) + 0x7828 )   (ゲームの 0x00460968 と同じ手順)
+    // ---------------------------------------------------------------
+
+    // 0x003F4280 から飛んでくる。
+    //   r0 = ダメージ, r5 = 攻撃した側, r6 = 受けた側
+    //   プレイヤーが攻撃し、受けた側が敵のとき、ダメージを固定値にする。
+    static void __attribute__((naked, used, noinline)) FixedDamageHook()
+    {
+        asm volatile(
+            ".arm\n"
+            "ldr   r12, =0x0068BBB8\n"
+            "ldr   r12, [r12]\n"
+            "cmp   r12, #0\n"
+            "beq   .Lfd_end\n"
+            "add   r12, r12, #0x7800\n"
+            "ldr   r12, [r12, #0x28]\n"
+            "cmp   r12, #0\n"
+            "beq   .Lfd_end\n"
+            "cmp   r5, r12\n"            // 攻撃した側がプレイヤー?
+            "bne   .Lfd_end\n"
+            "ldrb  r12, [r6, #0x554]\n"  // 受けた側が敵?
+            "cmp   r12, #1\n"
+            "bne   .Lfd_end\n"
+            "ldrb  r12, [r6, #0x3BC]\n"
+            "cmp   r12, #2\n"
+            "cmpne r12, #0xE\n"
+            "bne   .Lfd_end\n"
+            "ldr   r0, =BC_FixedDamage\n"
+            "ldr   r0, [r0]\n"
+            ".Lfd_end:\n"
+            "vmov  s0, r0\n"             // 元の命令 (0x3F4280)
+            "vldr  s23, .Lfd_half\n"     // 元の命令 (0x3F4284)
+            "ldr   pc, =0x003F4288\n"
+            ".ltorg\n"
+            ".align 2\n"
+            ".Lfd_half: .float 0.5\n"
+        );
+    }
+
+    // 0x001F9AFC から飛んでくる。
+    //   r1 = ダメージ(表示用), r5 = 受けた側
+    //   受けた側がプレイヤー以外で、ダメージが0でなければ 9999 にする。
+    static void __attribute__((naked, used, noinline)) DisplayHook()
+    {
+        asm volatile(
+            ".arm\n"
+            "mov   r8, r1\n"             // 元の命令 (0x1F9AFC)
+            "mov   r7, r2\n"             // 元の命令 (0x1F9B00)
+            "ldr   r12, =0x0068BBB8\n"
+            "ldr   r12, [r12]\n"
+            "cmp   r12, #0\n"
+            "addne r12, r12, #0x7800\n"
+            "ldrne r12, [r12, #0x28]\n"
+            "cmp   r5, r12\n"
+            "cmpne r8, #0\n"
+            "movne r8, #0x2700\n"
+            "addne r8, r8, #0xF\n"       // 0x270F = 9999
+            "ldr   pc, =0x001F9B04\n"
+            ".ltorg\n"
+        );
+    }
+
+    // 0x001A6404 から飛んでくる (敵ごとの更新処理の入口)。
+    //   r5 = 敵。プレイヤーに近い敵に対して、ダメージ処理(0x003F4160)を呼ぶ。
+    //   倍率は 1.0 (等倍)。
+    static void __attribute__((naked, used, noinline)) ProximityHook()
+    {
+        asm volatile(
+            ".arm\n"
+            "push  {r0-r7, r12, lr}\n"
+            "vpush {d0-d3}\n"
+            // r4 = プレイヤー
+            "ldr   r12, =0x0068BBB8\n"
+            "ldr   r12, [r12]\n"
+            "mov   r4, #0\n"
+            "cmp   r12, #0\n"
+            "addne r12, r12, #0x7800\n"
+            "ldrne r4, [r12, #0x28]\n"
+            "cmp   r4, #0\n"
+            "beq   .Lpx_exit\n"
+            "cmp   r4, r5\n"
+            "beq   .Lpx_exit\n"
+            // 敵かどうか
+            "ldrb  r0, [r5, #0x554]\n"
+            "cmp   r0, #1\n"
+            "bne   .Lpx_exit\n"
+            "ldrb  r0, [r5, #0x3BC]\n"
+            "cmp   r0, #2\n"
+            "cmpne r0, #0xE\n"
+            "bne   .Lpx_exit\n"
+            "add   r0, r5, #0xD4\n"
+            "ldr   r12, =0x005AF9EC\n"
+            "blx   r12\n"
+            "cmp   r0, #0\n"
+            "bne   .Lpx_exit\n"
+            // 敵の座標 -> s0,s1,s2
+            "mov   r0, r5\n"
+            "ldr   r1, [r0]\n"
+            "ldr   r1, [r1, #0x18]\n"
+            "blx   r1\n"
+            "vldr  s0, [r0]\n"
+            "vldr  s1, [r0, #4]\n"
+            "vldr  s2, [r0, #8]\n"
+            // プレイヤーの座標 -> s3,s4,s5
+            "mov   r0, r4\n"
+            "ldr   r1, [r0]\n"
+            "ldr   r1, [r1, #0x18]\n"
+            "blx   r1\n"
+            "vldr  s3, [r0]\n"
+            "vldr  s4, [r0, #4]\n"
+            "vldr  s5, [r0, #8]\n"
+            // 距離の2乗
+            "vsub.f32 s0, s0, s3\n"
+            "vsub.f32 s1, s1, s4\n"
+            "vsub.f32 s2, s2, s5\n"
+            "vmul.f32 s0, s0, s0\n"
+            "vmla.f32 s0, s1, s1\n"
+            "vmla.f32 s0, s2, s2\n"
+            "ldr   r0, =BC_ProxRange\n"
+            "vldr  s1, [r0]\n"
+            "vcmpe.f32 s0, s1\n"
+            "vmrs  APSR_nzcv, fpscr\n"
+            "bgt   .Lpx_exit\n"          // 範囲外
+            // 範囲内: ダメージ処理を呼ぶ
+            "ldr   r0, [r4, #0x544]\n"
+            "str   r0, [r5, #0x548]\n"
+            "mov   r0, r5\n"
+            "bl    .Lpx_find\n"
+            "mov   r6, r0\n"
+            "mov   r0, r4\n"
+            "bl    .Lpx_find\n"
+            "mov   r7, r0\n"
+            "cmp   r6, #0\n"
+            "cmpne r7, #0\n"
+            "beq   .Lpx_exit\n"
+            "sub   sp, sp, #0x144\n"
+            "mov   r0, #0\n"
+            "mov   r1, sp\n"
+            "mov   r2, #0x44\n"
+            ".Lpx_clr:\n"
+            "str   r0, [r1], #4\n"
+            "subs  r2, r2, #1\n"
+            "bne   .Lpx_clr\n"
+            "str   r6, [sp, #8]\n"
+            "str   r7, [sp, #0x58]\n"
+            "add   r0, sp, #0xF0\n"
+            "str   r0, [sp, #0x70]\n"
+            "ldr   r0, =0x47C35000\n"
+            "str   r0, [sp, #0xBC]\n"
+            "vldr  s0, .Lpx_one\n"       // 倍率 1.0 (等倍固定)
+            "vldr  s1, .Lpx_one\n"
+            "vsub.f32 s2, s0, s0\n"
+            "mov   r0, sp\n"
+            "add   r1, sp, #0x50\n"
+            "mvn   r2, #0\n"
+            "mov   r3, #1\n"
+            "ldr   r12, =0x003F4160\n"
+            "blx   r12\n"
+            "add   sp, sp, #0x144\n"
+            ".Lpx_exit:\n"
+            "vpop  {d0-d3}\n"
+            "pop   {r0-r7, r12, lr}\n"
+            "vpush {d8}\n"               // 元の命令 (0x1A6404)
+            "vmov.f32 s16, s0\n"         // 元の命令 (0x1A6408)
+            "ldr   pc, =0x001A640C\n"
+            ".ltorg\n"
+            ".align 2\n"
+            ".Lpx_one: .float 1.0\n"
+            // r0 = 敵/プレイヤーのポインタ -> r0 = ゲーム内ハンドル (0 なら見つからない)
+            ".Lpx_find:\n"
+            "ldr   r1, =0x0068BBB8\n"
+            "ldr   r1, [r1]\n"
+            "add   r1, r1, #4\n"
+            "add   r1, r1, #0x7800\n"
+            "add   r1, r1, #0x16C\n"
+            "ldr   r2, [r1, #0x1C]\n"
+            "cmp   r2, #0\n"
+            "moveq r0, #0\n"
+            "bxeq  lr\n"
+            "ldr   r3, [r1, #0x20]\n"
+            "add   r2, r2, #0x10\n"
+            ".Lpx_fa:\n"
+            "cmp   r3, #0\n"
+            "moveq r0, #0\n"
+            "bxeq  lr\n"
+            "ldr   r12, [r2]\n"
+            ".Lpx_fb:\n"
+            "cmp   r12, #0\n"
+            "beq   .Lpx_fc\n"
+            "ldr   r1, [r12, #8]\n"
+            "cmp   r1, r0\n"
+            "ldreq r0, [r12, #4]\n"
+            "bxeq  lr\n"
+            "ldr   r12, [r12, #0x10]\n"
+            "b     .Lpx_fb\n"
+            ".Lpx_fc:\n"
+            "add   r2, r2, #0x14\n"
+            "sub   r3, r3, #1\n"
+            "b     .Lpx_fa\n"
+            ".ltorg\n"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    //  1. 固定ダメージ (プレイヤーのみ)
+    // ---------------------------------------------------------------
+    static const u32 DISPLAY_LIMIT = 10000; // これ以上は表示9999固定を併用
+
+    static u32 FixedDamageValue()
+    {
+        return g_fixedDamage;
+    }
+
+    static void FixedDamageSettings(MenuEntry *entry)
+    {
+        (void)entry;
+        u32 v = FixedDamageValue();
+        Keyboard kb("固定ダメージ値 (0~2147483647)\n"
+                    "10000以上は表示9999固定が自動で併用されます");
+        kb.IsHexadecimal(false);
+        if (kb.Open(v, v) == 0)
         {
-            f.Close();
-            return;
+            if (v > 0x7FFFFFFF)
+                v = 0x7FFFFFFF;
+            g_fixedDamage = v;
         }
-        std::string text(size, '\0');
-        f.Read(&text[0], size);
-        f.Close();
+    }
 
-        size_t pos = 0;
-        while (pos < text.size())
+    static void FixedDamageGame(MenuEntry *entry)
+    {
+        static bool fixApplied = false;
+        static bool dspApplied = false;
+
+        if (!entry->IsActivated())
         {
-            size_t end = text.find('\n', pos);
-            if (end == std::string::npos)
-                end = text.size();
-            std::string line = text.substr(pos, end - pos);
-            pos = end + 1;
-            if (!line.empty() && line[line.size() - 1] == '\r')
-                line.erase(line.size() - 1);
-
-            std::string col[4];
-            size_t s0 = 0;
-            int n = 0;
-            while (n < 4)
+            // OFF: 元に戻す
+            if (dspApplied)
             {
-                const size_t t = line.find('\t', s0);
-                if (t == std::string::npos)
-                    break;
-                col[n++] = line.substr(s0, t - s0);
-                s0 = t + 1;
+                RestoreHook(0x001F9AFC, ORG_DSP_FC, ORG_DSP_00);
+                dspApplied = false;
             }
-            if (n != 4)
-                continue;
-
-            SavedPos p;
-            p.area = (u32)strtoul(col[0].c_str(), nullptr, 10);
-            p.x    = BitsFloat((u32)strtoul(col[1].c_str(), nullptr, 16));
-            p.y    = BitsFloat((u32)strtoul(col[2].c_str(), nullptr, 16));
-            p.z    = BitsFloat((u32)strtoul(col[3].c_str(), nullptr, 16));
-            p.name = line.substr(s0);
-            g_savedPos.push_back(p);
+            if (fixApplied)
+            {
+                RestoreHook(0x003F4280, ORG_DMG_80, ORG_DMG_84);
+                fixApplied = false;
+            }
+            return;
         }
-    #endif
+
+        const u32 value = FixedDamageValue();
+
+        if (!fixApplied)
+        {
+            if (!HookIsFree(0x003F4280, ORG_DMG_80, ORG_DMG_84, FnAddr(FixedDamageHook)))
+            {
+                OSD::Notify("固定ダメージ: フック位置が他のコードに使われています");
+                entry->Disable();
+                return;
+            }
+            InstallHook(0x003F4280, FnAddr(FixedDamageHook));
+            fixApplied = true;
+        }
+
+        // ダメージ表示9999固定 (値に応じて自動 ON/OFF)
+        if (value >= DISPLAY_LIMIT)
+        {
+            if (!dspApplied)
+            {
+                if (!HookIsFree(0x001F9AFC, ORG_DSP_FC, ORG_DSP_00, FnAddr(DisplayHook)))
+                {
+                    OSD::Notify("ダメージ表示9999: フック位置が他のコードに使われています");
+                    entry->Disable();
+                    return;
+                }
+                InstallHook(0x001F9AFC, FnAddr(DisplayHook));
+                dspApplied = true;
+            }
+        }
+        else if (dspApplied)
+        {
+            RestoreHook(0x001F9AFC, ORG_DSP_FC, ORG_DSP_00);
+            dspApplied = false;
+        }
     }
 
-    static void AppendSavedPos(const SavedPos &p)
+    // ---------------------------------------------------------------
+    //  2. 近づいたらダメージ判定 (倍率は等倍固定・範囲指定可)
+    //     ダメージは通常の攻撃計算を通るので、固定ダメージと併用すると
+    //     近くの敵に固定ダメージが入ります。
+    // ---------------------------------------------------------------
+    // 範囲 (距離の整数値)。内部では距離の2乗(float)を使う。
+    // 既定値 4 → 4*4 = 16.0 (従来の 0x41800000 と同じ)
+    static u32 &ProximityRadius()
     {
-    #if WARP_POINTS_TO_FILE
-        File f;
-        if (File::Open(f, WARP_POINTS_FILE, File::WRITE | File::CREATE | File::APPEND) == 0)
+        static u32 r = 4;
+        return r;
+    }
+
+    static u32 RadiusToBits(u32 r)
+    {
+        const float sq = static_cast<float>(r) * static_cast<float>(r);
+        u32 bits = 0;
+        std::memcpy(&bits, &sq, sizeof(bits));
+        return bits;
+    }
+
+    static void ProximitySettings(MenuEntry *entry)
+    {
+        (void)entry;
+        u32 r = ProximityRadius();
+        Keyboard kb("近づいたら判定の範囲 (1~200)\n既定値は 4 です");
+        kb.IsHexadecimal(false);
+        if (kb.Open(r, r) == 0)
         {
-            f.WriteLine(Utils::Format("%u\t%08X\t%08X\t%08X\t", p.area, FloatBits(p.x), FloatBits(p.y), FloatBits(p.z)) + p.name);
-            f.Close();
+            if (r < 1)
+                r = 1;
+            if (r > 200)
+                r = 200;
+            ProximityRadius() = r;
         }
+    }
+
+    static void ProximityGame(MenuEntry *entry)
+    {
+        static bool applied = false;
+
+        if (!entry->IsActivated())
+        {
+            if (applied)
+            {
+                RestoreHook(0x001A6404, ORG_PRX_04, ORG_PRX_08);
+                applied = false;
+            }
+            return;
+        }
+
+        g_proxRange = RadiusToBits(ProximityRadius()); // 範囲の変更をすぐ反映
+
+        if (!applied)
+        {
+            if (!HookIsFree(0x001A6404, ORG_PRX_04, ORG_PRX_08, FnAddr(ProximityHook)))
+            {
+                OSD::Notify("近づいたら判定: フック位置が他のコードに使われています");
+                entry->Disable();
+                return;
+            }
+            InstallHook(0x001A6404, FnAddr(ProximityHook));
+            applied = true;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    //  3. HP減らない / SP減らない (プレイヤー)
+    //       manager = *(u32*)0x0068BBB8
+    //       player  = *(u32*)(manager + 0x7828)
+    //       HP = *(float*)(player + 0xD4 + 0x80)
+    //       SP = *(float*)(player + 0xD4 + 0x84)   ※SPがHPの隣という推定
+    // ---------------------------------------------------------------
+    static bool PlayerStatusBase(u32 &base)
+    {
+        u32 mgr = 0, player = 0;
+        if (!Process::Read32(0x0068BBB8, mgr) || mgr == 0)
+            return false;
+        if (!Process::CheckAddress(mgr + 0x7828))
+            return false;
+        if (!Process::Read32(mgr + 0x7828, player) || player == 0)
+            return false;
+        base = player + 0xD4;
+        return Process::CheckAddress(base + 0x80) && Process::CheckAddress(base + 0x84);
+    }
+
+    // 減ったら、直前の最大値(回復で増えた値は更新)に戻す
+    static void KeepNoDecrease(MenuEntry *entry, u32 offset, float &held, u32 &lastBase)
+    {
+        if (!entry->IsActivated())
+        {
+            held = 0.0f;
+            lastBase = 0;
+            return;
+        }
+
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
+            return;
+
+        if (base != lastBase) // プレイヤーのデータが入れ替わったらリセット
+        {
+            lastBase = base;
+            held = 0.0f;
+        }
+
+        float cur = 0.0f;
+        if (!Process::ReadFloat(base + offset, cur))
+            return;
+        if (!(cur >= 0.0f && cur < 10000000.0f)) // NaN・異常値には触らない
+            return;
+
+        if (cur >= held)
+            held = cur;
         else
-            OSD::Notify("points: file open failed (memory only)");
-    #else
-        (void)p;
-    #endif
+            Process::WriteFloat(base + offset, held);
     }
 
-    // 保存した位置へ移動する (同じエリアならそのまま、別のエリアなら入ってから)
-    static void RequestSavedPos(const SavedPos &p, bool forceReload = false)
+    static void HpNoDecreaseGame(MenuEntry *entry)
     {
-        u16 cur = 0;
-        if (g_warpTask != 0)
-            Process::Read16(g_warpTask + 0x6B2, cur);
-        const u32 obj = PosPlayerObj();
-
-        g_posMode     = 0;
-        g_posXYZ[0]   = p.x;
-        g_posXYZ[1]   = p.y;
-        g_posXYZ[2]   = p.z;
-        g_posArea     = p.area;
-        g_posOldObj   = obj;
-        g_posFrames   = 0;
-        g_posSawGap   = 0;
-        g_posHold     = 0;
-        PosResetDetect();
-        g_recN        = 0;
-
-         if (!forceReload && g_warpTask != 0 && obj && cur == p.area)
-        {
-            g_posMode = 2;                 // 同じエリア: そのまま移動
-            OSD::Notify("Teleport requested.");
-        }
-        else
-        {
-            g_warpArea    = p.area;        // 別のエリア: 標準の入口で入ってから、位置を書く
-            g_warpLink    = 0;
-            g_warpUseLink = 0;
-            g_posMode     = 1;
-            g_warpPending = 1;
-            OSD::Notify("Warp + teleport requested.");
-        }
+        static float held = 0.0f;
+        static u32 lastBase = 0;
+        KeepNoDecrease(entry, 0x80, held, lastBase);
     }
 
-    // いまのエリアに入り直して(ロード)、いまの位置に戻る
-    static void ReloadHereEntry(MenuEntry *entry)
+    static void SpNoDecreaseGame(MenuEntry *entry)
+    {
+        static float held = 0.0f;
+        static u32 lastBase = 0;
+        KeepNoDecrease(entry, 0x84, held, lastBase);
+    }
+
+    // 確認用: HP/SPのアドレスを表示する
+    static void ShowStatusAddr(MenuEntry *entry)
     {
         (void)entry;
-
-        if (!InstallWarpHook())
-            return;
-
-        u16 area16 = 0;
-        if (g_warpTask == 0 || !Process::Read16(g_warpTask + 0x6B2, area16))
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
         {
-            MessageBox("準備中です",
-                       "位置を読む準備をしています。\nメニューを閉じて、ゲームを1秒ほど動かしてから、もう一度実行してください。")();
+            OSD::Notify("プレイヤーが見つかりません");
             return;
         }
-        const u32 obj = PosPlayerObj();
-        if (!obj)
-        {
-            MessageBox("実行できません",
-                       "プレイヤーのデータを取得できません。\n操作できる状態で、もう一度実行してください。")();
-            return;
-        }
-
-        SavedPos p;
-        p.area = area16;
-        p.x = *(volatile float *)(obj + 0x7C);
-        p.y = *(volatile float *)(obj + 0x80);
-        p.z = *(volatile float *)(obj + 0x84);
-
-        RequestSavedPos(p, true);   // true = 同じエリアでも、入り直す
-        OSD::Notify("Reload here requested.");
+        float hp = 0.0f, sp = 0.0f, tg = 0.0f;
+        Process::ReadFloat(base + 0x80, hp);
+        Process::ReadFloat(base + 0x84, sp);
+        Process::ReadFloat(base + 0x88, tg);
+        MessageBox("HP/SP/テンションのアドレス",
+                   Utils::Format("HP: %08X (%.1f)\nSP: %08X (%.1f)\nテンション: %08X (%.1f)",
+                                 base + 0x80, hp, base + 0x84, sp, base + 0x88, tg))();
     }
 
-    static void SavePosEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        if (!InstallWarpHook())
-            return;
-        LoadSavedPos();
-
-        u16 area16 = 0;
-        if (g_warpTask == 0 || !Process::Read16(g_warpTask + 0x6B2, area16))
-        {
-            MessageBox("準備中です",
-                       "位置を読む準備をしています。\nメニューを閉じて、ゲームを1秒ほど動かしてから、もう一度実行してください。")();
-            return;
-        }
-        const u32 obj = PosPlayerObj();
-        if (!obj)
-        {
-            MessageBox("保存できません",
-                       "プレイヤーのデータを取得できません。\n操作できる状態で、もう一度実行してください。")();
-            return;
-        }
-
-        SavedPos p;
-        p.area = area16;
-        p.x = *(volatile float *)(obj + 0x7C);
-        p.y = *(volatile float *)(obj + 0x80);
-        p.z = *(volatile float *)(obj + 0x84);
-
-        std::string name;
-        Keyboard kb("ワープ名を入力");
-        if (kb.Open(name) != 0)
-            return;
-        for (size_t i = 0; i < name.size(); ++i)
-            if (name[i] == '\t' || name[i] == '\n' || name[i] == '\r')
-                name[i] = ' ';
-        if (name.empty())
-            name = Utils::Format("保存位置 %u", (u32)g_savedPos.size() + 1);
-        p.name = name;
-
-        g_savedPos.push_back(p);
-        AppendSavedPos(p);
-
-        MessageBox("保存しました",
-                   Utils::Format("%s\nエリアID %u\nx %s / y %s / z %s\n\n「エリアワープ」の一覧の末尾に追加しました。",
-                                 p.name.c_str(), p.area, Fmt2(p.x).c_str(), Fmt2(p.y).c_str(), Fmt2(p.z).c_str()))();
-    }
-
-    // 保存位置へのワープの経過 (毎フレームの、エリアID・状態・座標) を SD に書き出す。うまくいかないときの調査用。
-    static void PosDumpEntry(MenuEntry *entry)
-    {
-        (void)entry;
-        const u32 n = g_recN;
-        if (n == 0)
-        {
-            MessageBox("記録がありません", "保存位置へのワープを実行したあとで、もう一度実行してください。")();
-            return;
-        }
-    #if WARP_POINTS_TO_FILE
-        File f;
-        if (File::Open(f, "/fll_warp_notes.txt", File::WRITE | File::CREATE | File::APPEND) != 0)
-        {
-            MessageBox("書き出せません", "fll_warp_notes.txt を開けませんでした。")();
-            return;
-        }
-        f.WriteLine(Utils::Format("TL-BEGIN target_area=%u frames=%u", (u32)g_posArea, n));
-        for (u32 i = 0; i < n; ++i)
-        {
-            f.WriteLine(Utils::Format("TL %u m%u a%u s%u o%X  %s %s %s", i, (u32)g_recMode[i], (u32)g_recArea[i], (u32)g_recState[i],
-                                      g_recObj[i], Fmt2(g_recPos[i][0]).c_str(), Fmt2(g_recPos[i][1]).c_str(), Fmt2(g_recPos[i][2]).c_str()));
-        }
-        f.WriteLine("TL-END");
-        f.Close();
-    #endif
-        MessageBox("書き出しました", Utils::Format("%u 行を fll_warp_notes.txt に書き出しました。", n))();
-    }
-
-    // 位置ワープの状態が変わったときに、画面に通知する (プラグイン側のフレームごとの処理)
-    static void PosNotifyFrame(void)
-    {
-        static u32 lastMode = 0;
-        const u32 m = g_posMode;
-        if (m == lastMode)
-            return;
-        if (m == 2)
-            OSD::Notify("Pos: placing...");
-        else if (m == 0 && lastMode == 2)
-            OSD::Notify("Pos: done");
-        else if (m == 0 && lastMode == 1)
-            OSD::Notify("Pos: gave up (timeout)");
-        lastMode = m;
-    }
-
-    // メニューから選んだときに1回だけ実行される (有効/無効の切り替えではない)
-    static void WarpEntry(MenuEntry *entry)
-    {
-        (void)entry;
-
-        if (!InstallWarpHook())
-            return;
-        LoadSavedPos();
-
-        std::vector<std::string> names;
-        for (int i = 0; i < WARP_COUNT; ++i)
-            names.push_back(g_warpDests[i].label);
-        for (size_t i = 0; i < g_savedPos.size(); ++i)
-            names.push_back(Utils::Format("[保存] %s (エリア%u)", g_savedPos[i].name.c_str(), g_savedPos[i].area));
-
-        Keyboard kb("移動先を選択 ([保存]は、保存した位置 / ほかは、行き先へ向かう扉の前)", names);
-        int sel = kb.Open();
-        if (sel < 0 || sel >= (int)names.size())
-            return;
-
-        if (sel >= WARP_COUNT)
-        {
-            RequestSavedPos(g_savedPos[sel - WARP_COUNT]);
-            return;
-        }
-
-        g_posMode     = 0;
-        g_warpArea    = g_warpDests[sel].area;
-        g_warpLink    = g_warpDests[sel].link;
-        g_warpUseLink = 1;
-        g_warpPending = 1;     // メニューを閉じた後、ゲームが次にタスクを更新したときに実行される
-        OSD::Notify("Warp requested.");
-    }
-
-    // ------------------------------------------------------------
-    //  探索ワープ / 扉の記録 (開発用)
-    //  ・探索ワープ: 「出たいエリア」と「入口番号」を数字で指定して移動する
-    //  ・扉の自動記録: 有効にして扉を通ると、here / dest / 入口番号 を記録する
-    //  記録は SD カード直下の fll_warp_notes.txt に追記される (書けない場合は画面の一覧のみ)。
-    //  存在しないエリアIDへ移動すると、落ちる可能性がある。必ずバックアップを取ること。
+    // ---------------------------------------------------------------
+    //  4. テンションゲージ (プレイヤー)
+    //     テンション = *(float*)(player + 0xD4 + 0x88)
+    //       (HPの+8。既存コードのアドレス 16EACA70→16EACA78 の差から推定)
+    //     1段階目 = 50.0 (42480000) / 2段階目 = 100.0 (42C80000)
     //
-    //  here = 扉を通る前に居たエリア (扉がある側) / dest = 扉の向こう側のエリア
-    //  入口番号 L の扉は、here 側と dest 側の2か所にある (両側で同じ番号)。
-    //   ・ここ(here)に出たいとき      → (here, L) を指定
-    //   ・扉の先(dest)に出たいとき    → (dest, L) を指定
-    //  ゲーム本体は (行き先エリア, L) を渡すと「その行き先へ向かう扉の前」に出る
-    //  (= 反対側のエリアに出る) ので、数字指定ワープは入口番号 L の反対側のエリアを
-    //  調べて、本体に渡す値へ変換している。反対側が未登録の入口番号は、変換できない。
-    // ------------------------------------------------------------
-    #ifndef WARP_LOG_TO_FILE
-    #define WARP_LOG_TO_FILE 1      // ビルドが通らないときは 0 にするとファイル出力を外せる
-    #endif
+    //     モード:
+    //       0 自動(フラグ判定) : 2段階目の効果中フラグ (player+0xFBC の最上位ビット) を読み、
+    //                  効果中は 50.0 固定 (1段階目のダメージ技を連打できる)、
+    //                  効果中でなければ 100.0 で待機 (すぐ2段階目を撃てる)。
+    //                  装備による効果時間の違いにも自動で追従する。
+    //       1 段階1固定 : 常に 50.0
+    //       2 段階2固定 : 常に 100.0
+    //       3 自動(時間指定) : フラグを使わず、ゲージが減ったら発動とみなして
+    //                  設定した「効果時間(秒)」だけ 50.0 固定 (予備)
+    // ---------------------------------------------------------------
+    // 2段階目の効果中フラグ (調査結果): player+0xFBC
+    //   効果中 = 最上位ビット(0x80000000)が立つ (例 8000000A / 8000000F)
+    //   効果なし = 0   ※武器を構えただけでは変わらない
+    //   (player+0xA10 は「武器を構えている」フラグで、効果中フラグではない)
+    static const u32 TENSION_EFFECT_FLAG_OFF = 0x0FBC;
 
-    static std::vector<std::string> g_notes;
-    static u32 g_expArea = 2;
-    static u32 g_expLink = 0;
-    static int g_expMode = 0;       // 0 = 入口番号を指定 / 1 = エリアだけ指定 (標準の入口)
-
-    static void AppendNote(const std::string &line)
+    static u32 &TensionMode()
     {
-        g_notes.push_back(line);
-    #if WARP_LOG_TO_FILE
-        File f;
-        if (File::Open(f, "/fll_warp_notes.txt", File::WRITE | File::CREATE | File::APPEND) == 0)
-        {
-            f.WriteLine(line);
-            f.Close();
-        }
-        else
-            OSD::Notify("note: file open failed (memory only)");
-    #endif
+        static u32 m = 0; // 既定: フラグ判定
+        return m;
     }
 
-    // 入口番号 → その入口が結ぶ2つのエリア。扉の自動記録のログ末尾の
-    // 「{ 番号, here, dest },」をそのまま足せる。(扉を通ると、実行中も自動で覚える)
-    struct LinkEnd { u16 link; u16 a; u16 b; };
-    static const LinkEnd g_linkEnds[] =
+    static u32 &TensionBuffSec()
     {
-        {  39,   3,  25 },   // 郊外南 <-> パーテル大平原東
-        { 125,  24,  25 },   // パーテル西 <-> パーテル大平原東
-        { 128,  25, 210 },   // パーテル大平原東 <-> ハニワの洞窟
-        { 133,  82,  83 },
-        { 142,  83,  86 },
-        { 132,  82,  85 },
-        { 136,  97,  98 },
-        {  88,  16,  19 },
-        {  83,  11,  31 },
-        {  81,  13,  30 },
-    };
-    static std::vector<LinkEnd> g_linkLearned;
-
-    static void LearnLink(u32 link, u32 a, u32 b)
-    {
-        for (size_t i = 0; i < g_linkLearned.size(); ++i)
-        {
-            const LinkEnd &e = g_linkLearned[i];
-            if (e.link == link && ((e.a == a && e.b == b) || (e.a == b && e.b == a)))
-                return;
-        }
-        LinkEnd e;
-        e.link = (u16)link;
-        e.a    = (u16)a;
-        e.b    = (u16)b;
-        g_linkLearned.push_back(e);
+        static u32 s = 30;
+        return s;
     }
 
-    // 戻り値: 0 = 反対側が見つかった / 1 = 入口番号が未登録 / 2 = そのエリアは、この入口の端ではない
-    static int FindOtherEnd(u32 area, u32 link, u32 &other, u32 &ea, u32 &eb)
-    {
-        bool known = false;
-        for (int pass = 0; pass < 2; ++pass)
-        {
-            const size_t n = (pass == 0) ? g_linkLearned.size() : (sizeof(g_linkEnds) / sizeof(g_linkEnds[0]));
-            for (size_t i = 0; i < n; ++i)
-            {
-                const LinkEnd &e = (pass == 0) ? g_linkLearned[i] : g_linkEnds[i];
-                if (e.link != link)
-                    continue;
-                known = true;
-                ea = e.a;
-                eb = e.b;
-                if (e.a == area) { other = e.b; return 0; }
-                if (e.b == area) { other = e.a; return 0; }
-            }
-        }
-        return known ? 2 : 1;
-    }
-
-    // ゲーム本体へ予約する。area は本体に渡す値 (= その入口が向かう側のエリア)。
-    static void RequestWarpRaw(u32 area, u32 link, bool useLink)
-    {
-        if (area > 999) area = 999;   // 0 も指定できる (存在しないIDだと落ちる可能性あり)
-        g_warpArea    = area;
-        g_warpLink    = link;
-        g_warpUseLink = useLink ? 1 : 0;
-        g_posMode     = 0;            // 保存位置の予約が残っていたら、取り消す
-        g_warpPending = 1;
-        OSD::Notify(Utils::Format("Warp: engine area %u link %u%s", area, link, useLink ? "" : " (default)"));
-    }
-
-    // 「area の、番号 link の入口の前」に出る。
-    static void WarpToEntrance(u32 area, u32 link)
-    {
-        u32 other = 0, ea = 0, eb = 0;
-        const int r = FindOtherEnd(area, link, other, ea, eb);
-
-        if (r == 2)
-        {
-            MessageBox("移動できません",
-                       Utils::Format("入口番号 %u は、エリア %u とエリア %u をつなぐ入口です。\n"
-                                     "エリア %u には、この入口はありません。", link, ea, eb, area))();
-            return;
-        }
-        if (r == 1)
-        {
-            if (!(MessageBox("入口番号が未登録",
-                             Utils::Format("入口番号 %u の両側のエリアが、まだ登録されていません。\n\n"
-                                           "このまま続けると、エリア %u へ向かう扉の前 (隣のエリア側) に出ます。\n"
-                                           "続けますか?\n\n"
-                                           "(「扉の自動記録」を有効にして、その入口の扉を通ると登録されます)",
-                                           link, area),
-                             DialogType::DialogYesNo))())
-                return;
-            RequestWarpRaw(area, link, true);
-            return;
-        }
-        RequestWarpRaw(other, link, true);
-    }
-
-    static u32 CurrentAreaId(void)
-    {
-        u16 a = 0;
-        if (g_warpTask != 0)
-            Process::Read16(g_warpTask + 0x6B2, a);
-        return a;
-    }
-
-    static void ShowNotes(void)
-    {
-        if (g_notes.empty())
-        {
-            MessageBox("記録", "まだ記録がありません。")();
-            return;
-        }
-        std::string text;
-        int shown = 0;
-        for (int i = (int)g_notes.size() - 1; i >= 0 && shown < 12; --i, ++shown)
-            text += g_notes[i] + "\n";
-        MessageBox("記録 (新しい順 最大12件)", text)();
-    }
-
-    static void ExploreEntry(MenuEntry *entry)
+    static void TensionSettings(MenuEntry *entry)
     {
         (void)entry;
+        std::vector<std::string> top;
+        top.push_back("モード");
+        top.push_back("段階2の効果時間(秒) ※時間指定モード用");
+        Keyboard kbTop("テンションゲージの設定", top);
+        const int c = kbTop.Open();
+        if (c == 0)
+        {
+            std::vector<std::string> modes;
+            modes.push_back("自動(効果中フラグで判定)");
+            modes.push_back("段階1固定(50.0)");
+            modes.push_back("段階2固定(100.0)");
+            modes.push_back("自動(効果時間を設定で指定)");
+            Keyboard kbMode("モード", modes);
+            const int m = kbMode.Open();
+            if (m >= 0)
+                TensionMode() = static_cast<u32>(m);
+        }
+        else if (c == 1)
+        {
+            u32 sec = TensionBuffSec();
+            Keyboard kbSec("段階2の効果時間(秒) 1~600\n実際に計って合わせてください");
+            kbSec.IsHexadecimal(false);
+            if (kbSec.Open(sec, sec) == 0)
+            {
+                if (sec < 1)
+                    sec = 1;
+                if (sec > 600)
+                    sec = 600;
+                TensionBuffSec() = sec;
+            }
+        }
+    }
 
-        if (!InstallWarpHook())
+    static void TensionGame(MenuEntry *entry)
+    {
+        static u32  lastBase = 0;
+        static bool buff = false;   // 段階2の効果中とみなしている
+        static bool primed = false; // 100.0 を書いた後
+        static u32  frames = 0;
+
+        if (!entry->IsActivated())
+        {
+            lastBase = 0;
+            buff = false;
+            primed = false;
+            frames = 0;
+            return;
+        }
+
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
             return;
 
-        const u32 cur = CurrentAreaId();
+        if (base != lastBase)
+        {
+            lastBase = base;
+            buff = false;
+            primed = false;
+            frames = 0;
+        }
 
-        // 項目の「表示」と「動作」は、必ずペアで追加する (opts と acts を同時に push_back する)。
-        // 表示順を変えたいときは、下の並びの行を入れ替えるだけでよい (switch は動作名で分岐する)。
-        enum Act { ACT_INPUT, ACT_AREA_ONLY, ACT_AGAIN, ACT_SHOW };
+        const u32 addr = base + 0x88;
+        float cur = 0.0f;
+        if (!Process::ReadFloat(addr, cur))
+            return;
+        if (!(cur >= 0.0f && cur < 1000.0f)) // NaN・異常値には触らない
+            return;
+
+        const u32 mode = TensionMode();
+        if (mode == 1)
+        {
+            if (cur != 50.0f)
+                Process::WriteFloat(addr, 50.0f);
+            return;
+        }
+        if (mode == 2)
+        {
+            if (cur != 100.0f)
+                Process::WriteFloat(addr, 100.0f);
+            return;
+        }
+
+        if (mode == 0)
+        {
+            // 自動(フラグ判定): 効果中 = 50.0 / 効果中でない = 100.0
+            u32 flag = 0;
+            if (!Process::Read32(base - 0xD4 + TENSION_EFFECT_FLAG_OFF, flag))
+                return;
+            const bool effect = (flag & 0x80000000u) != 0;
+            const float target = effect ? 50.0f : 100.0f;
+            if (cur != target)
+                Process::WriteFloat(addr, target);
+            return;
+        }
+
+        // モード3: 自動(効果時間を設定で指定)
+        if (!buff)
+        {
+            if (primed && cur < 99.0f) // 100.0 で待機中に減った = 段階2が発動した
+            {
+                buff = true;
+                frames = 0;
+                Process::WriteFloat(addr, 50.0f);
+                return;
+            }
+            if (cur != 100.0f)
+                Process::WriteFloat(addr, 100.0f);
+            primed = true;
+            return;
+        }
+
+        // 効果中: 50.0 に固定
+        frames++;
+        if (frames >= TensionBuffSec() * 60u) // 60フレーム = 約1秒
+        {
+            buff = false;
+            primed = false; // 次のフレームで 100.0 に戻す
+            return;
+        }
+        if (cur != 50.0f)
+            Process::WriteFloat(addr, 50.0f);
+    }
+
+    // ---------------------------------------------------------------
+    //  5. テンション調査 (開発用)
+    //     プレイヤーのデータ(player+0 ~ +0x1000)を5つの状態で保存して、
+    //     「2段階目の効果中フラグ」「残り時間」らしき場所をSDに書き出す。
+    //       A  = 武器をしまっている通常状態
+    //       W  = 武器を構えた(戦闘モード)・2段階目の効果なし
+    //       E1 = 2段階目の効果中(武器を構えたまま)
+    //       E2 = 効果中(数秒後)
+    //       F  = 効果が切れた後(武器を構えたまま)
+    //     W と F が同じで E1/E2 だけ違う場所が、効果中フラグ。
+    //     (A と W の違いは戦闘モードのフラグなので、候補から除ける)
+    //     結果は SD の fll_tension_scan.txt に出力される。
+    // ---------------------------------------------------------------
+    static const u32 SCAN_SIZE = 0x1000;
+    static const int SCAN_COUNT = 5;
+
+    static std::vector<u32> &ScanSnap(int i)
+    {
+        static std::vector<u32> snaps[SCAN_COUNT];
+        return snaps[i];
+    }
+
+    static u32 &ScanPlayer(int i)
+    {
+        static u32 pl[SCAN_COUNT] = {0, 0, 0, 0, 0};
+        return pl[i];
+    }
+
+    static void ScanTake(int i)
+    {
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
+        {
+            MessageBox("プレイヤーが見つかりません")();
+            return;
+        }
+        const u32 player = base - 0xD4;
+        std::vector<u32> &v = ScanSnap(i);
+        v.assign(SCAN_SIZE / 4, 0);
+        for (u32 off = 0; off < SCAN_SIZE; off += 4)
+        {
+            u32 w = 0;
+            if (Process::CheckAddress(player + off))
+                Process::Read32(player + off, w);
+            v[off / 4] = w;
+        }
+        ScanPlayer(i) = player;
+        OSD::Notify(Utils::Format("保存しました (player=%08X)", player));
+    }
+
+    static float AsFloat(u32 w)
+    {
+        float f = 0.0f;
+        std::memcpy(&f, &w, sizeof(f));
+        return f;
+    }
+
+    static void ScanWrite()
+    {
+        for (int i = 0; i < SCAN_COUNT; ++i)
+        {
+            if (ScanSnap(i).empty())
+            {
+                MessageBox("A, W, E1, E2, F をすべて保存してから書き出してください")();
+                return;
+            }
+        }
+        File file;
+        if (File::Open(file, "fll_tension_scan.txt", File::RWC | File::TRUNCATE) != 0)
+        {
+            MessageBox("fll_tension_scan.txt を開けませんでした")();
+            return;
+        }
+        file.WriteLine(Utils::Format("player: A=%08X W=%08X E1=%08X E2=%08X F=%08X",
+                                     ScanPlayer(0), ScanPlayer(1), ScanPlayer(2),
+                                     ScanPlayer(3), ScanPlayer(4)));
+
+        file.WriteLine("== 効果中フラグ候補 (W==F, E1==E2, E1!=W)  形式: +offset W -> E1");
+        int n = 0;
+        for (u32 i = 0; i < SCAN_SIZE / 4 && n < 300; ++i)
+        {
+            const u32 W = ScanSnap(1)[i], E1 = ScanSnap(2)[i], E2 = ScanSnap(3)[i], F = ScanSnap(4)[i];
+            if (W == F && E1 == E2 && E1 != W)
+            {
+                file.WriteLine(Utils::Format("+%04X  %08X -> %08X  (float %.3f -> %.3f)",
+                                             i * 4, W, E1, AsFloat(W), AsFloat(E1)));
+                ++n;
+            }
+        }
+
+        file.WriteLine("== タイマー候補 (W==F, E1!=E2)  形式: +offset E1 -> E2");
+        n = 0;
+        for (u32 i = 0; i < SCAN_SIZE / 4 && n < 300; ++i)
+        {
+            const u32 W = ScanSnap(1)[i], E1 = ScanSnap(2)[i], E2 = ScanSnap(3)[i], F = ScanSnap(4)[i];
+            if (W == F && E1 != E2)
+            {
+                file.WriteLine(Utils::Format("+%04X  %08X -> %08X  (float %.3f -> %.3f)",
+                                             i * 4, E1, E2, AsFloat(E1), AsFloat(E2)));
+                ++n;
+            }
+        }
+
+        file.WriteLine("== 参考: 戦闘モードの違い (A!=W かつ W==F)");
+        n = 0;
+        for (u32 i = 0; i < SCAN_SIZE / 4 && n < 100; ++i)
+        {
+            const u32 A = ScanSnap(0)[i], W = ScanSnap(1)[i], F = ScanSnap(4)[i];
+            if (A != W && W == F)
+            {
+                file.WriteLine(Utils::Format("+%04X  %08X -> %08X", i * 4, A, W));
+                ++n;
+            }
+        }
+        file.Close();
+        MessageBox("fll_tension_scan.txt に書き出しました")();
+    }
+
+    static void TensionScanEntry(MenuEntry *entry)
+    {
+        (void)entry;
         std::vector<std::string> opts;
-        std::vector<int> acts;
-
-        opts.push_back("エリアIDと入口番号を数字で指定");
-        acts.push_back(ACT_INPUT);
-        opts.push_back("エリアIDだけ数字で指定 (標準の入口)");
-        acts.push_back(ACT_AREA_ONLY);
-        opts.push_back(Utils::Format("もう一度同じIDへ (%u)", g_expArea));
-        acts.push_back(ACT_AGAIN);
-        opts.push_back("記録を表示");
-        acts.push_back(ACT_SHOW);
-
-        u32 sel = 0;
-        if (!AskChoice(Utils::Format("探索ワープ  いまのエリアID=%u / 前回の指定=ID %u 入口 %u", cur, g_expArea, g_expLink),
-                       opts, sel))
-            return;
-        if (sel >= acts.size())
-            return;
-
-        switch (acts[sel])
-        {
-        case ACT_INPUT:
-        {
-            u32 area = g_expArea, link = g_expLink;
-            if (!AskValue("出たいエリアID (0〜999)", false, 999, g_expArea, area))
-                return;
-            if (!AskValue("その入口番号 (0〜999)", false, 999, g_expLink, link))
-                return;
-            g_expArea = area;
-            g_expLink = link;
-            g_expMode = 0;
-            WarpToEntrance(area, link);
-            break;
-        }
-        case ACT_AREA_ONLY:
-        {
-            u32 area = g_expArea;
-            if (!AskValue("エリアID (0〜999)", false, 999, g_expArea, area))
-                return;
-            g_expArea = area;
-            g_expMode = 1;
-            RequestWarpRaw(area, 0, false);
-            break;
-        }
-        case ACT_AGAIN:
-            if (g_expMode == 0)
-                WarpToEntrance(g_expArea, g_expLink);
-            else
-                RequestWarpRaw(g_expArea, 0, false);
-            break;
-        case ACT_SHOW:
-            ShowNotes();
-            break;
-        default:
-            break;
-        }
+        opts.push_back("A: 武器をしまった通常状態を保存");
+        opts.push_back("W: 武器を構えた(効果なし)を保存");
+        opts.push_back("E1: 2段階目の効果中を保存");
+        opts.push_back("E2: 効果中(数秒後)を保存");
+        opts.push_back("F: 効果が切れた後(武器を構えたまま)を保存");
+        opts.push_back("結果をSDに書き出す");
+        Keyboard kb("テンション調査", opts);
+        const int c = kb.Open();
+        if (c >= 0 && c < SCAN_COUNT)
+            ScanTake(c);
+        else if (c == SCAN_COUNT)
+            ScanWrite();
     }
 
-    // 有効な間、毎フレーム呼ばれる。扉を通ってオブジェクトの中身が変わるたびに記録する。
-    // (同じ扉を続けて通ると、中身が変わらないので記録されない)
-    static void DoorLogEntry(MenuEntry *entry)
+    // ---------------------------------------------------------------
+    //  メニュー登録
+    // ---------------------------------------------------------------
+    static void InitMenu(PluginMenu &menu)
     {
-        (void)entry;
-        static u32 lastWord = 0xFFFFFFFF;
+        MenuFolder *folder = new MenuFolder("バトル");
 
-        // here (いま居るエリア) を読むには、ワープ用のフックが必要 (タスクの場所を毎フレーム受け取る)
-        if (g_warpTask == 0)
-        {
-            InstallWarpHook();
-            return;
-        }
+        folder->Append(new MenuEntry(
+            "固定ダメージ(プレイヤー)", FixedDamageGame, FixedDamageSettings,
+            "プレイヤーが敵に与えるダメージを固定します。\n"
+            "設定(右の歯車)で 0~2147483647 を指定できます。\n"
+            "10000以上は、表示9999固定が自動で併用されます。"));
 
-        u32 w = 0;
-        if (!Process::Read32(0x16D5D4A8, w))   // ChangeMapオブジェクトの +12 (エリアID16bit) と +14 (入口番号16bit)
-            return;
-        if (w == lastWord)
-            return;
-        lastWord = w;
+        folder->Append(new MenuEntry(
+            "近づいたらダメージ判定", ProximityGame, ProximitySettings,
+            "近くの敵にダメージ判定を出します(倍率は等倍)。\n"
+            "固定ダメージと併用すると、近くの敵に固定ダメージが入ります。\n"
+            "設定で範囲を 1~200 で指定できます。"));
 
-        const u32 dest = w & 0xFFFF;
-        const u32 link = w >> 16;
-        if (dest == 0)
-            return;
+        folder->Append(new MenuEntry(
+            "HP減らない", HpNoDecreaseGame, nullptr,
+            "プレイヤーのHPが減ったら、直前の値に戻します。\n"
+            "回復やレベルアップで増えた値は、新しい上限として覚えます。"));
 
-        // here = 扉を通る前に居たエリア / dest = 扉の向こう
-        const u32 here = CurrentAreaId();
-        LearnLink(link, here, dest);
-        AppendNote(Utils::Format("DOOR here=%u dest=%u link=%u | ここに出る: %u/%u  扉の先に出る: %u/%u | { %u, %u, %u },",
-                                 here, dest, link, here, link, dest, link, link, here, dest));
-        OSD::Notify(Utils::Format("Door: here %u dest %u link %u", here, dest, link));
+        folder->Append(new MenuEntry(
+            "SP減らない", SpNoDecreaseGame, nullptr,
+            "プレイヤーのSPが減ったら、直前の値に戻します。"));
+
+        folder->Append(new MenuEntry(
+            "テンションゲージ", TensionGame, TensionSettings,
+            "テンションゲージを自動で管理します(設定でモードと効果時間を指定)。\n"
+            "自動: 効果中フラグを読んで、効果中は50.0固定、そうでなければ100.0で待機。\n"
+            "段階1だけ解放済みの場合は、設定で「段階1固定」にしてください。"));
+
+        folder->Append(new MenuEntry(
+            "テンション調査 (開発用)", nullptr, TensionScanEntry,
+            "2段階目の効果中フラグ/残り時間を探すための調査です。\n"
+            "A(武器しまい)→W(武器を構える)→E1(効果中)→E2(数秒後)→F(効果終了後) の5回保存して書き出します。\n"
+            "E1〜Fのあいだは武器を構えたままにしてください。"));
+
+        folder->Append(new MenuEntry(
+            "HP/SPアドレス確認 (開発用)", nullptr, ShowStatusAddr,
+            "プレイヤーのHP/SP/テンションのアドレスと現在値を表示します。"));
+
+        menu += folder;
     }
 
-    // ============================================================
-    //  プレイヤー切り替え (直接版) / 日本語版 v1.7L
-    //  実機GDBで通し確認済み
-    // ============================================================
-    namespace PlayerSwitch
+    // menu がポインタ(PluginMenu *menu)の場合はこちらが呼ばれる
+    static void InitMenu(PluginMenu *menu)
     {
-        // true にすると、進行状況を画面に出します(不具合調査用)
-        static constexpr bool VERBOSE = false;
-        // true にすると、スロット選択画面(オレンジ色の背景とアバター)を出さずに進めます
-        // (実機GDBで確認済み: UIの初期化と「UIを開く」を止め、UIの準備完了の印を手動で立てる)
-        static constexpr bool HIDE_SELECT_UI = true;
-
-        static constexpr u32 FLOW_OBJ       = 0x7208DC;   // シーンフロー (+36 切替要求, +44 要求状態, +48 現在状態)
-        static constexpr u32 ROOT_TASK      = 0x6B95EC;   // ルートタスク
-        static constexpr u32 VPTR_EXSEL     = 0x66D898;   // スロット選択タスクの vtable
-        static constexpr u32 VPTR_FIELD     = 0x669038;
-        static constexpr u32 STATE_IDLE     = 1;
-        static constexpr u32 STATE_FIELD    = 9;
-        static constexpr u32 IDLE_MSG_ADDR  = 0x687D14;
-        static constexpr u32 FN_SEND        = 0x46FEEC;
-        static constexpr u32 DESC_EXSEL     = 0x6D9D1C;
-        static constexpr u32 MGR_OBJ        = 0x719374;
-        static constexpr u32 FN_MGR_INIT    = 0x28299C;
-        static constexpr u32 FN_MGR_UPDATE  = 0x28238C;
-        static constexpr u32 FN_MGR_TERM    = 0x257D88;
-        static constexpr u32 FN_EXSEL_UPDATE   = 0x411E98;
-        static constexpr u32 VTBL_EXSEL_UPDATE = 0x66D8AC;
-        static constexpr u32 UIMGR_OBJ      = 0x6B977C;
-        static constexpr u32 FN_ATTACH      = 0x46FFE0;
-        static constexpr u32 SLOT_VAR       = 0x71BA40;
-        static constexpr u32 UI_OPEN_ADDR   = 0x41251C;   // bl 0x308888 (スロット選択UIを開く)
-        static constexpr u32 UI_OPEN_ORIG   = 0xEBFBD8D9;
-        static constexpr u32 UI_INIT_ADDR   = 0x412F9C;   // bl 0x30aba8 (スロット選択UIの初期化)
-        static constexpr u32 UI_INIT_ORIG   = 0xEBFBDF01;
-        static constexpr u32 ARM_NOP        = 0xE1A00000;
-        static constexpr u32 MAX_FRAMES     = 60 * 90;
-        static constexpr u32 STATE_TITLE    = 8;
-        // スロット選択タスクの中の、スロットごとの「概要の入れ物」(0x800バイトおき)。
-        // 2バイト目が、概要の読み込みに成功した印 (データのないスロットは 0)
-        static constexpr u32 SUM_BASE       = 0x79B0;
-        static constexpr u32 SUM_STRIDE     = 0x800;
-
-        typedef s32  (*SendFn)(u32, u32);
-        typedef void (*FnU32)(u32);
-        typedef void (*FnU32x2)(u32, u32);
-
-        enum Phase { IDLE, D_BLANK, D_SEL, D_DONE, D_RESTART };
-
-        static volatile int  g_slot  = -1;
-        static Phase         g_phase = IDLE;
-        static u32           g_wait  = 0;
-        static u32           g_tick  = 0;
-        static volatile bool g_sent  = false;
-        static volatile s32  g_sendResult = 0;
-        static bool g_mgrInit = false, g_vtblPatched = false, g_uiAttached = false, g_uiHidden = false, g_uiInitHidden = false;
-        static int  g_lastSt = -1;
-        static int  g_slotValid[3] = { -1, -1, -1 };   // -1:不明 0:データなし(未作成) 1:データあり
-        static u32  g_idleTick = 0;
-
-        static void Say(const std::string &m) { if (VERBOSE) OSD::Notify(m); }
-
-        static u32 FindByVptr(u32 node, u32 vptr, int depth)
-        {
-            u32 v = 0;
-            if (depth > 4 || !Process::CheckAddress(node))
-                return 0;
-            if (Process::Read32(node, v) && v == vptr)
-                return node;
-            u32 child = 0;
-            if (!Process::Read32(node + 340, child))
-                return 0;
-            for (int i = 0; i < 64 && child && Process::CheckAddress(child); i++)
-            {
-                u32 found = FindByVptr(child, vptr, depth + 1);
-                if (found)
-                    return found;
-                if (!Process::Read32(child + 344, child))
-                    break;
-            }
-            return 0;
-        }
-
-        // スロット選択タスクの概要から、各スロットのデータの有無を読み取って覚える
-        static void SampleSummary(u32 obj)
-        {
-            u8 st = 0, nx = 0;
-            Process::Read8(obj + 0x91B9, st);
-            Process::Read8(obj + 0x91B8, nx);
-            // 3人分の読み込みが終わって、決定待ちになるまで(状態0x0A / 0x0B)の間だけ有効
-            if (!(st == 0x0A || st == 0x0B || nx == 0x0A || nx == 0x0B))
-                return;
-            for (u32 i = 0; i < 3; i++)
-            {
-                u8 ok = 0;
-                if (Process::Read8(obj + SUM_BASE + i * SUM_STRIDE + 1, ok))
-                    g_slotValid[i] = ok ? 1 : 0;
-            }
-        }
-
-        static void RequestState(u32 st)
-        {
-            Process::Write32(FLOW_OBJ + 44, st);
-            Process::Write8(FLOW_OBJ + 36, 1);
-        }
-
-        static void RestoreIdleMsg(void) { Process::Write16(IDLE_MSG_ADDR, 0); }
-
-        // スロット選択タスクの更新の差し替え (ゲーム本来のスレッドで毎フレーム動く)
-        //  1. UI管理を、このタスクの子として登録 (これがないと読み込みが完了しない)
-        //  2. 状態0x0C(読み込み開始)の直前に、スロット番号を書く
-        //  3. 管理オブジェクトを更新してから、本来の更新を呼ぶ
-        //  4. 状態0x0E(リンク確認)に進もうとしたら 0x22 へ飛ばす
-        static void ExSelUpdateWrapper(u32 self)
-        {
-            if (!g_uiAttached)
-            {
-                ((FnU32x2)FN_ATTACH)(self, UIMGR_OBJ);
-                if (HIDE_SELECT_UI)
-                    *(volatile u32 *)(self + 372) |= 3;   // UIの準備完了の印 (UIの初期化を止めたので手動で立てる)
-                g_uiAttached = true;
-            }
-            volatile u8 *nextSt = (volatile u8 *)(self + 0x91B8);
-            if (*nextSt == 0x0C && g_slot >= 0)
-                *(volatile u8 *)SLOT_VAR = (u8)g_slot;
-
-            ((FnU32)FN_MGR_UPDATE)(MGR_OBJ);
-            ((FnU32)FN_EXSEL_UPDATE)(self);
-
-            if (*nextSt == 0x0E)
-                *nextSt = 0x22;
-        }
-
-        static void CleanupDirect(void)
-        {
-            if (g_vtblPatched)
-            {
-                Process::Write32(VTBL_EXSEL_UPDATE, FN_EXSEL_UPDATE);
-                g_vtblPatched = false;
-            }
-            if (g_uiHidden)
-            {
-                Process::Write32(UI_OPEN_ADDR, UI_OPEN_ORIG);
-                g_uiHidden = false;
-            }
-            if (g_uiInitHidden)
-            {
-                Process::Write32(UI_INIT_ADDR, UI_INIT_ORIG);
-                g_uiInitHidden = false;
-            }
-            if (g_mgrInit)
-            {
-                ((FnU32)FN_MGR_TERM)(MGR_OBJ);
-                g_mgrInit = false;
-            }
-        }
-
-        static void Abort(const char *msg)
-        {
-            OSD::Notify(msg);
-            Process::Write32(FLOW_OBJ + 12, 0);
-            CleanupDirect();
-            RestoreIdleMsg();
-            g_phase = IDLE;
-        }
-
-        // ゲーム起動時の SlotReset と同じ初期化
-        static void ResetSlotState(void)
-        {
-            Process::Write8(SLOT_VAR, 0);
-            for (u32 o = 4; o <= 24; o += 4)
-                Process::Write32(SLOT_VAR + o, 0);
-        }
-
-        // シーンフローのリスナー (FLOW+12)。状態変更の直後に、ゲーム本来のスレッドから1回だけ呼ばれる
-        static void FlowListener(s32 state, u32 arg)
-        {
-            (void)arg;
-            if (state != (s32)STATE_IDLE)
-                return;
-            Process::Write32(FLOW_OBJ + 12, 0);
-            ResetSlotState();
-            g_uiAttached = false;
-            ((FnU32)FN_MGR_INIT)(MGR_OBJ);
-            g_mgrInit = true;
-            if (HIDE_SELECT_UI)
-            {
-                g_uiHidden = Process::Write32(UI_OPEN_ADDR, ARM_NOP);
-                g_uiInitHidden = Process::Write32(UI_INIT_ADDR, ARM_NOP);
-            }
-            g_vtblPatched = Process::Write32(VTBL_EXSEL_UPDATE, (u32)&ExSelUpdateWrapper);
-            g_sendResult = ((SendFn)FN_SEND)(ROOT_TASK, DESC_EXSEL);
-            g_sent = true;
-        }
-
-        // menu->Callback から毎フレーム呼ばれる (切り替え中以外は即 return)
-        static void OnFrame(void)
-        {
-            if (g_phase == IDLE)
-            {
-                // タイトル画面の間だけ、6フレームに1回、スロットのデータの有無を読み取って覚える
-                if ((++g_idleTick % 6) == 0)
-                {
-                    u32 c = 0;
-                    if (Process::Read32(FLOW_OBJ + 48, c) && c == STATE_TITLE)
-                    {
-                        u32 o = FindByVptr(ROOT_TASK, VPTR_EXSEL, 0);
-                        if (o)
-                            SampleSummary(o);
-                    }
-                }
-                return;
-            }
-
-            // 重くならないよう、切り替え中も3フレームに1回だけ調べる
-            if (g_phase != D_BLANK && (++g_tick % 3) != 0)
-                return;
-
-            u32 cur = 0;
-            Process::Read32(FLOW_OBJ + 48, cur);
-            (void)cur;
-
-            switch (g_phase)
-            {
-            case D_BLANK:
-            {
-                if (!g_sent)
-                {
-                    if (++g_wait > 600)
-                        Abort("PS: flow listener not called");
-                    return;
-                }
-                Say(Utils::Format("PS: send=%d vtbl=%d", (int)g_sendResult, (int)g_vtblPatched));
-                g_wait = 0;
-                g_lastSt = -1;
-                g_phase = D_SEL;
-                break;
-            }
-            case D_SEL:
-            {
-                u32 obj = FindByVptr(ROOT_TASK, VPTR_EXSEL, 0);
-                if (!obj)
-                {
-                    if (++g_wait > 100)
-                        Abort("PS: select task not created");
-                    return;
-                }
-                u8 st = 0, nx = 0;
-                Process::Read8(obj + 0x91B9, st);
-                Process::Read8(obj + 0x91B8, nx);
-                if ((int)st != g_lastSt)
-                {
-                    g_lastSt = st;
-                    Say(Utils::Format("PS: select state %02X", st));
-                }
-                SampleSummary(obj);   // 切り替えのたびに、データの有無を更新する
-                // UIを開く(0A)/決定待ち(0B)に来たら、決定済みにして読み込み(0C以降)へ進める
-                if (st == 0x0A || st == 0x0B || nx == 0x0A || nx == 0x0B)
-                {
-                    Process::Write32(obj + 0x91BC, (u32)g_slot);
-                    Process::Write8(0x68BAD1, 0);
-                    Process::Write8(obj + 0x91B8, 0x0C);
-                    Say("PS: decide -> load");
-                    g_wait = 0;
-                    g_phase = D_DONE;
-                }
-                else if (++g_wait > MAX_FRAMES / 3)
-                    Abort("PS: select timeout");
-                break;
-            }
-            case D_DONE:
-            {
-                // スロット選択タスクが自分で終了するのを待つ
-                if (FindByVptr(ROOT_TASK, VPTR_EXSEL, 0))
-                {
-                    if (++g_wait > MAX_FRAMES / 3)
-                        Abort("PS: load timeout");
-                    return;
-                }
-                Say("PS: load finished");
-                CleanupDirect();
-                g_wait = 0;
-                g_phase = D_RESTART;
-                break;
-            }
-            case D_RESTART:
-            {
-                if (FindByVptr(ROOT_TASK, VPTR_FIELD, 0))
-                {
-                    RestoreIdleMsg();
-                    g_phase = IDLE;
-                    Say("PS: done");
-                    return;
-                }
-                // ゲーム側が自分でフィールドを作らない場合は、こちらから要求する
-                if (++g_wait == 40)
-                {
-                    RestoreIdleMsg();
-                    RequestState(STATE_FIELD);
-                    Say("PS: request field");
-                }
-                else if (g_wait > 600)
-                    Abort("PS: field timeout");
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
-        // メニュー項目から呼ばれる
-        static void Entry(MenuEntry *entry)
-        {
-            (void)entry;
-            u32 cur = 0;
-            Process::Read32(FLOW_OBJ + 48, cur);
-            if (cur != STATE_FIELD)
-            {
-                OSD::Notify("Field only");
-                return;
-            }
-            if (g_phase != IDLE)
-            {
-                OSD::Notify("Busy");
-                return;
-            }
-            std::vector<std::string> opts;
-            for (int i = 0; i < 3; i++)
-                opts.push_back(std::string("プレイヤー ") + (char)('1' + i) + (g_slotValid[i] == 0 ? " (未作成)" : ""));
-            Keyboard kb("プレイヤーを選択", opts);
-            int r = kb.Open();
-            if (r < 0)
-                return;
-            if (g_slotValid[r] == 0)
-            {
-                MessageBox("プレイヤー切り替え", "プレイヤー未作成のため切り替えできません。")();
-                return;
-            }
-
-            // 状態IDLEが新しいシーンを作らないよう、メッセージ番号を範囲外にしておく
-            if (!Process::Write16(IDLE_MSG_ADDR, 0x7FFF))
-            {
-                OSD::Notify("PS: cannot patch table");
-                return;
-            }
-            g_slot = r; g_wait = 0; g_tick = 0; g_lastSt = -1;
-            g_sent = false;
-            Process::Write32(FLOW_OBJ + 24, 0);
-            Process::Write32(FLOW_OBJ + 12, (u32)&FlowListener);
-            g_phase = D_BLANK;
-            RequestState(STATE_IDLE);
-        }
+        InitMenu(*menu);
     }
 
-
-
-    // ------------------------------------------------------------
-    //  CTRPF 必須関数
-    // ------------------------------------------------------------
-    void PatchProcess(FwkSettings &settings)
-    {
-        (void)settings;
-    }
-
-    void OnProcessExit(void)
-    {
-    }
-
-    int main(void)
-    {
-        if (Process::GetTitleID() != 0x00040000000E9C00ULL)
-            OSD::Notify("Warning: unexpected title.");
-
-        // タイトルとバージョン表示。バージョン番号 (数字3つ) の版は使わず、名前に含める。
-        PluginMenu *menu = new PluginMenu("ファンタジーライフ LINK ver1.7L",
-                                          "日本語版用。海外版PLGのItemEditorと同じ方式です。");
-        menu->SynchronizeWithFrame(true);
-
-        BattleCheats::InitMenu(menu);
-        
-menu->Append(new MenuEntry("エリアワープ", nullptr, WarpEntry,
-                                   "移動先を選ぶと、通常のロード画面つきで、そのエリアへ移動します。\n"
-                                   "出る場所は、選んだ行き先へ向かう扉の前です(扉がある側のエリア)。\n"
-                                   "一覧の末尾の[保存]は、「現在位置を保存」で保存した位置です。\n使う前に必ずバックアップを取ってください。"));
-        AddLifeChange(menu);
-
-        AddItemEditor(menu);   // アイテムエディタ (装備編集 / 生成 / 削除 / 一括変更)
-
-        AddCraft(menu);   // 制作フォルダ (素材0個 / 99個 / 即完了 / 品質固定)
-
-menu->Append(new MenuEntry("現在位置を保存 (ワープ一覧に追加)", nullptr, SavePosEntry,
-                                   "いま立っている位置に名前をつけて保存します。保存した位置は「エリアワープ」の一覧の末尾に並びます。\n"
-                                   "別のエリアの位置を選ぶと、そのエリアへ入ってから、保存した位置へ移動します。\n"
-                                   "保存先は SD直下の fll_warp_points.txt です。"));
-menu->Append(new MenuEntry("その場でロード (現在位置に戻る)", nullptr, ReloadHereEntry,
-                                   "いまのエリアを読み込み直して、いまの位置に戻ります。\n"
-                                   "モンスターやボスの再出現に使えます。"));
-menu->Append(new MenuEntry("探索ワープ (開発用)", nullptr, ExploreEntry,
-                                   "出たいエリアIDと入口番号を数字で指定して移動します(そのエリアの、その入口の前に出ます)。\n"
-                                   "入口番号の反対側のエリアが未登録のときは、確認が出ます。「扉の自動記録」で扉を通ると登録されます。\n"
-                                   "存在しないIDだと落ちる可能性があります。必ずバックアップを取ってください。"));
-menu->Append(new MenuEntry("扉の自動記録 (開発用)", DoorLogEntry, nullptr,
-                                   "有効にして扉を通ると、here(扉がある側)・dest(扉の向こう)・入口番号を記録します。\n"
-                                   "ここに出たい → here/入口番号、扉の先に出たい → dest/入口番号 で数字指定できます。\n"
-                                   "記録は SD直下の fll_warp_notes.txt に追記されます。"));
-menu->Append(new MenuEntry("位置ワープの記録を保存 (開発用)", nullptr, PosDumpEntry,
-                                   "保存位置へのワープの経過 (毎フレームの状態と座標) を、fll_warp_notes.txt に書き出します。\n"
-                                   "別のエリアの保存位置へうまく移動できないときの、調査用です。"));
-
-        AddRecommended(menu);
-        AddMageRapid(menu);
-
-
-        // プレイヤー切り替えは、アクセスしやすいように一番下に置く
-menu->Append(new MenuEntry("プレイヤー切り替え", nullptr, PlayerSwitch::Entry,
-                                   "フィールドで実行します。タイトルを経由せず、選んだプレイヤーのデータに切り替えます。\n"
-                                   "使う前に、セーブのバックアップを取ってください。"));
-
-        menu->Callback(PlayerSwitch::OnFrame);
-        menu->Callback(PosNotifyFrame);
-        
-        menu->Run();
-        delete menu;
-        return 0;
-    }
-}
+} // namespace BattleCheats
