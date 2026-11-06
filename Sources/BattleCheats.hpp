@@ -548,12 +548,14 @@ namespace BattleCheats
     //       3 自動(時間指定) : フラグを使わず、ゲージが減ったら発動とみなして
     //                  設定した「効果時間(秒)」だけ 50.0 固定 (予備)
     // ---------------------------------------------------------------
-    // 2段階目の効果中フラグ (調査結果: player+0xA10 が 通常=0 / 効果中=1)
+    // ※ player+0xA10 は「武器を構えている(戦闘モード)」フラグで、効果中フラグではなかった。
+    //   モード0は効果中フラグが見つかるまで使えない(下の定数を差し替えて使う)。
+    // 2段階目の効果中フラグ (未特定: 調査で見つけたオフセットに置き換える)
     static const u32 TENSION_EFFECT_FLAG_OFF = 0x0A10;
 
     static u32 &TensionMode()
     {
-        static u32 m = 0;
+        static u32 m = 3; // フラグ判定(0)は未完成のため、既定は時間指定(3)
         return m;
     }
 
@@ -574,7 +576,7 @@ namespace BattleCheats
         if (c == 0)
         {
             std::vector<std::string> modes;
-            modes.push_back("自動(効果中フラグで判定)");
+            modes.push_back("自動(効果中フラグで判定) ※未完成");
             modes.push_back("段階1固定(50.0)");
             modes.push_back("段階2固定(100.0)");
             modes.push_back("自動(効果時間を設定で指定)");
@@ -692,22 +694,29 @@ namespace BattleCheats
 
     // ---------------------------------------------------------------
     //  5. テンション調査 (開発用)
-    //     プレイヤーのデータ(player+0 ~ +0x1000)を4つの状態で保存して、
+    //     プレイヤーのデータ(player+0 ~ +0x1000)を5つの状態で保存して、
     //     「2段階目の効果中フラグ」「残り時間」らしき場所をSDに書き出す。
-    //       A  = 通常 / B1 = 効果中 / B2 = 効果中(数秒後) / C = 効果終了後
+    //       A  = 武器をしまっている通常状態
+    //       W  = 武器を構えた(戦闘モード)・2段階目の効果なし
+    //       E1 = 2段階目の効果中(武器を構えたまま)
+    //       E2 = 効果中(数秒後)
+    //       F  = 効果が切れた後(武器を構えたまま)
+    //     W と F が同じで E1/E2 だけ違う場所が、効果中フラグ。
+    //     (A と W の違いは戦闘モードのフラグなので、候補から除ける)
     //     結果は SD の fll_tension_scan.txt に出力される。
     // ---------------------------------------------------------------
     static const u32 SCAN_SIZE = 0x1000;
+    static const int SCAN_COUNT = 5;
 
     static std::vector<u32> &ScanSnap(int i)
     {
-        static std::vector<u32> snaps[4];
+        static std::vector<u32> snaps[SCAN_COUNT];
         return snaps[i];
     }
 
     static u32 &ScanPlayer(int i)
     {
-        static u32 pl[4] = {0, 0, 0, 0};
+        static u32 pl[SCAN_COUNT] = {0, 0, 0, 0, 0};
         return pl[i];
     }
 
@@ -742,11 +751,11 @@ namespace BattleCheats
 
     static void ScanWrite()
     {
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < SCAN_COUNT; ++i)
         {
             if (ScanSnap(i).empty())
             {
-                MessageBox("A, B1, B2, C をすべて保存してから書き出してください")();
+                MessageBox("A, W, E1, E2, F をすべて保存してから書き出してください")();
                 return;
             }
         }
@@ -756,29 +765,44 @@ namespace BattleCheats
             MessageBox("fll_tension_scan.txt を開けませんでした")();
             return;
         }
-        file.WriteLine(Utils::Format("player: A=%08X B1=%08X B2=%08X C=%08X",
-                                     ScanPlayer(0), ScanPlayer(1), ScanPlayer(2), ScanPlayer(3)));
-        file.WriteLine("== フラグ候補 (A==C, B1==B2, B1!=A)");
+        file.WriteLine(Utils::Format("player: A=%08X W=%08X E1=%08X E2=%08X F=%08X",
+                                     ScanPlayer(0), ScanPlayer(1), ScanPlayer(2),
+                                     ScanPlayer(3), ScanPlayer(4)));
+
+        file.WriteLine("== 効果中フラグ候補 (W==F, E1==E2, E1!=W)  形式: +offset W -> E1");
         int n = 0;
         for (u32 i = 0; i < SCAN_SIZE / 4 && n < 300; ++i)
         {
-            const u32 A = ScanSnap(0)[i], B1 = ScanSnap(1)[i], B2 = ScanSnap(2)[i], C = ScanSnap(3)[i];
-            if (A == C && B1 == B2 && B1 != A)
+            const u32 W = ScanSnap(1)[i], E1 = ScanSnap(2)[i], E2 = ScanSnap(3)[i], F = ScanSnap(4)[i];
+            if (W == F && E1 == E2 && E1 != W)
             {
                 file.WriteLine(Utils::Format("+%04X  %08X -> %08X  (float %.3f -> %.3f)",
-                                             i * 4, A, B1, AsFloat(A), AsFloat(B1)));
+                                             i * 4, W, E1, AsFloat(W), AsFloat(E1)));
                 ++n;
             }
         }
-        file.WriteLine("== タイマー候補 (A==C, B1!=B2)");
+
+        file.WriteLine("== タイマー候補 (W==F, E1!=E2)  形式: +offset E1 -> E2");
         n = 0;
         for (u32 i = 0; i < SCAN_SIZE / 4 && n < 300; ++i)
         {
-            const u32 A = ScanSnap(0)[i], B1 = ScanSnap(1)[i], B2 = ScanSnap(2)[i], C = ScanSnap(3)[i];
-            if (A == C && B1 != B2)
+            const u32 W = ScanSnap(1)[i], E1 = ScanSnap(2)[i], E2 = ScanSnap(3)[i], F = ScanSnap(4)[i];
+            if (W == F && E1 != E2)
             {
                 file.WriteLine(Utils::Format("+%04X  %08X -> %08X  (float %.3f -> %.3f)",
-                                             i * 4, B1, B2, AsFloat(B1), AsFloat(B2)));
+                                             i * 4, E1, E2, AsFloat(E1), AsFloat(E2)));
+                ++n;
+            }
+        }
+
+        file.WriteLine("== 参考: 戦闘モードの違い (A!=W かつ W==F)");
+        n = 0;
+        for (u32 i = 0; i < SCAN_SIZE / 4 && n < 100; ++i)
+        {
+            const u32 A = ScanSnap(0)[i], W = ScanSnap(1)[i], F = ScanSnap(4)[i];
+            if (A != W && W == F)
+            {
+                file.WriteLine(Utils::Format("+%04X  %08X -> %08X", i * 4, A, W));
                 ++n;
             }
         }
@@ -790,16 +814,17 @@ namespace BattleCheats
     {
         (void)entry;
         std::vector<std::string> opts;
-        opts.push_back("A: 通常の状態を保存");
-        opts.push_back("B1: 2段階目の効果中を保存");
-        opts.push_back("B2: 効果中(数秒後)を保存");
-        opts.push_back("C: 効果が切れた後を保存");
+        opts.push_back("A: 武器をしまった通常状態を保存");
+        opts.push_back("W: 武器を構えた(効果なし)を保存");
+        opts.push_back("E1: 2段階目の効果中を保存");
+        opts.push_back("E2: 効果中(数秒後)を保存");
+        opts.push_back("F: 効果が切れた後(武器を構えたまま)を保存");
         opts.push_back("結果をSDに書き出す");
-        Keyboard kb("テンション調査 (先に「テンションゲージ」をOFFに)", opts);
+        Keyboard kb("テンション調査", opts);
         const int c = kb.Open();
-        if (c >= 0 && c <= 3)
+        if (c >= 0 && c < SCAN_COUNT)
             ScanTake(c);
-        else if (c == 4)
+        else if (c == SCAN_COUNT)
             ScanWrite();
     }
 
@@ -840,8 +865,8 @@ namespace BattleCheats
         folder->Append(new MenuEntry(
             "テンション調査 (開発用)", nullptr, TensionScanEntry,
             "2段階目の効果中フラグ/残り時間を探すための調査です。\n"
-            "通常→効果中→効果中(数秒後)→効果終了後 の4回保存して、書き出します。\n"
-            "使う前に「テンションゲージ」をOFFにしてください。"));
+            "A(武器しまい)→W(武器を構える)→E1(効果中)→E2(数秒後)→F(効果終了後) の5回保存して書き出します。\n"
+            "E1〜Fのあいだは武器を構えたままにしてください。"));
 
         folder->Append(new MenuEntry(
             "HP/SPアドレス確認 (開発用)", nullptr, ShowStatusAddr,
