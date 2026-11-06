@@ -18,6 +18,7 @@
 //       - 値が 10000 以上のときは、ダメージ表示9999固定を自動で併用
 //    2. 近づいたらダメージ判定 (倍率は等倍固定・範囲指定可)
 //    3. HP減らない / SP減らない (プレイヤー)
+//    4. テンションゲージ (自動 / 段階1固定 / 段階2固定)
 //
 //  使い方 (main.cpp など):
 //      #include "BattleCheats.hpp"
@@ -32,6 +33,8 @@
 #include <CTRPluginFramework.hpp>
 #include <cstring>
 #include <cstddef>
+#include <string>
+#include <vector>
 
 namespace BattleCheats
 {
@@ -520,12 +523,265 @@ namespace BattleCheats
             OSD::Notify("プレイヤーが見つかりません");
             return;
         }
-        float hp = 0.0f, sp = 0.0f;
+        float hp = 0.0f, sp = 0.0f, tg = 0.0f;
         Process::ReadFloat(base + 0x80, hp);
         Process::ReadFloat(base + 0x84, sp);
-        MessageBox("HP/SPアドレス",
-                   Utils::Format("HP: %08X (%.1f)\nSP: %08X (%.1f)",
-                                 base + 0x80, hp, base + 0x84, sp))();
+        Process::ReadFloat(base + 0x88, tg);
+        MessageBox("HP/SP/テンションのアドレス",
+                   Utils::Format("HP: %08X (%.1f)\nSP: %08X (%.1f)\nテンション: %08X (%.1f)",
+                                 base + 0x80, hp, base + 0x84, sp, base + 0x88, tg))();
+    }
+
+    // ---------------------------------------------------------------
+    //  4. テンションゲージ (プレイヤー)
+    //     テンション = *(float*)(player + 0xD4 + 0x88)
+    //       (HPの+8。既存コードのアドレス 16EACA70→16EACA78 の差から推定)
+    //     1段階目 = 50.0 (42480000) / 2段階目 = 100.0 (42C80000)
+    //
+    //     モード:
+    //       0 自動   : 通常は 100.0 で待機 → 技を使ってゲージが減ったら
+    //                  「2段階目が発動した」とみなし、効果時間のあいだ 50.0 に固定
+    //                  (1段階目のダメージ技を連打できる)。時間が過ぎたら 100.0 に戻る。
+    //       1 段階1固定 : 常に 50.0
+    //       2 段階2固定 : 常に 100.0
+    //     ※2段階目の効果が終わったかどうかはゲームから読めていないため、
+    //       「効果時間(秒)」を設定値で指定します。
+    // ---------------------------------------------------------------
+    static u32 &TensionMode()
+    {
+        static u32 m = 0;
+        return m;
+    }
+
+    static u32 &TensionBuffSec()
+    {
+        static u32 s = 30;
+        return s;
+    }
+
+    static void TensionSettings(MenuEntry *entry)
+    {
+        (void)entry;
+        std::vector<std::string> top;
+        top.push_back("モード");
+        top.push_back("段階2の効果時間(秒)");
+        Keyboard kbTop("テンションゲージの設定", top);
+        const int c = kbTop.Open();
+        if (c == 0)
+        {
+            std::vector<std::string> modes;
+            modes.push_back("自動(段階2発動→効果中は段階1固定)");
+            modes.push_back("段階1固定(50.0)");
+            modes.push_back("段階2固定(100.0)");
+            Keyboard kbMode("モード", modes);
+            const int m = kbMode.Open();
+            if (m >= 0)
+                TensionMode() = static_cast<u32>(m);
+        }
+        else if (c == 1)
+        {
+            u32 sec = TensionBuffSec();
+            Keyboard kbSec("段階2の効果時間(秒) 1~600\n実際に計って合わせてください");
+            kbSec.IsHexadecimal(false);
+            if (kbSec.Open(sec, sec) == 0)
+            {
+                if (sec < 1)
+                    sec = 1;
+                if (sec > 600)
+                    sec = 600;
+                TensionBuffSec() = sec;
+            }
+        }
+    }
+
+    static void TensionGame(MenuEntry *entry)
+    {
+        static u32  lastBase = 0;
+        static bool buff = false;   // 段階2の効果中とみなしている
+        static bool primed = false; // 100.0 を書いた後
+        static u32  frames = 0;
+
+        if (!entry->IsActivated())
+        {
+            lastBase = 0;
+            buff = false;
+            primed = false;
+            frames = 0;
+            return;
+        }
+
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
+            return;
+
+        if (base != lastBase)
+        {
+            lastBase = base;
+            buff = false;
+            primed = false;
+            frames = 0;
+        }
+
+        const u32 addr = base + 0x88;
+        float cur = 0.0f;
+        if (!Process::ReadFloat(addr, cur))
+            return;
+        if (!(cur >= 0.0f && cur < 1000.0f)) // NaN・異常値には触らない
+            return;
+
+        const u32 mode = TensionMode();
+        if (mode == 1)
+        {
+            if (cur != 50.0f)
+                Process::WriteFloat(addr, 50.0f);
+            return;
+        }
+        if (mode == 2)
+        {
+            if (cur != 100.0f)
+                Process::WriteFloat(addr, 100.0f);
+            return;
+        }
+
+        // 自動モード
+        if (!buff)
+        {
+            if (primed && cur < 99.0f) // 100.0 で待機中に減った = 段階2が発動した
+            {
+                buff = true;
+                frames = 0;
+                Process::WriteFloat(addr, 50.0f);
+                return;
+            }
+            if (cur != 100.0f)
+                Process::WriteFloat(addr, 100.0f);
+            primed = true;
+            return;
+        }
+
+        // 効果中: 50.0 に固定
+        frames++;
+        if (frames >= TensionBuffSec() * 60u) // 60フレーム = 約1秒
+        {
+            buff = false;
+            primed = false; // 次のフレームで 100.0 に戻す
+            return;
+        }
+        if (cur != 50.0f)
+            Process::WriteFloat(addr, 50.0f);
+    }
+
+    // ---------------------------------------------------------------
+    //  5. テンション調査 (開発用)
+    //     プレイヤーのデータ(player+0 ~ +0x1000)を4つの状態で保存して、
+    //     「2段階目の効果中フラグ」「残り時間」らしき場所をSDに書き出す。
+    //       A  = 通常 / B1 = 効果中 / B2 = 効果中(数秒後) / C = 効果終了後
+    //     結果は SD の fll_tension_scan.txt に出力される。
+    // ---------------------------------------------------------------
+    static const u32 SCAN_SIZE = 0x1000;
+
+    static std::vector<u32> &ScanSnap(int i)
+    {
+        static std::vector<u32> snaps[4];
+        return snaps[i];
+    }
+
+    static u32 &ScanPlayer(int i)
+    {
+        static u32 pl[4] = {0, 0, 0, 0};
+        return pl[i];
+    }
+
+    static void ScanTake(int i)
+    {
+        u32 base = 0;
+        if (!PlayerStatusBase(base))
+        {
+            MessageBox("プレイヤーが見つかりません")();
+            return;
+        }
+        const u32 player = base - 0xD4;
+        std::vector<u32> &v = ScanSnap(i);
+        v.assign(SCAN_SIZE / 4, 0);
+        for (u32 off = 0; off < SCAN_SIZE; off += 4)
+        {
+            u32 w = 0;
+            if (Process::CheckAddress(player + off))
+                Process::Read32(player + off, w);
+            v[off / 4] = w;
+        }
+        ScanPlayer(i) = player;
+        OSD::Notify(Utils::Format("保存しました (player=%08X)", player));
+    }
+
+    static float AsFloat(u32 w)
+    {
+        float f = 0.0f;
+        std::memcpy(&f, &w, sizeof(f));
+        return f;
+    }
+
+    static void ScanWrite()
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            if (ScanSnap(i).empty())
+            {
+                MessageBox("A, B1, B2, C をすべて保存してから書き出してください")();
+                return;
+            }
+        }
+        File file;
+        if (File::Open(file, "fll_tension_scan.txt", File::RWC | File::TRUNCATE) != 0)
+        {
+            MessageBox("fll_tension_scan.txt を開けませんでした")();
+            return;
+        }
+        file.WriteLine(Utils::Format("player: A=%08X B1=%08X B2=%08X C=%08X",
+                                     ScanPlayer(0), ScanPlayer(1), ScanPlayer(2), ScanPlayer(3)));
+        file.WriteLine("== フラグ候補 (A==C, B1==B2, B1!=A)");
+        int n = 0;
+        for (u32 i = 0; i < SCAN_SIZE / 4 && n < 300; ++i)
+        {
+            const u32 A = ScanSnap(0)[i], B1 = ScanSnap(1)[i], B2 = ScanSnap(2)[i], C = ScanSnap(3)[i];
+            if (A == C && B1 == B2 && B1 != A)
+            {
+                file.WriteLine(Utils::Format("+%04X  %08X -> %08X  (float %.3f -> %.3f)",
+                                             i * 4, A, B1, AsFloat(A), AsFloat(B1)));
+                ++n;
+            }
+        }
+        file.WriteLine("== タイマー候補 (A==C, B1!=B2)");
+        n = 0;
+        for (u32 i = 0; i < SCAN_SIZE / 4 && n < 300; ++i)
+        {
+            const u32 A = ScanSnap(0)[i], B1 = ScanSnap(1)[i], B2 = ScanSnap(2)[i], C = ScanSnap(3)[i];
+            if (A == C && B1 != B2)
+            {
+                file.WriteLine(Utils::Format("+%04X  %08X -> %08X  (float %.3f -> %.3f)",
+                                             i * 4, B1, B2, AsFloat(B1), AsFloat(B2)));
+                ++n;
+            }
+        }
+        file.Close();
+        MessageBox("fll_tension_scan.txt に書き出しました")();
+    }
+
+    static void TensionScanEntry(MenuEntry *entry)
+    {
+        (void)entry;
+        std::vector<std::string> opts;
+        opts.push_back("A: 通常の状態を保存");
+        opts.push_back("B1: 2段階目の効果中を保存");
+        opts.push_back("B2: 効果中(数秒後)を保存");
+        opts.push_back("C: 効果が切れた後を保存");
+        opts.push_back("結果をSDに書き出す");
+        Keyboard kb("テンション調査 (先に「テンションゲージ」をOFFに)", opts);
+        const int c = kb.Open();
+        if (c >= 0 && c <= 3)
+            ScanTake(c);
+        else if (c == 4)
+            ScanWrite();
     }
 
     // ---------------------------------------------------------------
@@ -557,8 +813,20 @@ namespace BattleCheats
             "プレイヤーのSPが減ったら、直前の値に戻します。"));
 
         folder->Append(new MenuEntry(
+            "テンションゲージ", TensionGame, TensionSettings,
+            "テンションゲージを自動で管理します(設定でモードと効果時間を指定)。\n"
+            "自動: 通常は100.0で待機→段階2が発動したら効果時間のあいだ50.0固定。\n"
+            "段階1だけ解放済みの場合は、設定で「段階1固定」にしてください。"));
+
+        folder->Append(new MenuEntry(
+            "テンション調査 (開発用)", nullptr, TensionScanEntry,
+            "2段階目の効果中フラグ/残り時間を探すための調査です。\n"
+            "通常→効果中→効果中(数秒後)→効果終了後 の4回保存して、書き出します。\n"
+            "使う前に「テンションゲージ」をOFFにしてください。"));
+
+        folder->Append(new MenuEntry(
             "HP/SPアドレス確認 (開発用)", nullptr, ShowStatusAddr,
-            "プレイヤーのHP/SPのアドレスと現在値を表示します。"));
+            "プレイヤーのHP/SP/テンションのアドレスと現在値を表示します。"));
 
         menu += folder;
     }
